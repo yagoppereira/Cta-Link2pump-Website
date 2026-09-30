@@ -850,33 +850,26 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     # coincidem no vencimento. Confirmamos isso agrupando por emissão: os
     # "meses suspeitos" se separaram corretamente em dois meses cada.
     # Emissão é uma data mais fiel ao período de referência de verdade do
-    # que vencimento.
-    #
-    # MAS emissão não É o período de referência, é a data em que a NF foi
-    # GERADA — e o CIGAM fatura essa linha (aluguel/licenciamento) em
-    # ATRASO: a NF do período M só é emitida no início do mês M+1.
-    # Confirmado com dado real em toda a carteira, não só este contrato
-    # (agregado no BigQuery sobre ~2900 notas de licenciamento/mês, 3
-    # meses seguidos): toda nota com texto "PERIODO: X" no item tem
-    # emissão EXATAMENTE no mês seguinte a X, sem NENHUMA exceção. Por
-    # isso o mês de referência de verdade é emissão MENOS 1 mês — sem
-    # esse ajuste, a NF emitida em setembro pro período fechado de agosto
-    # ficava rotulada "Set/26" em vez de "Ago/26".
+    # que vencimento. O mês de referência do gráfico é o mês em que a NF
+    # foi de fato EMITIDA/faturada (confirmado com o usuário: ele quer
+    # "Set/26" pra uma NF emitida em setembro, mesmo que o texto do item
+    # dessa NF diga "PERIODO: Agosto" — não tentamos mais "corrigir" isso
+    # deslocando pro período de serviço).
     mes_atual = pd.Timestamp.now().to_period("M")
     if df["data_emissao"].notna().any():
         # tem pelo menos uma emissão real registrada nesse subcontrato.
-        # Corte é ATÉ o mês corrente (<= mes_atual), não só antes dele:
-        # como o período de referência já é emissão - 1, uma NF emitida
-        # ESTE mês cobre o mês ANTERIOR inteiro (já fechado, já
-        # totalmente conhecido) — não é o mês em andamento ainda
-        # incompleto. Só uma emissão no PRÓPRIO mês seguinte (que ainda
-        # não aconteceu) representaria o mês corrente de verdade, e essa
-        # linha não existe ainda nos dados. A regra de excluir previsão
-        # (acima) não resolve isso sozinha: previsão é sobre parcela
-        # FUTURA projetada, não sobre "esse mês específico ainda não
-        # fechou pra todo mundo".
+        # Corte é ATÉ o mês corrente (<= mes_atual), não só antes dele
+        # (< mes_atual): o CIGAM fatura essa linha (aluguel/licenciamento)
+        # com atraso — a NF que sai NESTE mês corresponde ao que fechou
+        # no mês anterior, não a uma cobrança do mês em andamento ainda
+        # incompleta. Corte estrito em "< mes_atual" escondia por mais um
+        # mês inteiro uma NF que já tinha sido emitida e era 100% real,
+        # só porque calhava de cair no mesmo mês corrente do calendário.
+        # A regra de excluir previsão (acima) não resolve isso sozinha:
+        # previsão é sobre parcela FUTURA projetada, não sobre "esse mês
+        # específico ainda não fechou pra todo mundo".
         df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") <= mes_atual)]
-        df["mes"] = df["data_emissao"].dt.to_period("M") - 1
+        df["mes"] = df["data_emissao"].dt.to_period("M")
     elif "data" in df.columns and pd.to_datetime(df["data"], dayfirst=True, errors="coerce").notna().any():
         # nenhuma linha tem 'emissao' preenchida -> esse schema
         # provavelmente não usa esse campo; cai pra 'data' como um todo.
@@ -1011,13 +1004,12 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
             continue
         if not itens:
             continue
-        # dataEmissao - 1: mesmo deslocamento de preparar_dados_subcontrato
-        # (ver lá) — a NF é emitida no mês SEGUINTE ao período que ela
-        # cobre, confirmado em toda a carteira. Sem isso, o mês devolvido
-        # aqui não bateria com o mês já usado pelas parcelas, criando uma
+        # mesmo mês de referência de preparar_dados_subcontrato (ver lá):
+        # o mês em que a NF foi emitida, sem deslocamento — precisa bater
+        # com o mês já usado pelas parcelas, senão cria uma
         # descontinuidade bem na costura entre os dois (ponta completada
         # por faturamento real x histórico vindo de parcelasContrato).
-        mes = (pd.Period(row["dataEmissao"], freq="M") - 1) if pd.notna(row["dataEmissao"]) else None
+        mes = pd.Period(row["dataEmissao"], freq="M") if pd.notna(row["dataEmissao"]) else None
         if mes is None:
             continue
         for item in itens:
@@ -1057,16 +1049,10 @@ def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes
     tabela inteira, então nesse caso não busca nada (fica com o
     comportamento de antes: sem completar a ponta).
 
-    `desde` pede 2 meses depois de `depois_de`, não 1: `depois_de` e
-    `ate_mes` (e o "mes" que volta de buscar_faturamento_recorrente_bq)
-    são período de referência, mas o filtro da query é por dataEmissao —
-    e emissão = período + 1 (ver buscar_faturamento_recorrente_bq). Uma
-    NF de período depois_de+1 só é emitida no mês depois_de+2; pedir
-    "desde depois_de+1" perderia justo a primeira NF que precisamos
-    completar."""
+    """
     if depois_de is None:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
-    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 2).start_time.strftime("%Y-%m-%d"))
+    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 1).start_time.strftime("%Y-%m-%d"))
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
     df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais) & (df_fat["mes"] <= ate_mes)]
@@ -1926,7 +1912,7 @@ def plotar_historico_multi(
         # mostrar esse detalhe fixo na tela em vez de precisar manter o
         # mouse parado em cima do ponto pra ler
         fig.add_trace(go.Scatter(
-            x=meses_str, y=valores, mode="lines+markers", connectgaps=False,
+            x=eixo_labels, y=valores, mode="lines+markers", connectgaps=False,
             # ● = ativo, ○ = encerrado — a legenda é o único lugar em que
             # a pessoa lê o nome do contrato, então carregar a situação
             # aqui evita ter que cruzar com os cards pra saber
@@ -1961,7 +1947,7 @@ def plotar_historico_multi(
         idx_incompletos = [j for j, c in enumerate(completos) if not c and pd.notna(valores[j])]
         if idx_incompletos:
             fig.add_trace(go.Scatter(
-                x=[meses_str[j] for j in idx_incompletos],
+                x=[eixo_labels[j] for j in idx_incompletos],
                 y=[valores[j] for j in idx_incompletos],
                 mode="markers",
                 marker=dict(size=14, color="#f59e0b", symbol="triangle-up", line=dict(color="white", width=1)),
@@ -1979,7 +1965,7 @@ def plotar_historico_multi(
         idx_variacao = [j for j, p in enumerate(variacoes_pct) if p is not None] if mostrar_eventos_cancelamento else []
         if idx_variacao:
             fig.add_trace(go.Scatter(
-                x=[meses_str[j] for j in idx_variacao],
+                x=[eixo_labels[j] for j in idx_variacao],
                 y=[valores[j] for j in idx_variacao],
                 mode="markers",
                 marker=dict(
@@ -1999,7 +1985,7 @@ def plotar_historico_multi(
             idx_relevantes = [j for j in idx_variacao if abs(variacoes_pct[j]) >= limiar_anotacao_pct]
             if idx_relevantes:
                 fig.add_trace(go.Scatter(
-                    x=[meses_str[j] for j in idx_relevantes],
+                    x=[eixo_labels[j] for j in idx_relevantes],
                     y=[valores[j] for j in idx_relevantes],
                     mode="text",
                     text=[
@@ -2061,7 +2047,7 @@ def plotar_historico_multi(
                     cor_marcador, simbolo, tamanho = COR_TEXTO_GRAFICO, "diamond", 18
 
                 fig.add_trace(go.Scatter(
-                    x=[meses_str[idx]], y=[valores[idx]], mode="markers",
+                    x=[eixo_labels[idx]], y=[valores[idx]], mode="markers",
                     marker=dict(size=tamanho, color=cor_marcador, symbol=simbolo, line=dict(color="white", width=1.5)),
                     legendgroup=grupo_legenda, showlegend=False,
                     hovertext=[hover_cancel], hoverinfo="text",
@@ -2069,7 +2055,7 @@ def plotar_historico_multi(
                 ))
                 trace_situacao.append(situacao_grupo); trace_eh_grupo_individual.append(True); trace_grupo_dono.append(h['grupo'])
                 fig.add_trace(go.Scatter(
-                    x=[meses_str[idx], meses_str[idx]], y=[0, max(valores)],
+                    x=[eixo_labels[idx], eixo_labels[idx]], y=[0, max(valores)],
                     mode="lines", line=dict(color=cor_marcador, width=1, dash="dash"),
                     opacity=0.35, legendgroup=grupo_legenda, showlegend=False, hoverinfo="skip",
                     visible=visivel_inicial_grupo,
@@ -2118,7 +2104,7 @@ def plotar_historico_multi(
         legendgroup_total = f"total_{variante}"
 
         fig.add_trace(go.Scatter(
-            x=meses_str_t, y=valores_t, mode="lines", name=nome,
+            x=eixo_labels_t, y=valores_t, mode="lines", name=nome,
             legendgroup=legendgroup_total, showlegend=True, visible=visivel_inicialmente,
             # era "black" — sumia contra o fundo escuro do gráfico (ver
             # COR_FUNDO_GRAFICO); a cor de texto do gráfico contrasta bem
@@ -2132,7 +2118,7 @@ def plotar_historico_multi(
         idx_var_t = [j for j, p in enumerate(var_pct_t) if p is not None]
         if idx_var_t:
             fig.add_trace(go.Scatter(
-                x=[meses_str_t[j] for j in idx_var_t],
+                x=[eixo_labels_t[j] for j in idx_var_t],
                 y=[valores_t[j] for j in idx_var_t],
                 mode="markers",
                 marker=dict(
@@ -2149,7 +2135,7 @@ def plotar_historico_multi(
                 idx_var_t_relevantes = [j for j in idx_var_t if abs(var_pct_t[j]) >= limiar_anotacao_pct]
                 if idx_var_t_relevantes:
                     fig.add_trace(go.Scatter(
-                        x=[meses_str_t[j] for j in idx_var_t_relevantes],
+                        x=[eixo_labels_t[j] for j in idx_var_t_relevantes],
                         y=[valores_t[j] for j in idx_var_t_relevantes],
                         mode="text",
                         text=[
@@ -2294,8 +2280,22 @@ def plotar_historico_multi(
         margin=dict(t=110, b=margem_inferior, l=70, r=40),
         xaxis=dict(
             tickangle=-45, type="category", domain=[0, 1],
-            categoryorder="array", categoryarray=todos_meses_str,
-            tickvals=todos_meses_str[::passo], ticktext=todos_eixo_labels[::passo],
+            # categoryarray usa os rótulos JÁ FORMATADOS ("Ago/26"), não
+            # mais o período cru — é o mesmo valor usado como `x` de cada
+            # trace agora (ver eixo_labels/eixo_labels_t), então o rótulo
+            # de cada tick já É o valor da categoria: não precisa mais de
+            # um ticktext à parte. Isso deixa usar tickmode="linear" (1 a
+            # cada `passo` categorias, recalculado pelo Plotly a cada
+            # zoom/pan) em vez de uma lista de tickvals pré-cortada pro
+            # histórico INTEIRO — com uma série de vários anos, dar zoom
+            # num trecho recente deixava sobreviver só os poucos rótulos
+            # daquela lista fixa que calhavam de cair ali, em posições
+            # arbitrárias dentro da janela visível (parecia "pontos
+            # desalinhados, pulando mês" mesmo com os pontos no lugar
+            # certo). Com o passo recalculado sobre o que está visível,
+            # os rótulos ficam uniformemente espaçados em QUALQUER zoom.
+            categoryorder="array", categoryarray=todos_eixo_labels,
+            tickmode="linear", dtick=passo,
             range=range_inicial,
             rangeslider=dict(visible=False),
             # minallowed/maxallowed REMOVIDO daqui de propósito — eixo do
