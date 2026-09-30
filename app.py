@@ -840,49 +840,63 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     else:
         df["data_emissao"] = pd.NaT
 
-    # MÊS DE REFERÊNCIA (data_ref) usa a MESMA data do critério de corte
-    # (emissão), não vencimento. Descobrimos com dado real (cliente HOK,
-    # contrato 1146) que usar vencimento pra agrupar por mês criava
-    # colisões: esse contrato fatura ~3-4 semanas antes do vencimento, e
-    # às vezes isso empurra a emissão de DOIS meses consecutivos pro mesmo
-    # mês de vencimento — fazendo parecer que tem "cobrança duplicada" num
-    # mês só, quando na verdade são duas cobranças de meses DIFERENTES que
-    # só coincidem no vencimento. Confirmamos isso agrupando por emissão:
-    # os "meses suspeitos" se separaram corretamente em dois meses cada.
+    # MÊS DE REFERÊNCIA usa a MESMA data do critério de corte (emissão),
+    # não vencimento. Descobrimos com dado real (cliente HOK, contrato
+    # 1146) que usar vencimento pra agrupar por mês criava colisões: esse
+    # contrato fatura ~3-4 semanas antes do vencimento, e às vezes isso
+    # empurra a emissão de DOIS meses consecutivos pro mesmo mês de
+    # vencimento — fazendo parecer que tem "cobrança duplicada" num mês
+    # só, quando na verdade são duas cobranças de meses DIFERENTES que só
+    # coincidem no vencimento. Confirmamos isso agrupando por emissão: os
+    # "meses suspeitos" se separaram corretamente em dois meses cada.
     # Emissão é uma data mais fiel ao período de referência de verdade do
     # que vencimento.
-
-    # corte é ANTES do mês corrente (< mes_atual), não até ele (<= mes_atual):
-    # o mês em andamento não fechou ainda, então nem todo subcontrato do
-    # grupo necessariamente já gerou a NF dele — incluir esse mês parcial
-    # faz o total (de cliente OU de grupo econômico inteiro) despencar no
-    # último ponto do gráfico, como se tivesse caído faturamento que na
-    # verdade só ainda não foi emitido. A regra de excluir previsão (acima)
-    # não resolve isso sozinha: previsão é sobre parcela FUTURA projetada,
-    # não sobre "esse mês específico ainda não fechou pra todo mundo".
+    #
+    # MAS emissão não É o período de referência, é a data em que a NF foi
+    # GERADA — e o CIGAM fatura essa linha (aluguel/licenciamento) em
+    # ATRASO: a NF do período M só é emitida no início do mês M+1.
+    # Confirmado com dado real em toda a carteira, não só este contrato
+    # (agregado no BigQuery sobre ~2900 notas de licenciamento/mês, 3
+    # meses seguidos): toda nota com texto "PERIODO: X" no item tem
+    # emissão EXATAMENTE no mês seguinte a X, sem NENHUMA exceção. Por
+    # isso o mês de referência de verdade é emissão MENOS 1 mês — sem
+    # esse ajuste, a NF emitida em setembro pro período fechado de agosto
+    # ficava rotulada "Set/26" em vez de "Ago/26".
     mes_atual = pd.Timestamp.now().to_period("M")
     if df["data_emissao"].notna().any():
-        # tem pelo menos uma emissão real registrada nesse subcontrato ->
-        # usa 'emissao' tanto pro corte (provisão futura fica de fora)
-        # quanto pro mês de referência (agrupamento no gráfico)
-        df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") < mes_atual)]
-        df["data_ref"] = df["data_emissao"]
+        # tem pelo menos uma emissão real registrada nesse subcontrato.
+        # Corte é ATÉ o mês corrente (<= mes_atual), não só antes dele:
+        # como o período de referência já é emissão - 1, uma NF emitida
+        # ESTE mês cobre o mês ANTERIOR inteiro (já fechado, já
+        # totalmente conhecido) — não é o mês em andamento ainda
+        # incompleto. Só uma emissão no PRÓPRIO mês seguinte (que ainda
+        # não aconteceu) representaria o mês corrente de verdade, e essa
+        # linha não existe ainda nos dados. A regra de excluir previsão
+        # (acima) não resolve isso sozinha: previsão é sobre parcela
+        # FUTURA projetada, não sobre "esse mês específico ainda não
+        # fechou pra todo mundo".
+        df = df[df["data_emissao"].notna() & (df["data_emissao"].dt.to_period("M") <= mes_atual)]
+        df["mes"] = df["data_emissao"].dt.to_period("M") - 1
     elif "data" in df.columns and pd.to_datetime(df["data"], dayfirst=True, errors="coerce").notna().any():
         # nenhuma linha tem 'emissao' preenchida -> esse schema
-        # provavelmente não usa esse campo; cai pra 'data' como um todo,
-        # tanto pro corte quanto pro mês de referência
+        # provavelmente não usa esse campo; cai pra 'data' como um todo.
+        # SEM o deslocamento de 1 mês acima: 'data' não tem a mesma
+        # garantia de defasagem fixa (é sobrescrita na liquidação e pode
+        # ficar meses à frente da emissão original — ver preco/liquidação
+        # real observada), então arriscar um ajuste aqui inventaria um
+        # padrão que não foi confirmado.
         df["data_lancamento"] = pd.to_datetime(df["data"], dayfirst=True, errors="coerce")
         df = df[df["data_lancamento"].notna() & (df["data_lancamento"].dt.to_period("M") < mes_atual)]
-        df["data_ref"] = df["data_lancamento"]
+        df["mes"] = df["data_lancamento"].dt.to_period("M")
     else:
         # fallback final: nem emissao nem data existem -> volta a usar
-        # vencimento, mesma lógica de antes, pra não zerar o histórico
-        # (única situação em que data_ref ainda vem de vencimento)
+        # vencimento, mesma lógica de antes (sem deslocamento, mesmo
+        # motivo do 'data' acima), pra não zerar o histórico
         df["data_ref"] = pd.to_datetime(df["vencimentoOriginal"], dayfirst=True, errors="coerce")
         df["data_ref"] = df["data_ref"].fillna(pd.to_datetime(df["vencimento"], dayfirst=True, errors="coerce"))
         df = df[df["data_ref"].isna() | (df["data_ref"].dt.to_period("M") < mes_atual)]
+        df["mes"] = df["data_ref"].dt.to_period("M")
 
-    df["mes"] = df["data_ref"].dt.to_period("M")
     df["chave"] = df["fatura"].fillna(df["lancamento"].astype(str))
 
     df = df[df["situacao"] != "J"].copy()  # juros à parte, não entram na mensalidade
@@ -997,7 +1011,13 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
             continue
         if not itens:
             continue
-        mes = pd.Period(row["dataEmissao"], freq="M") if pd.notna(row["dataEmissao"]) else None
+        # dataEmissao - 1: mesmo deslocamento de preparar_dados_subcontrato
+        # (ver lá) — a NF é emitida no mês SEGUINTE ao período que ela
+        # cobre, confirmado em toda a carteira. Sem isso, o mês devolvido
+        # aqui não bateria com o mês já usado pelas parcelas, criando uma
+        # descontinuidade bem na costura entre os dois (ponta completada
+        # por faturamento real x histórico vindo de parcelasContrato).
+        mes = (pd.Period(row["dataEmissao"], freq="M") - 1) if pd.notna(row["dataEmissao"]) else None
         if mes is None:
             continue
         for item in itens:
@@ -1035,10 +1055,18 @@ def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes
     tem quase 700MB, sempre filtrar) — sem NENHUM dado prévio de parcela
     pra esse grupo, não dá pra escolher um corte razoável sem escanear a
     tabela inteira, então nesse caso não busca nada (fica com o
-    comportamento de antes: sem completar a ponta)."""
+    comportamento de antes: sem completar a ponta).
+
+    `desde` pede 2 meses depois de `depois_de`, não 1: `depois_de` e
+    `ate_mes` (e o "mes" que volta de buscar_faturamento_recorrente_bq)
+    são período de referência, mas o filtro da query é por dataEmissao —
+    e emissão = período + 1 (ver buscar_faturamento_recorrente_bq). Uma
+    NF de período depois_de+1 só é emitida no mês depois_de+2; pedir
+    "desde depois_de+1" perderia justo a primeira NF que precisamos
+    completar."""
     if depois_de is None:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
-    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 1).start_time.strftime("%Y-%m-%d"))
+    df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 2).start_time.strftime("%Y-%m-%d"))
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
     df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais) & (df_fat["mes"] <= ate_mes)]
