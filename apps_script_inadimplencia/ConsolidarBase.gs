@@ -295,6 +295,15 @@ function consolidarBaseInteligente() {
 
   wsClientes.getRange(1, 1, resultadoFinal.length, 6).setValues(resultadoFinal);
 
+  // Resultado da consolidação na aba Relatório (não interrompe se falhar)
+  try {
+    const totalClientes = resultadoFinal.length - 1;
+    registrarConsolidacaoNoRelatorio_(contadorRegras, totalClientes);
+    registrarSaude_("clientes", totalClientes + " clientes", "consolidado em " + agoraFormatado_());
+  } catch (e) {
+    console.warn("Não foi possível atualizar o Relatório: " + e.message);
+  }
+
   alertaSeguro("🚀 Consolidação Concluída", "A aba 'Base_Clientes' foi gerada com sucesso! Todos os resgates por Cidade/UF ativos foram aplicados.");
 }
 

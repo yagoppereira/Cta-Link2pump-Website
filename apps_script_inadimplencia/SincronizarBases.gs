@@ -48,6 +48,7 @@ function atualizarBaseCigamDoDW() {
 
   // TRAVA: nunca limpa a aba se o DW não devolveu nada
   if (linhas.length === 0) {
+    registrarSaude_("cigam", "❌ Falhou", "DW não retornou clientes; base anterior mantida (" + agoraFormatado_() + ")");
     throw new Error("DW não retornou nenhum cliente. Base_CIGAM NÃO foi alterada.");
   }
 
@@ -65,6 +66,7 @@ function atualizarBaseCigamDoDW() {
   const carimbo = Utilities.formatDate(new Date(), "GMT-3", "dd/MM/yyyy HH:mm");
   aba.getRange(1, cabecalho.length + 2).setValue("Atualizado do DW em: " + carimbo);
 
+  registrarSaude_("cigam", linhas.length + " clientes", "atualizado do DW em " + carimbo);
   console.log(`Base_CIGAM atualizada do DW: ${linhas.length} clientes.`);
   return linhas.length;
 }
@@ -116,10 +118,12 @@ function atualizarBaseCidades() {
   // TRAVA: confere se o layout da origem continua o esperado
   const cab = dados[0].map(c => String(c).trim().toUpperCase());
   if (!cab[2].includes("VENDEDOR") || cab[3] !== "UF") {
+    registrarSaude_("cidades", "❌ Falhou", "layout da origem mudou; base anterior mantida (" + agoraFormatado_() + ")");
     throw new Error("Layout da aba Cidades mudou (esperado: Cidade | Sem Acento | Vendedor Nome | UF). Base_Cidades NÃO foi alterada.");
   }
   // TRAVA: anti-esvaziamento
   if (dados.length - 1 < CONFIG_SYNC.minimoLinhasCidades) {
+    registrarSaude_("cidades", "❌ Falhou", "origem veio quase vazia; base anterior mantida (" + agoraFormatado_() + ")");
     throw new Error(`Origem retornou só ${dados.length - 1} cidades. Base_Cidades NÃO foi alterada.`);
   }
 
@@ -131,6 +135,7 @@ function atualizarBaseCidades() {
   const carimbo = Utilities.formatDate(new Date(), "GMT-3", "dd/MM/yyyy HH:mm");
   abaDestino.getRange(1, 6).setValue("Copiado de 'Cidades por Vendedor' em: " + carimbo);
 
+  registrarSaude_("cidades", (dados.length - 1) + " cidades", "copiado em " + carimbo);
   console.log(`Base_Cidades atualizada: ${dados.length - 1} cidades.`);
   return dados.length - 1;
 }
