@@ -32,7 +32,7 @@ function consolidarBaseInteligente() {
   const dictVendedoresAtivos = {};
   if (dadosVendedores.length > 1) {
     for (let i = 1; i < dadosVendedores.length; i++) {
-      let nomeVendedor = String(dadosVendedores[i][0]).replace(/ /g, ' ').trim().toUpperCase();
+      let nomeVendedor = String(dadosVendedores[i][0]).replace(/\u00A0/g, ' ').trim().toUpperCase();
       let valCheck = dadosVendedores[i][2]; // Checkbox na Coluna C
       let estaAtivo = (valCheck === true || String(valCheck).toUpperCase() === "TRUE" || String(valCheck).toUpperCase() === "VERDADEIRO");
       if (nomeVendedor) {
@@ -44,9 +44,9 @@ function consolidarBaseInteligente() {
   const dictCidadeUf = {};
   if (dadosCidades.length > 1) {
     for (let i = 1; i < dadosCidades.length; i++) {
-      let cidadeRaw = String(dadosCidades[i][1] || dadosCidades[i][0]).replace(/ /g, ' ').trim();
-      let vendedorCidade = String(dadosCidades[i][2]).replace(/ /g, ' ').trim().toUpperCase();
-      let ufCidade = String(dadosCidades[i][3] || "").replace(/ /g, ' ').trim().toUpperCase();
+      let cidadeRaw = String(dadosCidades[i][1] || dadosCidades[i][0]).replace(/\u00A0/g, ' ').trim();
+      let vendedorCidade = String(dadosCidades[i][2]).replace(/\u00A0/g, ' ').trim().toUpperCase();
+      let ufCidade = String(dadosCidades[i][3] || "").replace(/\u00A0/g, ' ').trim().toUpperCase();
 
       if (!ufCidade && cidadeRaw.includes(",")) {
         let partes = cidadeRaw.split(",");
@@ -111,7 +111,7 @@ function consolidarBaseInteligente() {
 
   for (let i = 1; i < dadosManuais.length; i++) {
     let cnpjPuro = limparParaChavePura(dadosManuais[i][0]);
-    let vendedor = String(dadosManuais[i][1]).replace(/ /g, ' ').trim().toUpperCase();
+    let vendedor = String(dadosManuais[i][1]).replace(/\u00A0/g, ' ').trim().toUpperCase();
     if (cnpjPuro && vendedor) {
       dictManualExato[cnpjPuro] = vendedor;
       if (cnpjPuro.length >= 8) {
@@ -122,7 +122,7 @@ function consolidarBaseInteligente() {
   }
 
   for (let i = 1; i < dadosComercial.length; i++) {
-    let vendedor = String(dadosComercial[i][idxVendedorComercial]).replace(/ /g, ' ').trim().toUpperCase();
+    let vendedor = String(dadosComercial[i][idxVendedorComercial]).replace(/\u00A0/g, ' ').trim().toUpperCase();
     if (!vendedor) continue;
 
     let cnpjRaiz = extrairRaizCnpj(dadosComercial[i][idxCnpjComercial]);
@@ -167,9 +167,9 @@ function consolidarBaseInteligente() {
 
     let cnpjOriginal = String(dadosCigam[i][idxCnpjCigam]).trim();
     let cnpjPuro = limparParaChavePura(cnpjOriginal);
-    let nomeOriginal = String(dadosCigam[i][idxNomeCigam]).replace(/ /g, ' ').trim();
-    let municipioOriginal = String(dadosCigam[i][idxMunicipioCigam]).replace(/ /g, ' ').trim();
-    let ufOriginal = String(dadosCigam[i][idxUfCigam]).replace(/ /g, ' ').trim().toUpperCase();
+    let nomeOriginal = String(dadosCigam[i][idxNomeCigam]).replace(/\u00A0/g, ' ').trim();
+    let municipioOriginal = String(dadosCigam[i][idxMunicipioCigam]).replace(/\u00A0/g, ' ').trim();
+    let ufOriginal = String(dadosCigam[i][idxUfCigam]).replace(/\u00A0/g, ' ').trim().toUpperCase();
 
     if (!cnpjPuro || cnpjPuro.length < 11 || cnpjsProcessados.has(cnpjPuro)) continue;
     cnpjsProcessados.add(cnpjPuro);
@@ -342,7 +342,7 @@ function limparNomeEmpresa(nome) {
   if (!nome) return "";
   let limpo = String(nome).trim().toUpperCase();
 
-  limpo = limpo.normalize("NFD").replace(/[̀-ͯ]/g, "");
+  limpo = limpo.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
   // Trata separadores (hífen, barra, apóstrofos, aspas) como ESPAÇO
   // antes de remover pontuação, para não colar palavras adjacentes
@@ -360,7 +360,7 @@ function limparNomeEmpresa(nome) {
 function limparNomeCidade(cidade) {
   if (!cidade) return "";
   let limpo = String(cidade).split(",")[0].trim().toUpperCase();
-  limpo = limpo.normalize("NFD").replace(/[̀-ͯ]/g, "");
+  limpo = limpo.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
   // Substitui apóstrofos e crases por ESPAÇO (Garante que Dias D'ávila vire DIAS D AVILA)
   limpo = limpo.replace(/['`´"”-]/g, ' ');

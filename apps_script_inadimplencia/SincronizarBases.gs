@@ -155,10 +155,8 @@ function atualizarBasesEConsolidar() {
   consolidarBaseInteligente();
 }
 
-// Alerta que não quebra em gatilhos automáticos (onde getUi() não existe).
-// Para rodar consolidarBaseInteligente() por gatilho de tempo, troque nela:
-//   "SpreadsheetApp.getUi().alert("           → "alertaSeguro("
-//   ", SpreadsheetApp.getUi().ButtonSet.OK)"  → ")"
+// Alerta que não quebra em gatilhos automáticos (onde getUi() não existe):
+// no menu mostra a caixa de diálogo; em gatilho de tempo vai para o log.
 function alertaSeguro(titulo, mensagem) {
   try {
     const ui = SpreadsheetApp.getUi();

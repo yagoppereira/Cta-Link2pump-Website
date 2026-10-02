@@ -3,12 +3,13 @@
 Scripts do projeto Apps Script vinculado à planilha
 "Planilha Central Inadimplência por Carteira de Vendedor".
 
-| Arquivo | O que faz |
-|---|---|
-| `SincronizarBases.gs` | Base_CIGAM ← DW (BigQuery) · Base_Cidades ← "Cidades por Vendedor" · orquestrador `atualizarBasesEConsolidar()` |
-| `ConsolidarBase.gs` | `consolidarBaseInteligente()`: cascata de regras que gera a Base_Clientes |
-| `DistribuirInadimplencia.gs` | `distribuirInadimplenciaPorVendedor()`: lê o arquivo do dia, confere, distribui para as carteiras e alimenta o Looker |
-| `Relatorio.gs` | Layout e escrita das seções da aba Relatório (compartilhado pelos três acima) |
+| Arquivo no repo | Arquivo no Apps Script | O que faz |
+|---|---|---|
+| `SincronizarBases.gs` | `Cruzamento de Bases/Sincronizar Bases.gs` | Base_CIGAM ← DW (BigQuery) · Base_Cidades ← "Cidades por Vendedor" · orquestrador `atualizarBasesEConsolidar()` |
+| `ConsolidarBase.gs` | `Cruzamento de Bases/Atribuição Manual.gs` | `consolidarBaseInteligente()`: cascata de regras que gera a Base_Clientes |
+| `DistribuirInadimplencia.gs` | `Distribuição de Inadimplência.gs` | `distribuirInadimplenciaPorVendedor()`: lê o arquivo do dia, confere, distribui para as carteiras e alimenta o Looker |
+| `Relatorio.gs` | `Relatório.gs` | Layout e escrita das seções da aba Relatório (compartilhado pelos três acima) |
+| `MenuAutomacoes.gs` | `Menu Automações.gs` | Menu "⚙️ Automações" na ordem do fluxo |
 
 Fluxo: **Sincronizar bases → Consolidar Base_Clientes → Distribuir títulos**.
 

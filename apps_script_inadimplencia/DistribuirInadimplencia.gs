@@ -38,7 +38,7 @@ function distribuirInadimplenciaPorVendedor() {
     if (!txt) return "";
     return String(txt)
       .normalize("NFD")
-      .replace(/[̀-ͯ]/g, "")
+      .replace(/[\u0300-\u036f]/g, "")
       .toUpperCase()
       .trim();
   };
