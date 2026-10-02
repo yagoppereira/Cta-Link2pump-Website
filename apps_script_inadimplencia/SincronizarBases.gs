@@ -144,6 +144,9 @@ function atualizarBasesEConsolidar() {
   const qtdCidades = atualizarBaseCidades();
   SpreadsheetApp.flush();
   console.log(`Bases prontas (${qtdClientes} clientes, ${qtdCidades} cidades). Consolidando...`);
+  if (typeof consolidarBaseInteligente !== "function") {
+    throw new Error("consolidarBaseInteligente() não existe neste projeto. As bases foram atualizadas, mas a Base_Clientes NÃO foi consolidada. Restaure o arquivo que contém essa função (ver Histórico do projeto).");
+  }
   consolidarBaseInteligente();
 }
 
