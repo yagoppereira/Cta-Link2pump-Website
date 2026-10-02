@@ -9,5 +9,6 @@ function onOpen() {
     .addItem('5. Atualizar Layout Planilha de Vendedores (do Template)', 'aplicarPatchLayoutVendedores')
     .addSeparator()
     .addItem('Só reconsolidar Base de Clientes (sem atualizar bases)', 'consolidarBaseInteligente')
+    .addItem('🩺 Diagnóstico do sistema', 'diagnosticarSistema')
     .addToUi();
 }
