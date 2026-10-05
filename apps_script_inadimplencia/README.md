@@ -18,3 +18,6 @@ Pré-requisito: serviço avançado **BigQuery API** habilitado no projeto (e Dri
 
 Os demais scripts da planilha (validação da Lista_Vendedores, geração de
 planilhas de vendedores e patch de layout) ainda não estão versionados aqui.
+
+Abas de histórico criadas pela distribuição: `Historico_Distribuicao` (1 linha/dia) e `Historico_Clientes` (1 linha/cliente/dia).
+Ajustes manuais no Looker Studio: ver `AJUSTES_LOOKER.md`.
