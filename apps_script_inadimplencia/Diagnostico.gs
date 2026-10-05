@@ -124,6 +124,15 @@ function diagnosticarSistema() {
   avaliarFrescor("Base_CIGAM (DW)", lerCarimbo("Base_CIGAM", "J1"));
   avaliarFrescor("Base_Cidades", lerCarimbo("Base_Cidades", "F1"));
   avaliarFrescor("Última distribuição (Relatório B6)", lerCarimbo("Relatório", "B6"));
+  testar("Frescor", "Histórico diário", () => {
+    const aba = ss.getSheetByName(CONFIG_DISTRIB.abaHistoricoResumo);
+    if (!aba || aba.getLastRow() < 2) return alerta("Frescor", "Histórico diário", "ainda sem registros — começa na próxima distribuição");
+    const ultima = aba.getRange(aba.getLastRow(), 1).getValue();
+    if (!(ultima instanceof Date)) return alerta("Frescor", "Histórico diário", "última linha sem data");
+    const dias = (new Date() - ultima) / 864e5;
+    (dias <= 4 ? ok : alerta)("Frescor", "Histórico diário",
+      (aba.getLastRow() - 1) + " dias registrados · último " + Utilities.formatDate(ultima, "GMT-3", "dd/MM/yyyy"));
+  });
 
   // ---------------------------------------------------- 6. CONSISTÊNCIA
   testar("Consistência", "Bases", () => {

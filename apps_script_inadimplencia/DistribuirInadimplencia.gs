@@ -3,8 +3,36 @@ const CONFIG_DISTRIB = {
   tentativasLeitura: 3,          // Leituras do arquivo de origem antes de desistir
   esperaEntreLeiturasMs: 30000,  // Pausa entre leituras (arquivo atualiza de hora em hora)
   toleranciaTotalReais: 1.00,    // Diferença aceita entre soma lida e total de referência
-  quedaMaximaTitulos: 0.30       // Aborta se os títulos caírem mais que 30% vs. última execução
+  quedaMaximaTitulos: 0.30,      // Aborta se os títulos caírem mais que 30% vs. última execução
+
+  // Distribuidoras identificadas pela RAIZ do CNPJ (a divisão do CIGAM não serve:
+  // há distribuidoras na divisão 10 e clientes comuns nas divisões 11/90)
+  raizesDistribuidoras: {
+    "34274233": "Vibra",
+    "33337122": "Ipiranga",
+    "33453598": "Raízen",
+    "23314594": "Alesat"
+  },
+
+  // Mesma curva do campo "Reserva Estimada (R$)" do Looker: (dias/210)² × saldo
+  reservaDiasTeto: 210,
+  reservaExpoente: 2,
+
+  abaHistoricoResumo: "Historico_Distribuicao",  // 1 linha por dia
+  abaHistoricoClientes: "Historico_Clientes"      // 1 linha por cliente por dia
 };
+
+// Reserva estimada de um título (espelha o campo calculado do Looker)
+function calcularReserva_(saldo, diasAtraso) {
+  const dias = Math.min(Math.max(Number(diasAtraso) || 0, 0), CONFIG_DISTRIB.reservaDiasTeto);
+  return Math.pow(dias / CONFIG_DISTRIB.reservaDiasTeto, CONFIG_DISTRIB.reservaExpoente) * saldo;
+}
+
+function segmentoDoCnpj_(cnpjLimpo) {
+  const raiz = String(cnpjLimpo || "").padStart(14, "0").substring(0, 8);
+  const distribuidora = CONFIG_DISTRIB.raizesDistribuidoras[raiz];
+  return distribuidora ? "Distribuidora" : "Cliente Final";
+}
 
 function distribuirInadimplenciaPorVendedor() {
   const pastaId = CONFIG_DISTRIB.pastaId;
@@ -326,14 +354,15 @@ function distribuirInadimplenciaPorVendedor() {
     const dadosLookerRows = [[
       "CNPJ", "Cliente", "Vendedor", "UF", "Município", "Regiao",
       "Tipo de Produto", "Emissao", "Vencimento", "Fatura",
-      "Saldo", "Dias Atraso", "Data Atualizacao"
+      "Saldo", "Dias Atraso", "Data Atualizacao", "Segmento"
     ]];
    
+    // Devolve Date (não texto) para o Looker reconhecer o campo como data
     const formatarDataLimpa = (val) => {
       if (!val) return "";
-      if (val instanceof Date) {
-        return Utilities.formatDate(val, "GMT-3", "dd/MM/yyyy");
-      }
+      if (val instanceof Date) return val;
+      const m = String(val).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (m) return new Date(+m[3], +m[2] - 1, +m[1]);
       return String(val).trim();
     };
 
@@ -456,7 +485,8 @@ function distribuirInadimplenciaPorVendedor() {
         fatura,
         saldo,
         diasAtraso,  
-        dataHojeFormatada
+        dataHojeFormatada,
+        segmentoDoCnpj_(cnpjMasterLimpo)
       ]);
     }
 
@@ -564,6 +594,16 @@ function distribuirInadimplenciaPorVendedor() {
       abaLooker.getRange(2, 8, qtdLinhas, 2).setNumberFormat("dd/mm/yyyy");
     }
 
+    // Históricos (não interrompem a distribuição se falharem)
+    try {
+      registrarHistorico_(ssCentral, dadosLookerRows, {
+        distribuido: valor.distribuido, retido: valor.retido, orfao: valor.orfao,
+        arquivo: nomeArquivoLido
+      });
+    } catch (errHist) {
+      console.warn("Histórico não gravado: " + errHist.message);
+    }
+
     SpreadsheetApp.flush();
     console.log("Sucesso total! Processados: " + logTotalProcessado + " | Atribuídos: " + logDistribuidoAtivos);
 
@@ -571,4 +611,100 @@ function distribuirInadimplenciaPorVendedor() {
     console.error("Erro na execução: " + e.stack);
     abaRelatorio.getRange("B6").setValue("❌ Erro: " + e.message);
   }
+}
+
+// =========================================================================
+// HISTÓRICO — base para tendência no Looker e calibração futura da curva
+// -------------------------------------------------------------------------
+// Historico_Distribuicao: 1 linha por dia (resumo da carteira)
+// Historico_Clientes:     1 linha por cliente por dia
+// Rodar de novo no mesmo dia SUBSTITUI as linhas daquele dia.
+// =========================================================================
+function registrarHistorico_(ss, dadosLookerRows, extras) {
+  const cab = dadosLookerRows[0];
+  const idx = nome => cab.indexOf(nome);
+  const iCnpj = idx("CNPJ"), iCliente = idx("Cliente"), iVend = idx("Vendedor"),
+        iSaldo = idx("Saldo"), iDias = idx("Dias Atraso"), iSeg = idx("Segmento");
+
+  const hoje = new Date();
+  const dataHoje = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate());
+  const chaveHoje = Utilities.formatDate(dataHoje, "GMT-3", "yyyy-MM-dd");
+
+  const faixas = { "1-30": 0, "31-60": 0, "61-90": 0, ">90": 0 };
+  const segmentos = { "Distribuidora": 0, "Cliente Final": 0 };
+  const clientes = {};
+  let saldoTotal = 0, reservaTotal = 0;
+
+  for (let i = 1; i < dadosLookerRows.length; i++) {
+    const l = dadosLookerRows[i];
+    const saldo = Number(l[iSaldo]) || 0;
+    const dias = Number(l[iDias]) || 0;
+    const reserva = calcularReserva_(saldo, dias);
+    saldoTotal += saldo;
+    reservaTotal += reserva;
+
+    if (dias <= 30) faixas["1-30"] += saldo;
+    else if (dias <= 60) faixas["31-60"] += saldo;
+    else if (dias <= 90) faixas["61-90"] += saldo;
+    else faixas[">90"] += saldo;
+    segmentos[l[iSeg]] = (segmentos[l[iSeg]] || 0) + saldo;
+
+    const c = clientes[l[iCnpj]] || (clientes[l[iCnpj]] = {
+      cliente: l[iCliente], vendedor: l[iVend], segmento: l[iSeg], titulos: 0, saldo: 0, reserva: 0, maiorAtraso: 0
+    });
+    c.titulos++;
+    c.saldo += saldo;
+    c.reserva += reserva;
+    c.maiorAtraso = Math.max(c.maiorAtraso, dias);
+  }
+
+  const qtdClientes = Object.keys(clientes).length;
+  const resumo = [[
+    dataHoje, dadosLookerRows.length - 1, qtdClientes, saldoTotal, reservaTotal,
+    saldoTotal ? reservaTotal / saldoTotal : 0,
+    faixas["1-30"], faixas["31-60"], faixas["61-90"], faixas[">90"],
+    segmentos["Distribuidora"], segmentos["Cliente Final"],
+    extras.distribuido, extras.retido, extras.orfao, extras.arquivo
+  ]];
+  const cabResumo = ["Data", "Títulos", "Clientes", "Saldo Total", "Reserva Estimada", "Índice de Risco",
+    "Saldo 1-30", "Saldo 31-60", "Saldo 61-90", "Saldo >90",
+    "Saldo Distribuidoras", "Saldo Cliente Final", "Distribuído", "Retido", "Órfão", "Arquivo Lido"];
+  gravarDiaNoHistorico_(ss, CONFIG_DISTRIB.abaHistoricoResumo, cabResumo, resumo, chaveHoje);
+
+  const linhasClientes = Object.keys(clientes).map(cnpj => {
+    const c = clientes[cnpj];
+    return [dataHoje, cnpj, c.cliente, c.vendedor, c.segmento, c.titulos, c.saldo, c.reserva, c.maiorAtraso];
+  });
+  const cabClientes = ["Data", "CNPJ", "Cliente", "Vendedor", "Segmento", "Títulos", "Saldo", "Reserva Estimada", "Maior Atraso (dias)"];
+  gravarDiaNoHistorico_(ss, CONFIG_DISTRIB.abaHistoricoClientes, cabClientes, linhasClientes, chaveHoje);
+
+  console.log(`Histórico gravado: ${qtdClientes} clientes, índice de risco ${(saldoTotal ? reservaTotal / saldoTotal * 100 : 0).toFixed(2)}%.`);
+}
+
+// Acrescenta as linhas do dia ao fim da aba; se o dia já existe (as linhas do
+// dia ficam sempre no fim), apaga e regrava.
+function gravarDiaNoHistorico_(ss, nomeAba, cabecalho, linhas, chaveDia) {
+  let aba = ss.getSheetByName(nomeAba);
+  if (!aba) {
+    aba = ss.insertSheet(nomeAba);
+    aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]).setFontWeight("bold").setBackground("#cfe2f3");
+    aba.setFrozenRows(1);
+  }
+
+  const ultima = aba.getLastRow();
+  if (ultima > 1) {
+    const datas = aba.getRange(2, 1, ultima - 1, 1).getValues();
+    let primeiraDoDia = -1;
+    for (let i = datas.length - 1; i >= 0; i--) {
+      const d = datas[i][0];
+      const chave = d instanceof Date ? Utilities.formatDate(d, "GMT-3", "yyyy-MM-dd") : "";
+      if (chave === chaveDia) primeiraDoDia = i; else break;
+    }
+    if (primeiraDoDia !== -1) aba.deleteRows(primeiraDoDia + 2, datas.length - primeiraDoDia);
+  }
+
+  if (!linhas.length) return;
+  const inicio = aba.getLastRow() + 1;
+  aba.getRange(inicio, 1, linhas.length, cabecalho.length).setValues(linhas);
+  aba.getRange(inicio, 1, linhas.length, 1).setNumberFormat("dd/mm/yyyy");
 }
