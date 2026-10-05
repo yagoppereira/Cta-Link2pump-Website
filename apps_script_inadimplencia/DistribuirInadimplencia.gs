@@ -19,8 +19,50 @@ const CONFIG_DISTRIB = {
   reservaExpoente: 2,
 
   abaHistoricoResumo: "Historico_Distribuicao",  // 1 linha por dia
-  abaHistoricoClientes: "Historico_Clientes"      // 1 linha por cliente por dia
+  abaHistoricoClientes: "Historico_Clientes",     // 1 linha por cliente por dia
+
+  // "Mensalidade acumulada": meses de emissão distintos em aberto por cliente,
+  // contando só produtos recorrentes (comparação pelo início do Tipo de Produto)
+  produtosRecorrentes: ["Licenciamentos", "Aluguel"],
+  faixasAcumulo: [            // [limite superior de meses, rótulo]
+    [1, "1 mês"],
+    [3, "2 a 3 meses"],
+    [6, "4 a 6 meses"],
+    [12, "7 a 12 meses"],
+    [Infinity, "Acima de 12 meses"]
+  ]
 };
+
+function ehProdutoRecorrente_(tipoProduto) {
+  const t = String(tipoProduto || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
+  return CONFIG_DISTRIB.produtosRecorrentes.some(p =>
+    t.startsWith(p.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase()));
+}
+
+function faixaAcumulo_(meses) {
+  if (!meses) return "Sem mensalidade em aberto";
+  return CONFIG_DISTRIB.faixasAcumulo.find(f => meses <= f[0])[1];
+}
+
+// Acrescenta a cada linha do Looker: meses de mensalidade em aberto DO CLIENTE
+// e a faixa correspondente (valor do cliente repetido em todas as suas linhas,
+// para o Looker poder usar como dimensão)
+function anexarAcumuloMensalidades_(dadosLookerRows) {
+  const cab = dadosLookerRows[0];
+  const iCnpj = cab.indexOf("CNPJ"), iProd = cab.indexOf("Tipo de Produto"), iEmis = cab.indexOf("Emissao");
+  const mesesPorCliente = {};
+  for (let i = 1; i < dadosLookerRows.length; i++) {
+    const l = dadosLookerRows[i];
+    if (!ehProdutoRecorrente_(l[iProd]) || !(l[iEmis] instanceof Date)) continue;
+    const mes = l[iEmis].getFullYear() + "-" + (l[iEmis].getMonth() + 1);
+    (mesesPorCliente[l[iCnpj]] = mesesPorCliente[l[iCnpj]] || new Set()).add(mes);
+  }
+  cab.push("Meses em Aberto", "Faixa de Acúmulo");
+  for (let i = 1; i < dadosLookerRows.length; i++) {
+    const meses = mesesPorCliente[dadosLookerRows[i][iCnpj]] ? mesesPorCliente[dadosLookerRows[i][iCnpj]].size : 0;
+    dadosLookerRows[i].push(meses, faixaAcumulo_(meses));
+  }
+}
 
 // Reserva estimada de um título (espelha o campo calculado do Looker)
 function calcularReserva_(saldo, diasAtraso) {
@@ -490,6 +532,8 @@ function distribuirInadimplenciaPorVendedor() {
       ]);
     }
 
+    anexarAcumuloMensalidades_(dadosLookerRows);
+
     // =========================================================================
     // TRAVA 3: PROTEÇÃO DE INTEGRIDADE (ANTI-ESVAZIAMENTO)
     // =========================================================================
@@ -624,7 +668,7 @@ function registrarHistorico_(ss, dadosLookerRows, extras) {
   const cab = dadosLookerRows[0];
   const idx = nome => cab.indexOf(nome);
   const iCnpj = idx("CNPJ"), iCliente = idx("Cliente"), iVend = idx("Vendedor"),
-        iSaldo = idx("Saldo"), iDias = idx("Dias Atraso"), iSeg = idx("Segmento");
+        iSaldo = idx("Saldo"), iDias = idx("Dias Atraso"), iSeg = idx("Segmento"), iMeses = idx("Meses em Aberto");
 
   const hoje = new Date();
   const dataHoje = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate());
@@ -656,6 +700,7 @@ function registrarHistorico_(ss, dadosLookerRows, extras) {
     c.saldo += saldo;
     c.reserva += reserva;
     c.maiorAtraso = Math.max(c.maiorAtraso, dias);
+    c.mesesEmAberto = iMeses === -1 ? "" : l[iMeses];
   }
 
   const qtdClientes = Object.keys(clientes).length;
@@ -673,9 +718,9 @@ function registrarHistorico_(ss, dadosLookerRows, extras) {
 
   const linhasClientes = Object.keys(clientes).map(cnpj => {
     const c = clientes[cnpj];
-    return [dataHoje, cnpj, c.cliente, c.vendedor, c.segmento, c.titulos, c.saldo, c.reserva, c.maiorAtraso];
+    return [dataHoje, cnpj, c.cliente, c.vendedor, c.segmento, c.titulos, c.saldo, c.reserva, c.maiorAtraso, c.mesesEmAberto];
   });
-  const cabClientes = ["Data", "CNPJ", "Cliente", "Vendedor", "Segmento", "Títulos", "Saldo", "Reserva Estimada", "Maior Atraso (dias)"];
+  const cabClientes = ["Data", "CNPJ", "Cliente", "Vendedor", "Segmento", "Títulos", "Saldo", "Reserva Estimada", "Maior Atraso (dias)", "Meses em Aberto"];
   gravarDiaNoHistorico_(ss, CONFIG_DISTRIB.abaHistoricoClientes, cabClientes, linhasClientes, chaveHoje);
 
   console.log(`Histórico gravado: ${qtdClientes} clientes, índice de risco ${(saldoTotal ? reservaTotal / saldoTotal * 100 : 0).toFixed(2)}%.`);
@@ -689,6 +734,8 @@ function gravarDiaNoHistorico_(ss, nomeAba, cabecalho, linhas, chaveDia) {
     aba = ss.insertSheet(nomeAba);
     aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]).setFontWeight("bold").setBackground("#cfe2f3");
     aba.setFrozenRows(1);
+  } else {
+    aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]).setFontWeight("bold").setBackground("#cfe2f3");
   }
 
   const ultima = aba.getLastRow();

@@ -32,9 +32,40 @@ SUM(CASE WHEN Segmento = "Cliente Final" THEN Reserva Estimada (R$) ELSE 0 END)
 - **Ticket Médio**: renomear para **Saldo médio por título**, e adicionar o cartão **Saldo por Cliente**.
 - Adicionar o cartão **Índice de Risco – Cliente Final** ao lado do Índice geral.
 - Adicionar controle de filtro **Segmento** ao lado do filtro de Vendedor.
-- **"Acúmulo de Mensalidades Pendentes"**: o gráfico tem dois eixos e nomes cortados.
-  Substituir por **Reserva Estimada por Faixa de Atraso** (barras, uma métrica, ordenado por *Ordem Aging*)
-  — mostra que o risco está concentrado acima de 90 dias.
+- **"Acúmulo de Mensalidades Pendentes"**: mantido, mas redesenhado (ver seção 4.1).
+
+### 4.1 Acúmulo de mensalidades — novo desenho
+O gráfico atual cruza R$ (eixo esquerdo) com quantidade de meses (eixo direito) em 5 clientes
+com nomes cortados. A distribuição agora grava duas colunas novas em Dados_Looker:
+- **Meses em Aberto**: meses de emissão distintos com mensalidade em aberto **do cliente**
+  (só produtos recorrentes: Licenciamentos e Aluguel — ajustável em `CONFIG_DISTRIB.produtosRecorrentes`).
+  O valor é do cliente e se repete em todas as linhas dele → no Looker use **MAX**, nunca SUM.
+- **Faixa de Acúmulo**: 1 mês · 2 a 3 · 4 a 6 · 7 a 12 · Acima de 12 meses · Sem mensalidade em aberto.
+
+Campo de ordenação **Ordem Acúmulo**:
+```
+CASE Faixa de Acúmulo
+  WHEN "1 mês" THEN 1
+  WHEN "2 a 3 meses" THEN 2
+  WHEN "4 a 6 meses" THEN 3
+  WHEN "7 a 12 meses" THEN 4
+  WHEN "Acima de 12 meses" THEN 5
+  ELSE 6
+END
+```
+Campo **Mensalidade Média (R$)** (por cliente, para a tabela):
+```
+SUM(CASE WHEN Produto (Resumido) IN ("Licenciamentos", "Aluguel") THEN Saldo ELSE 0 END) / MAX(Meses em Aberto)
+```
+
+Substituir o gráfico atual por dois componentes (uma métrica por eixo):
+1. **Barras — Clientes por faixa de acúmulo**: dimensão *Faixa de Acúmulo* (ordenar por *Ordem Acúmulo*),
+   métrica `COUNT_DISTINCT(CNPJ)`; na dica de ferramenta, *Saldo*. Lê-se: "X clientes com mais de 12 meses acumulados".
+2. **Tabela — Maiores acúmulos**: Cliente · Vendedor · **MAX(Meses em Aberto)** · Saldo · Mensalidade Média ·
+   Reserva Estimada; ordenada por meses (desc), barras no Saldo, 10 linhas.
+
+O campo antigo `FORMAT_DATETIME("%Y-%m", Emissao)` continua funcionando (Emissao agora é data de verdade)
+e pode ficar para quem quiser contar meses de **todos** os produtos; a coluna nova conta só os recorrentes.
 
 ## 5. Página 1 (mapa)
 - Cor do mapa: métrica **Índice de Risco (%)** (onde está o risco); deixe **Saldo** e
