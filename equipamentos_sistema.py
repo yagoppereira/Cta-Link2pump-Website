@@ -29,6 +29,7 @@ import unicodedata
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from google.api_core.exceptions import Forbidden
 from google.cloud import bigquery
 
 # bases do sistema CTA no bronze (sufixo das tabelas sistema_<base>__*)
@@ -66,6 +67,11 @@ LIMITE_TIMELINE_COMPLETA = 25
 
 GRANULARIDADES = {"Dia": "D", "Semana": "W", "Mês": "M"}
 
+# tabelas do bronze que a aba lê, por base — é a lista que a service account
+# do app precisa enxergar (roles/bigquery.dataViewer), diferente das
+# cigam__* que as outras abas usam
+TABELAS_SISTEMA = ["cliente", "trr", "posto", "tanque", "bomba", "equipamento", "comboio_tanque", "abastecimento"]
+
 
 def _tabela(project_id: str, base: str, nome: str) -> str:
     # base vem sempre de BASES_SISTEMA (nunca do usuário) — seguro no f-string
@@ -80,37 +86,68 @@ def _normalizar_texto(texto) -> str:
 
 # --- 1. Dados (BigQuery) ---------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Carregando clientes do sistema (direto do BigQuery)...")
-def carregar_clientes_sistema(_client, project_id: str) -> pd.DataFrame:
-    """Diretório de clientes das 3 bases do sistema, com contagem de bombas
-    cadastradas nos postos de cada um — só pra resolver a busca."""
-    partes = []
-    for base in BASES_SISTEMA:
-        t = lambda nome: _tabela(project_id, base, nome)  # noqa: E731
-        partes.append(f"""
-        SELECT
-          '{base}' AS base,
-          CAST(c.cliente_id AS STRING) AS cliente_id,
-          c.nome AS cliente_nome,
-          REGEXP_REPLACE(IFNULL(CAST(c.cnpj AS STRING), ''), r'\\D', '') AS cnpj,
-          c.ativo AS cliente_ativo,
-          tr.nome AS trr_nome,
-          IFNULL(tr.sistema_interno, FALSE) AS trr_interno,
-          IFNULL(bb.qtd_bombas, 0) AS qtd_bombas,
-          IFNULL(bb.qtd_bombas_com_equipamento, 0) AS qtd_bombas_com_equipamento
-        FROM {t('cliente')} c
-        LEFT JOIN {t('trr')} tr ON tr.trr_id = c.trr_id
-        LEFT JOIN (
-          SELECT p.cliente_id, COUNT(*) AS qtd_bombas,
-                 COUNTIF(b.equipamento_id IS NOT NULL) AS qtd_bombas_com_equipamento
-          FROM {t('posto')} p
-          JOIN {t('tanque')} tq ON tq.posto_id = p.posto_id
-          JOIN {t('bomba')} b ON b.tanque_id = tq.tanque_id
-          GROUP BY p.cliente_id
-        ) bb ON bb.cliente_id = c.cliente_id
-        """)
-    df = _client.query("\nUNION ALL\n".join(partes)).to_dataframe(create_bqstorage_client=False)
+def _carregar_clientes_base(_client, project_id: str, base: str) -> pd.DataFrame:
+    t = lambda nome: _tabela(project_id, base, nome)  # noqa: E731
+    sql = f"""
+    SELECT
+      '{base}' AS base,
+      CAST(c.cliente_id AS STRING) AS cliente_id,
+      c.nome AS cliente_nome,
+      REGEXP_REPLACE(IFNULL(CAST(c.cnpj AS STRING), ''), r'\\D', '') AS cnpj,
+      c.ativo AS cliente_ativo,
+      tr.nome AS trr_nome,
+      IFNULL(tr.sistema_interno, FALSE) AS trr_interno,
+      IFNULL(bb.qtd_bombas, 0) AS qtd_bombas,
+      IFNULL(bb.qtd_bombas_com_equipamento, 0) AS qtd_bombas_com_equipamento
+    FROM {t('cliente')} c
+    LEFT JOIN {t('trr')} tr ON tr.trr_id = c.trr_id
+    LEFT JOIN (
+      SELECT p.cliente_id, COUNT(*) AS qtd_bombas,
+             COUNTIF(b.equipamento_id IS NOT NULL) AS qtd_bombas_com_equipamento
+      FROM {t('posto')} p
+      JOIN {t('tanque')} tq ON tq.posto_id = p.posto_id
+      JOIN {t('bomba')} b ON b.tanque_id = tq.tanque_id
+      GROUP BY p.cliente_id
+    ) bb ON bb.cliente_id = c.cliente_id
+    """
+    df = _client.query(sql).to_dataframe(create_bqstorage_client=False)
     df["_nome_norm"] = df["cliente_nome"].map(_normalizar_texto)
     return df
+
+
+def carregar_clientes_sistema(client, project_id: str):
+    """Diretório de clientes das bases do sistema, com contagem de bombas
+    cadastradas nos postos de cada um — só pra resolver a busca. Retorna
+    (diretorio, {base: erro}) — base sem permissão de leitura fica de fora
+    em vez de derrubar a aba."""
+    partes, sem_acesso = [], {}
+    for base in BASES_SISTEMA:
+        try:
+            partes.append(_carregar_clientes_base(client, project_id, base))
+        except Forbidden as e:
+            sem_acesso[base] = e
+    diretorio = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(
+        columns=["base", "cliente_id", "cliente_nome", "cnpj", "qtd_bombas", "_nome_norm"])
+    return diretorio, sem_acesso
+
+
+def _mostrar_falta_de_permissao(project_id: str, bases: list, erro: Exception):
+    """Erro 403 do BigQuery: a service account do app não lê as tabelas do
+    sistema. Lista exatamente o que precisa ser liberado."""
+    tabelas = "\n".join(f"- {_tabela(project_id, base, nome)}" for base in bases for nome in TABELAS_SISTEMA)
+    nomes_bases = ", ".join(BASES_SISTEMA[b] for b in bases)
+    st.error(
+        f"**Sem permissão de leitura nas tabelas do sistema ({nomes_bases}).** A service account "
+        "do app lê as tabelas `cigam__*` do dataset `bronze`, mas não as `sistema_*` que esta aba usa. "
+        "Quem administra o GCP precisa conceder **BigQuery Data Viewer** "
+        "(`roles/bigquery.dataViewer`) à service account do app nas tabelas abaixo "
+        "(ou no dataset `bronze` inteiro):",
+        icon="🔒",
+    )
+    st.markdown(tabelas)
+    # sem expander aqui: a função também é chamada dentro de um (busca
+    # parcial), e o Streamlit não aceita expander aninhado
+    st.caption("Erro do BigQuery: " + str(getattr(erro, "message", erro))[:600])
 
 
 def _query(client, sql: str, params: list) -> pd.DataFrame:
@@ -581,7 +618,16 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     if modo_demo:
         diretorio, parque_demo = gerar_dados_demo()
     else:
-        diretorio = carregar_clientes_sistema(client_bq, project_id)
+        diretorio, sem_acesso = carregar_clientes_sistema(client_bq, project_id)
+        if len(sem_acesso) == len(BASES_SISTEMA):
+            _mostrar_falta_de_permissao(project_id, list(sem_acesso), next(iter(sem_acesso.values())))
+            return
+        if sem_acesso:
+            st.warning("Busca feita só nas bases " + ", ".join(
+                BASES_SISTEMA[b] for b in BASES_SISTEMA if b not in sem_acesso)
+                + " — sem permissão de leitura em " + ", ".join(BASES_SISTEMA[b] for b in sem_acesso) + ".")
+            with st.expander("O que liberar pra incluir as outras bases"):
+                _mostrar_falta_de_permissao(project_id, list(sem_acesso), next(iter(sem_acesso.values())))
 
     candidatos = buscar_clientes_sistema(diretorio, termo)
     if candidatos.empty:
@@ -607,7 +653,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if cliente_id != "900101":
             cadastro, uso, trocas = cadastro.iloc[0:0], uso.iloc[0:0], trocas.iloc[0:0]
     else:
-        cadastro, uso, trocas = carregar_parque_cliente(client_bq, project_id, base, cliente_id)
+        try:
+            cadastro, uso, trocas = carregar_parque_cliente(client_bq, project_id, base, cliente_id)
+        except Forbidden as e:
+            _mostrar_falta_de_permissao(project_id, [base], e)
+            return
 
     st.subheader(escolhido["cliente_nome"], anchor=False)
     st.caption(" · ".join(filter(None, [
