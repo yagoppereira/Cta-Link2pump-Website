@@ -23,6 +23,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import streamlit as st
 
+import equipamentos_sistema
 import gerar_espelho_nfse
 import gerar_nota_debito
 
@@ -3730,13 +3731,13 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 
 def _renderizar_legenda_abas():
-    """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
-    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
-    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    """Rótulo + cor por cima da barra de abas, separando 'Cliente', 'Grupo
+    econômico' e 'Equipamentos' (Análise, na ponta esquerda) de 'Espelho
+    NFS-e' e 'Nota de Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
     alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
-    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
+    (posição 0-4, estável entre versões do Streamlit; bem mais confiável que
     mirar pela classe emotion-cache, que muda a cada build):
-    - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
+    - empurra a aba 3 (Espelho NFS-e) pra ponta direita com margin-left:auto
       no container flex (truque clássico de flexbox pra "quebrar" um grupo
       de itens em dois blocos nas pontas), com uma borda antes marcando a
       separação;
@@ -3756,25 +3757,27 @@ def _renderizar_legenda_abas():
             display: flex !important;
             width: 100% !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"] {{
             margin-left: auto !important;
             border-left: 1px solid rgba(138,149,168,0.4);
             padding-left: 16px;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p {{
             color: {_COR_GRUPO_ANALISE} !important;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_ANALISE} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] p {{
             color: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
         </style>
@@ -4680,8 +4683,8 @@ def renderizar_nota_debito():
 _renderizar_cabecalho()
 _renderizar_legenda_abas()
 
-aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
-    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
+aba_cliente, aba_grupo, aba_equipamentos, aba_espelho, aba_nota_debito = st.tabs(
+    ["Cliente", "Grupo econômico", "Equipamentos", "Espelho NFS-e", "Nota de Débito"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -4730,6 +4733,9 @@ with aba_grupo:
 
     if st.session_state.get("grupo_buscado"):
         relatorio_grupo(st.session_state["grupo_buscado"])
+
+with aba_equipamentos:
+    equipamentos_sistema.renderizar_aba_equipamentos(client_bq, PROJECT_ID, MODO_DEMO)
 
 with aba_espelho:
     renderizar_espelho_nfse()
