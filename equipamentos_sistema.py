@@ -21,6 +21,12 @@
 # contra ~14% quando o contador cai mas não reinicia perto de zero —
 # por isso só o reinício perto de zero conta. É sinal, não registro: o
 # serial anterior continua desconhecido.
+# Conferido contra o relatório "Auditoria de abastecimentos" do sistema
+# (que traz o serial por abastecimento) de 16 bombas: das 10 que trocaram
+# de serial entre mar e out/2026, a regra pegou 5, todas na data exata da
+# atualização do cadastro, e nenhum alarme falso nas 6 que não trocaram.
+# As outras 5 trocaram de serial com o contador seguindo sem reiniciar —
+# a estrela subconta trocas (pega ~metade), mas quando aparece, é troca.
 # ============================================================================
 
 import concurrent.futures
@@ -777,9 +783,10 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
   equipamento são cadastro de estado atual.
 - **★ Possível troca de equipamento:** o contador de abastecimentos da automação (`seq_number`) caiu pelo menos
   {SEQ_QUEDA_MINIMA} e recomeçou em até {SEQ_REINICIO_MAXIMO}, sem voltar pra sequência antiga nos
-  {SEQ_CONFIRMACAO_REGISTROS} registros seguintes. É **inferência**: um reset da automação sem troca física também
-  dispara, e um equipamento usado (com contador alto) instalado no lugar não dispara. O serial anterior à troca
-  continua desconhecido.
+  {SEQ_CONFIRMACAO_REGISTROS} registros seguintes. É **inferência**, conferida contra o relatório de abastecimentos
+  do sistema (que traz o serial): quando a estrela aparece, foi troca de verdade, na data certa — mas ela pega
+  **só cerca de metade** das trocas, porque muitas vezes o contador segue sem reiniciar no equipamento novo.
+  Bomba sem estrela **não** quer dizer que não trocou. O serial anterior à troca continua desconhecido.
 - **Zeros no gráfico:** entre o primeiro e o último abastecimento da bomba, período sem registro aparece como 0 L
   (bomba parada ou sem comunicação — o dado não distingue os dois).
 - **Equipamento ≠ bomba:** um equipamento duplo atende 2 bombas (canais 1 e 2) e as duas mostram o mesmo serial.
