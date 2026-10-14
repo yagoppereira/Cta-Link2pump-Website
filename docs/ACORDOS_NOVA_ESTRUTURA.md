@@ -77,25 +77,45 @@ Calculado:
 
 - `TIPO DE BAIXA`: PARCIAL ou QUITA O TÍTULO.
 - `STATUS DA PARCELA` e `AÇÃO NA BAIXA`: **BAIXAR TOTAL**, **BAIXAR PARCIAL** ou AGUARDAR PAGAMENTO.
-- `SITUAÇÃO NO CIGAM`: EM ABERTO, EM ABERTO (X90), LIQUIDADO ou SEM DADO.
-- `SALDO NO CIGAM`.
-- `CONFERÊNCIA`: OK, OK (PARCIAL), AGUARDANDO PAGAMENTO, PAGO (SEM DADO DO CIGAM),
-  **BAIXA PENDENTE**, **BAIXADO SEM PAGAMENTO**.
+- `SITUAÇÃO NO CIGAM`: LIQUIDADO, BAIXA PARCIAL, EM ABERTO (com "(PRORROGADO)" quando o
+  vencimento atual difere do original), UNIFICADO, BAIXADO COMO PERDA (X90) ou NÃO ENCONTRADO.
+- `SALDO NO CIGAM`, `SALDO ESPERADO NO CIGAM`, `DIFERENÇA DE SALDO`, `VENC. ATUAL NO CIGAM`
+  e `RECEBIDO NO CIGAM` (liquidação + juros lançados contra o título).
+- `CONFERÊNCIA`, por linha (título × parcela):
 
-### Fonte do CIGAM: aba TÍTULOS UNIFICADOS
+| Conferência | Regra | Leitura |
+|---|---|---|
+| OK | parcela paga e saldo do CIGAM = saldo esperado | baixa feita como combinado |
+| BAIXA PENDENTE | parcela paga e saldo do CIGAM **maior** que o esperado | dinheiro entrou, baixa não feita ou feita a menor |
+| BAIXADO SEM PAGAMENTO | parcela **não** paga e saldo do CIGAM **menor** que o esperado | baixa sem recebimento registrado aqui: falta lançar o recebimento, ou a baixa foi no título errado/a maior |
+| PRORROGAR NO CIGAM | título com saldo, vencimento atual no CIGAM já passou e a parcela do acordo ainda vai vencer | o saldo aparece como vencido (TÍTULOS UNIFICADOS, carta de cobrança) apesar de o acordo estar em dia |
+| UNIFICADO NO CIGAM / BAIXADO COMO PERDA / NÃO ENCONTRADO NO CIGAM | situação do título | conferir à mão |
+| AGUARDANDO PAGAMENTO | parcela não paga e saldo conforme | nada a fazer |
 
-A situação no CIGAM vem **só** da aba `TÍTULOS UNIFICADOS`, que é a base de
-inadimplência atualizada. As abas `BASE RAW` e `BASE X90` são legado e não são usadas.
+### Saldo esperado e baixa parcial
 
-- A aba lista os títulos **vencidos e em aberto** (normais e X90; a coluna PORTADOR
-  diz quais são X90). Título que consta nela = EM ABERTO; título que não consta =
-  LIQUIDADO.
-- A busca é pela FATURA exata (`20287761/1`) e também pelo número sem parcela
-  (`20246006`), formato usado em parte dos títulos.
-- Como a aba só tem títulos já vencidos, um título com vencimento original posterior
-  ao último vencimento da base (`ACORDOS_PAINEL!B8`, intervalo `P_CORTE_BASE`)
-  ainda não pode aparecer nela. Esses ficam como "SEM DADO (AINDA NÃO VENCIDO NO
-  CIGAM)", em vez de serem tratados como liquidados.
+`SALDO ESPERADO NO CIGAM = VALOR ORIGINAL − soma do VALOR ALOCADO nas parcelas já pagas`
+(nunca abaixo de zero). É a regra que o CIGAM segue na baixa parcial de acordo: o valor
+recebido abate o principal e o restante fica em aberto para a próxima transferência; nos
+casos conferidos, os juros só entraram como lançamento separado (E/J) na quitação. Exemplo
+conferido no BigQuery: título 21744/3 (LEONARDO LEAL LOPES), valor 10.250,00, entrada do
+acordo alocou 2.427,23 → baixa E/L de 2.427,23 em 29/09/2026 e saldo 7.822,77 no CIGAM.
+
+### Fonte dos dados do CIGAM
+
+Aba `CIGAM_TITULOS`, uma linha por título (fatura/parcela) que aparece em
+`ACORDOS_TITULOS`, vinda de `silver.lancamentos_receber` no BigQuery (espelho dos
+lançamentos do CIGAM): título R/c com valor, saldo, vencimento atual e original, e a soma
+das entradas E ligadas a ele pelo `codigoPartida`: L = liquidação, J = juros,
+U = unificação, portador X90/X91/X92 = baixa por perda. A chave é
+`código da empresa | fatura/parcela` (a parcela é o campo `complemento`).
+
+A aba `TÍTULOS UNIFICADOS` **não** é usada para dizer se um título foi pago: ela só lista
+títulos vencidos, e um título pode sair dela por ter sido unificado ou prorrogado.
+
+Atualização: `apps_script/AtualizarCigamAcordos.gs` refaz a consulta para os títulos em
+acordo e regrava a aba (instalação no cabeçalho do arquivo; gatilho diário opcional).
+A data da última carga aparece em `ACORDOS_PAINEL!B8`.
 
 ## ACORDOS_CUMPRIMENTO
 
