@@ -87,6 +87,7 @@ Calculado:
 |---|---|---|
 | OK | parcela paga e saldo do CIGAM = saldo esperado | baixa feita como combinado |
 | BAIXA PENDENTE | parcela paga e saldo do CIGAM **maior** que o esperado | dinheiro entrou, baixa não feita ou feita a menor |
+| CONFERIR (PAGA A MENOR) | mesma situação, mas a parcela foi paga a menor | não dá para saber em qual título o valor deveria abater |
 | BAIXADO SEM PAGAMENTO | parcela **não** paga e saldo do CIGAM **menor** que o esperado | baixa sem recebimento registrado aqui: falta lançar o recebimento, ou a baixa foi no título errado/a maior |
 | PRORROGAR NO CIGAM | título com saldo, vencimento atual no CIGAM já passou e a parcela do acordo ainda vai vencer | o saldo aparece como vencido (TÍTULOS UNIFICADOS, carta de cobrança) apesar de o acordo estar em dia |
 | UNIFICADO NO CIGAM / BAIXADO COMO PERDA / NÃO ENCONTRADO NO CIGAM | situação do título | conferir à mão |
@@ -100,6 +101,14 @@ recebido abate o principal e o restante fica em aberto para a próxima transfer�
 casos conferidos, os juros só entraram como lançamento separado (E/J) na quitação. Exemplo
 conferido no BigQuery: título 21744/3 (LEONARDO LEAL LOPES), valor 10.250,00, entrada do
 acordo alocou 2.427,23 → baixa E/L de 2.427,23 em 29/09/2026 e saldo 7.822,77 no CIGAM.
+
+### Saldo no CIGAM
+
+`SALDO NO CIGAM` = o menor entre o saldo da linha do título e
+(valor − liquidações − perda − unificação lançadas contra ele). Na carga de 14/10/2026,
+36 títulos tinham liquidação do valor cheio lançada mas o campo saldo da linha ainda
+cheio; nenhum deles consta na `TÍTULOS UNIFICADOS`, então o saldo da linha estava
+desatualizado e não o pagamento.
 
 ### Fonte dos dados do CIGAM
 
