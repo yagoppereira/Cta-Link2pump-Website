@@ -67,6 +67,39 @@ def formatar_mes_ano(periodo: pd.Period) -> str:
     return f"{MESES_PT[periodo.month - 1].capitalize()}/{str(periodo.year)[2:]}"
 
 
+_MESES_PT_POR_NOME = {
+    "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12,
+}
+
+
+def extrair_periodo_do_texto_item(texto: str):
+    """Lê o período de referência real de uma NF a partir do texto do
+    item (ex: "LICENCIAMENTO DE SOFTWARE PERIODO: Agosto/2026") —
+    confirmado com dado real em toda a carteira que é SEMPRE o mês
+    anterior à emissão, mas a emissão sozinha não é confiável como mês
+    de referência: o CIGAM às vezes emite a NF de 2 períodos seguidos
+    dentro do MESMO mês corrente (confirmado com dado real: cliente
+    LUCANO TERRAPLANAGEM, contrato 3086/3087 — NFs de Junho/2025 e
+    Julho/2025 as duas emitidas em julho/2025, a segunda só 21 dias
+    depois da primeira), o que faz as duas caírem juntas no mesmo "mês
+    de emissão" e a soma parecer uma cobrança em dobro num mês só. Esse
+    texto é o único dado que diferencia as duas de verdade. Retorna
+    None se não achar o padrão (texto vazio, ou item sem essa anotação
+    — ex: aluguel, que nunca carrega esse texto, só o licenciamento
+    pareado)."""
+    if not texto:
+        return None
+    m = re.search(r"PERIODO:\s*([A-Za-zçÇãÃ]+)\s*/\s*(\d{4})", str(texto), re.IGNORECASE)
+    if not m:
+        return None
+    nome_mes = unicodedata.normalize("NFKD", m.group(1)).encode("ascii", "ignore").decode().lower()
+    mes_num = _MESES_PT_POR_NOME.get(nome_mes)
+    if not mes_num:
+        return None
+    return pd.Period(f"{m.group(2)}-{mes_num:02d}", freq="M")
+
+
 def formatar_moeda(valor: float) -> str:
     s = f"{valor:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
@@ -808,13 +841,22 @@ def buscar_parcelas_bq(codigo_contrato: str) -> pd.DataFrame:
     return df_json[colunas_presentes]
 
 
-def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
-    """Mesma lógica de dedup do script de contrato único, mas retorna a
-    mensalidade por mês (sem separar juros) + o(s) número(s) de fatura/NF
-    daquele mês — usada como peça para somar vários subcontratos de um
-    grupo unificado."""
+def _detalhar_parcelas_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
+    """Filtra (exclui previsão/juros) e deduplica as parcelas de UM
+    subcontrato, uma linha por FATURA/lançamento — sem agrupar por mês
+    ainda. Usada por preparar_dados_subcontrato (que agrupa isso direto,
+    pro caso simples) e por obter_historico_unificado (que antes de
+    agrupar corrige colisões de mês usando o texto da NF — ver
+    extrair_periodo_do_texto_item — algo que só é possível com o detalhe
+    POR FATURA, não depois de já somado por mês).
+
+    Retorna: fatura, valor, mes_bruto (mês de emissão sem nenhuma
+    correção — usado como mês final por preparar_dados_subcontrato, e
+    como fallback por obter_historico_unificado), data_emissao_exata
+    (Timestamp; NaT quando a linha veio do fallback de vencimento, que
+    não tem a mesma confiabilidade pra casar com NFs irmãs)."""
     if df_parcelas.empty:
-        return pd.DataFrame(columns=["mes", "valor", "fatura"])
+        return pd.DataFrame(columns=["fatura", "valor", "mes_bruto", "data_emissao_exata"])
 
     df = df_parcelas.copy()
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
@@ -890,6 +932,10 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
         df["data_ref"] = df["data_ref"].fillna(pd.to_datetime(df["vencimento"], dayfirst=True, errors="coerce"))
         df = df[df["data_ref"].isna() | (df["data_ref"].dt.to_period("M") < mes_atual)]
         df["mes"] = df["data_ref"].dt.to_period("M")
+        # fallback de vencimento não tem a mesma confiabilidade de
+        # emissão pra casar com uma NF irmã do mesmo dia (ver
+        # obter_historico_unificado) — deixa em branco de propósito
+        df["data_emissao"] = pd.NaT
 
     df["chave"] = df["fatura"].fillna(df["lancamento"].astype(str))
 
@@ -897,7 +943,22 @@ def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     df["prioridade"] = df["tipo"].apply(lambda t: PRIORIDADE_TIPO.index(t) if t in PRIORIDADE_TIPO else 99)
     df = df.sort_values("prioridade").drop_duplicates(subset="chave", keep="first")
 
-    return df.groupby("mes", as_index=False).agg(
+    return df.rename(columns={"mes": "mes_bruto", "data_emissao": "data_emissao_exata"})[
+        ["fatura", "valor", "mes_bruto", "data_emissao_exata"]
+    ]
+
+
+def preparar_dados_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
+    """Mensalidade por mês (sem separar juros) + o(s) número(s) de
+    fatura/NF daquele mês — usada como peça pra somar vários
+    subcontratos de um grupo unificado. Agrupa direto pelo mês de
+    emissão CRU (ver _detalhar_parcelas_subcontrato): quem precisa da
+    correção de colisão por texto de NF é obter_historico_unificado, que
+    chama _detalhar_parcelas_subcontrato diretamente em vez desta."""
+    detalhes = _detalhar_parcelas_subcontrato(df_parcelas)
+    if detalhes.empty:
+        return pd.DataFrame(columns=["mes", "valor", "fatura"])
+    return detalhes.rename(columns={"mes_bruto": "mes"}).groupby("mes", as_index=False).agg(
         valor=("valor", "sum"),
         fatura=("fatura", lambda s: ", ".join(sorted(set(str(x) for x in s if pd.notna(x) and str(x).strip())))),
     )
@@ -995,7 +1056,15 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
         return pd.DataFrame(columns=colunas)
 
     materiais_recorrentes = set(MAPA_CODIGO_MATERIAL.keys())
-    linhas = []
+
+    # 1ª passada: junta cada linha (= 1 NF) com seus itens já parseados e
+    # o mês de emissão cru (fallback). Junto, tenta ler o período de
+    # referência REAL no texto de algum item dessa NF (ver
+    # extrair_periodo_do_texto_item) — guarda em periodo_confirmado_por_dia
+    # pra servir de referência pras NFs SEM esse texto (aluguel) emitidas
+    # no MESMO dia (ver 2ª passada).
+    linhas_cruas = []
+    periodo_confirmado_por_dia = {}
     for _, row in df.iterrows():
         if pd.isna(row.get("itensNf_json")):
             continue
@@ -1005,17 +1074,12 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
             continue
         if not itens:
             continue
-        # mesmo mês de referência de preparar_dados_subcontrato (ver lá):
-        # o mês em que a NF foi emitida, sem deslocamento — precisa bater
-        # com o mês já usado pelas parcelas, senão cria uma
-        # descontinuidade bem na costura entre os dois (ponta completada
-        # por faturamento real x histórico vindo de parcelasContrato).
-        mes = pd.Period(row["dataEmissao"], freq="M") if pd.notna(row["dataEmissao"]) else None
-        if mes is None:
+        if pd.isna(row["dataEmissao"]):
             continue
+        mes_bruto = pd.Period(row["dataEmissao"], freq="M")
+        chave_dia = (row["codigo_cliente"], pd.Timestamp(row["dataEmissao"]).date())
+        periodo_do_texto = None
         for item in itens:
-            # mesma proteção contra duplicata acessória de
-            # _buscar_itens_notas_fiscais_lote_cacheado
             if str(item.get("documento", "")).strip().upper() != "NF":
                 continue
             cod_material = str(item.get("codigoMaterial", "")).strip()
@@ -1026,10 +1090,30 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
             valor_item = preco * qtd if pd.notna(preco) and pd.notna(qtd) else preco
             if pd.isna(valor_item):
                 continue
-            linhas.append({
-                "codigo_cliente": row["codigo_cliente"], "mes": mes,
+            if periodo_do_texto is None:
+                periodo_do_texto = extrair_periodo_do_texto_item(item.get("descricao"))
+            linhas_cruas.append({
+                "codigo_cliente": row["codigo_cliente"], "mes_bruto": mes_bruto, "chave_dia": chave_dia,
                 "nf": str(row.get("nf", "")).strip(), "codigoMaterial": cod_material, "valor": valor_item,
             })
+        if periodo_do_texto is not None:
+            periodo_confirmado_por_dia.setdefault(chave_dia, periodo_do_texto)
+
+    # 2ª passada: resolve o "mes" de cada item — texto da PRÓPRIA NF
+    # primeiro, senão o de uma NF IRMÃ emitida no mesmo dia (aluguel e
+    # licenciamento do mesmo ciclo sempre emitem juntos, confirmado com
+    # dado real), senão o mês de emissão cru como último recurso. Sem
+    # isso, duas NFs de períodos DIFERENTES emitidas no mesmo mês
+    # corrente (o CIGAM às vezes acelera e emite 2 ciclos seguidos antes
+    # do próximo mês fechar) caem juntas no mesmo "mes" e a soma parece
+    # cobrança em dobro num mês só.
+    linhas = []
+    for linha in linhas_cruas:
+        mes = periodo_confirmado_por_dia.get(linha["chave_dia"], linha["mes_bruto"])
+        linhas.append({
+            "codigo_cliente": linha["codigo_cliente"], "mes": mes,
+            "nf": linha["nf"], "codigoMaterial": linha["codigoMaterial"], "valor": linha["valor"],
+        })
     if not linhas:
         return pd.DataFrame(columns=colunas)
     return pd.DataFrame(linhas)
@@ -1147,11 +1231,65 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
     segurança).
     """
     subcodigos = [normalizar_codigo_contrato(c) for c in str(codigo_contrato_grupo).split("/")]
+    detalhes_por_subcodigo = {cod: _detalhar_parcelas_subcontrato(buscar_parcelas_bq(cod)) for cod in subcodigos}
+
+    # corrige colisão de mês ANTES de somar: o CIGAM às vezes emite 2
+    # períodos seguidos dentro do MESMO mês de emissão (confirmado com
+    # dado real — cliente LUCANO TERRAPLANAGEM, contrato 3086/3087, NFs
+    # de período Junho/2025 e Julho/2025 as duas emitidas em julho/2025)
+    # — agrupar pelo mês de emissão cru, sem corrigir isso, soma as duas
+    # juntas num "mês" só, parecendo cobrança em dobro. O texto da NF
+    # ("PERIODO: X") é o único dado que confirma o período de cada uma;
+    # NFs sem esse texto (aluguel, nunca carrega) herdam o período
+    # confirmado de uma NF IRMÃ emitida no MESMO dia (aluguel e
+    # licenciamento do mesmo ciclo sempre emitem juntos).
+    todas_faturas_parcela = sorted(set(
+        str(f) for det in detalhes_por_subcodigo.values() if not det.empty
+        for f in det["fatura"].dropna() if str(f).strip()
+    ))
+    mapa_itens_parcela = buscar_itens_notas_fiscais_lote(todas_faturas_parcela) if todas_faturas_parcela else {}
+
+    def _periodo_confirmado_da_fatura(fatura):
+        for _desc, _val, texto in mapa_itens_parcela.get(str(fatura), []):
+            periodo = extrair_periodo_do_texto_item(texto)
+            if periodo is not None:
+                return periodo
+        return None
+
+    periodo_confirmado_por_dia = {}
+    for det in detalhes_por_subcodigo.values():
+        if det.empty:
+            continue
+        for _, linha in det.iterrows():
+            if pd.isna(linha["data_emissao_exata"]):
+                continue
+            periodo = _periodo_confirmado_da_fatura(linha["fatura"])
+            if periodo is not None:
+                periodo_confirmado_por_dia.setdefault(linha["data_emissao_exata"].date(), periodo)
+
+    def _resolver_mes(linha):
+        periodo = _periodo_confirmado_da_fatura(linha["fatura"])
+        if periodo is not None:
+            return periodo
+        if pd.notna(linha["data_emissao_exata"]):
+            periodo = periodo_confirmado_por_dia.get(linha["data_emissao_exata"].date())
+            if periodo is not None:
+                return periodo
+        return linha["mes_bruto"]
+
     partes = []
     partes_por_subcodigo = {}
     for cod in subcodigos:
-        df_parcelas = buscar_parcelas_bq(cod)
-        parte = preparar_dados_subcontrato(df_parcelas)
+        det = detalhes_por_subcodigo[cod]
+        if det.empty:
+            parte = pd.DataFrame(columns=["mes", "valor", "fatura"])
+        else:
+            det = det.copy()
+            det["mes"] = det.apply(_resolver_mes, axis=1)
+            parte = det.groupby("mes", as_index=False).agg(
+                valor=("valor", "sum"),
+                fatura=("fatura", lambda s: ", ".join(sorted(set(str(x) for x in s if pd.notna(x) and str(x).strip())))),
+            )
         partes.append(parte)
         partes_por_subcodigo[cod] = parte
 
