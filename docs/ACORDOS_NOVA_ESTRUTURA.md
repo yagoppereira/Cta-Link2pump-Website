@@ -18,6 +18,7 @@ ACORDOS_RESUMO     1 linha por acordo        (o que foi negociado + situação c
       │        │ ID ACORDO + Nº PGTO
       └────────┴── ACORDOS_TITULOS   1 linha por título × pagamento  (o que baixar no CIGAM)
 ACORDOS_PAINEL     indicadores e listas de follow-up, tudo calculado
+ACORDOS_CUMPRIMENTO  clientes cumprindo x em atraso x descumpriram (no estilo da aba Bloqueios)
 ```
 
 Em cada aba, **cabeçalho verde = preenchido** (à mão ou colado da macro) e
@@ -42,7 +43,7 @@ Regras do STATUS (parâmetros editáveis em `ACORDOS_PAINEL!B5:B7`, intervalos n
 `P_DIAS_QUEBRA`, `P_TOL`, `P_ALERTA`):
 
 - **QUITADO**: saldo a receber ≤ tolerância.
-- **QUEBRADO**: alguma parcela vencida há `B5` dias ou mais (padrão 15).
+- **QUEBRADO**: alguma parcela vencida há `B5` dias ou mais.
 - **EM ATRASO**: há parcela vencida, mas há menos de `B5` dias.
 - **EM DIA**: nada vencido em aberto.
 
@@ -76,18 +77,43 @@ Calculado:
 
 - `TIPO DE BAIXA`: PARCIAL ou QUITA O TÍTULO.
 - `STATUS DA PARCELA` e `AÇÃO NA BAIXA`: **BAIXAR TOTAL**, **BAIXAR PARCIAL** ou AGUARDAR PAGAMENTO.
-- `SITUAÇÃO NO CIGAM`: EM ABERTO (aba `BASE RAW`), EM ABERTO (X90) (aba `BASE X90`),
-  SEM DADO (APÓS CORTE DA BASE) ou BAIXADO / FORA DA BASE.
+- `SITUAÇÃO NO CIGAM`: EM ABERTO, EM ABERTO (X90), LIQUIDADO ou SEM DADO.
 - `SALDO NO CIGAM`.
 - `CONFERÊNCIA`: OK, OK (PARCIAL), AGUARDANDO PAGAMENTO, PAGO (SEM DADO DO CIGAM),
   **BAIXA PENDENTE**, **BAIXADO SEM PAGAMENTO**.
 
-A conferência depende de `BASE RAW` e `BASE X90` estarem atualizadas com o CIGAM.
-`ACORDOS_PAINEL!B8` mostra o último vencimento presente na `BASE RAW`; títulos com
-vencimento original posterior a essa data não aparecem na base e por isso ficam como
-"SEM DADO", em vez de serem acusados como baixados. "BAIXADO / FORA DA BASE" também
-cobre título unificado ou prorrogado no CIGAM: por isso o diagnóstico é "conferir", e
-não "erro".
+### Fonte do CIGAM: aba TÍTULOS UNIFICADOS
+
+A situação no CIGAM vem **só** da aba `TÍTULOS UNIFICADOS`, que é a base de
+inadimplência atualizada. As abas `BASE RAW` e `BASE X90` são legado e não são usadas.
+
+- A aba lista os títulos **vencidos e em aberto** (normais e X90; a coluna PORTADOR
+  diz quais são X90). Título que consta nela = EM ABERTO; título que não consta =
+  LIQUIDADO.
+- A busca é pela FATURA exata (`20287761/1`) e também pelo número sem parcela
+  (`20246006`), formato usado em parte dos títulos.
+- Como a aba só tem títulos já vencidos, um título com vencimento original posterior
+  ao último vencimento da base (`ACORDOS_PAINEL!B8`, intervalo `P_CORTE_BASE`)
+  ainda não pode aparecer nela. Esses ficam como "SEM DADO (AINDA NÃO VENCIDO NO
+  CIGAM)", em vez de serem tratados como liquidados.
+
+## ACORDOS_CUMPRIMENTO
+
+Equivalente à aba `Bloqueios`, só que calculado a partir da estrutura nova. Mostra
+quatro blocos lado a lado, cada um com contagem e total na linha 5:
+
+| Bloco | Critério (por cliente = EMPRESA do acordo) |
+|---|---|
+| **CUMPRINDO ACORDO** (não enviar carta de cobrança) | acordo EM DIA e o cliente não tem nenhum acordo QUEBRADO ou EM ATRASO |
+| **EM ATRASO** | acordo EM ATRASO e o cliente não tem acordo QUEBRADO |
+| **DESCUMPRIRAM** | acordo QUEBRADO |
+| **TÍTULOS EM ABERTO DOS ACORDOS DESCUMPRIDOS** | títulos dos acordos QUEBRADOS cuja parcela não foi paga, com a situação no CIGAM |
+
+A fronteira entre EM ATRASO e QUEBRADO é o parâmetro `ACORDOS_PAINEL!B5`. Com o
+valor 1, qualquer parcela vencida já marca o acordo como QUEBRADO, e EM ATRASO fica
+só com parcelas pagas a menor.
+
+A aba `Bloqueios` continua lendo a aba `ACORDOS` antiga e não foi alterada.
 
 ## Rotina
 
