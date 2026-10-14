@@ -102,6 +102,26 @@ casos conferidos, os juros só entraram como lançamento separado (E/J) na quita
 conferido no BigQuery: título 21744/3 (LEONARDO LEAL LOPES), valor 10.250,00, entrada do
 acordo alocou 2.427,23 → baixa E/L de 2.427,23 em 29/09/2026 e saldo 7.822,77 no CIGAM.
 
+### Principal e juros em cada baixa
+
+Pela mesma regra, cada linha de `ACORDOS_TITULOS` separa o valor alocado em:
+
+- `JUROS A LANÇAR NESTA PARCELA` (X): os juros do título (coluna H) entram inteiros na
+  linha que quita o título (saldo após = 0); nas linhas parciais é zero.
+- `PRINCIPAL A BAIXAR NESTA PARCELA` (W): valor alocado − juros.
+- `JUROS LANÇADOS NO CIGAM` (Y): soma dos lançamentos E/J do título, mostrada na linha
+  que quita o título quando a parcela já foi paga.
+- `CONFERÊNCIA DE JUROS` (Z): OK, JUROS A MENOR NO CIGAM, JUROS A MAIOR NO CIGAM ou
+  SEM CONFERÊNCIA (título unificado, em perda ou não encontrado).
+
+Totais: `ACORDOS_PARCELAS` S:T (principal e juros por parcela, o que a baixa precisa
+lançar), `ACORDOS_RESUMO` AA:AD (juros negociados, recebidos, lançados no CIGAM e
+diferença) e o bloco "JUROS EM ACORDOS" em `ACORDOS_PAINEL!D17:F21`.
+
+Nos acordos migrados, a coluna H é o juros calculado pela calculadora no legado; diferença
+para o lançado no CIGAM pode vir de juros recalculado na data do pagamento, desconto ou
+juros lançado em outro título do mesmo acordo (ver L-001).
+
 ### Saldo no CIGAM
 
 `SALDO NO CIGAM` = o menor entre o saldo da linha do título e
