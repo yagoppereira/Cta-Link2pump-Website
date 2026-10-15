@@ -13,13 +13,15 @@
 '                      colunas de entrada das abas da planilha de inadimplencia:
 '
 '        REG_ACORDO    -> ACORDOS_RESUMO   (1 linha por acordo,   colunas A:J)
-'        REG_PARCELAS  -> ACORDOS_PARCELAS (1 linha por pagamento, colunas A:G)
+'        REG_PARCELAS  -> ACORDOS_PARCELAS (1 linha por pagamento, colunas A:D)
 '        REG_TITULOS   -> ACORDOS_TITULOS  (1 linha por titulo x pagamento, A:K)
 '
 '   As tres tabelas sao ligadas pelo ID ACORDO (AC-<cod cliente>-<aaaammdd>).
 '   Depois de gerar, copie as linhas novas de cada aba REG_* e cole (somente
 '   valores) no fim da aba correspondente na planilha Google. Status, atraso,
 '   diagnostico e conferencia com o CIGAM sao calculados la, nao aqui.
+'   O dinheiro que entra NAO e lancado aqui: cada comprovante vira uma linha
+'   em ACORDOS_RECEBIMENTOS (data, ID ACORDO, valor) na planilha Google.
 '
 ' Depende de Module0_Nucleo.
 '
@@ -47,14 +49,11 @@ Public Const RA_TERMO    As Long = 8
 Public Const RA_SITMAN   As Long = 9
 Public Const RA_OBS      As Long = 10
 
-' REG_PARCELAS (= ACORDOS_PARCELAS A:G)
+' REG_PARCELAS (= ACORDOS_PARCELAS A:D)
 Public Const RP_ID       As Long = 1
 Public Const RP_NUM      As Long = 2
 Public Const RP_VENC     As Long = 3
 Public Const RP_VALOR    As Long = 4
-Public Const RP_DTREC    As Long = 5
-Public Const RP_VLREC    As Long = 6
-Public Const RP_OBS      As Long = 7
 
 ' REG_TITULOS (= ACORDOS_TITULOS A:K)
 Public Const RT_ID       As Long = 1
@@ -503,8 +502,8 @@ End Sub
 ' REG_ACORDO   : 1 linha  -> ID, data, responsavel, empresa, CNPJ, total, forma,
 '                            condicao, situacao manual (vazia), observacoes
 ' REG_PARCELAS : 1 linha por pagamento (0 = entrada) -> vencimento e valor
-'                previsto. DATA/VALOR RECEBIDO ficam em branco: sao preenchidos
-'                na planilha Google quando o dinheiro entra.
+'                previsto. Os recebimentos sao lancados na planilha Google
+'                (ACORDOS_RECEBIMENTOS), nao aqui.
 ' REG_TITULOS  : 1 linha por par TITULO x PAGAMENTO, em ordem FIFO.
 '                Os valores do titulo se repetem em todas as linhas dele; as
 '                somas da planilha usam so VALOR ALOCADO, entao nao ha soma
@@ -529,8 +528,7 @@ Public Function EmitirRegistro(pags() As PagPlano, ByVal nPag As Long, _
                 "RESPONSAVEL", "EMPRESA", "CNPJ", "TOTAL ACORDADO", "FORMA", _
                 "CONDICAO / TERMO", "SITUACAO MANUAL", "OBSERVACOES"))
     Set wsP = GarantirAbaRegistro(ABA_REG_PARCELAS, Array("ID ACORDO", _
-                "No PGTO (0 = ENTRADA)", "VENCIMENTO", "VALOR PREVISTO", _
-                "DATA RECEBIMENTO", "VALOR RECEBIDO", "OBS. RECEBIMENTO"))
+                "No PGTO (0 = ENTRADA)", "VENCIMENTO", "VALOR PREVISTO"))
     Set wsT = GarantirAbaRegistro(ABA_REG_TITULOS, Array("ID ACORDO", _
                 "No PGTO (0 = ENTRADA)", "EMPRESA", "FATURA (DOC)", "NFS-e", _
                 "VENCIMENTO ORIGINAL", "VALOR ORIGINAL", "JUROS", _

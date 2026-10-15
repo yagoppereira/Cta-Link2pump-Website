@@ -1,5 +1,6 @@
 /**
- * CTA SMART - Atualiza a aba CIGAM_TITULOS da planilha de inadimplencia.
+ * CTA SMART - Atualiza as abas CIGAM_TITULOS e CIGAM_BAIXAS da planilha
+ * de inadimplencia.
  *
  * Para cada titulo que esta em ACORDOS_TITULOS, busca no BigQuery
  * (silver.lancamentos_receber, espelho dos lancamentos do CIGAM):
@@ -8,9 +9,14 @@
  *       L = liquidacao (pagamento), J = juros, U = unificacao,
  *       portador X90/X91/X92 = baixa por perda (nao e pagamento)
  *
- * As formulas de ACORDOS_TITULOS comparam o saldo do CIGAM com o saldo
- * esperado pelo acordo e apontam baixa pendente, baixa sem pagamento
- * registrado e saldo que precisa ser prorrogado.
+ * CIGAM_TITULOS: uma linha por titulo (saldo e totais por tipo de entrada).
+ * CIGAM_BAIXAS:  uma linha por entrada L (liquidacao) ou J (juros), com data,
+ *                sem perdas (X90/X91/X92) e sem unificacoes. A coluna H
+ *                (ID ACORDO) e formula da planilha e nao e tocada aqui.
+ *
+ * As formulas do ciclo (ACORDOS_RESUMO / ACORDOS_TITULOS) comparam o que
+ * foi lancado em ACORDOS_RECEBIMENTOS com o que foi baixado no CIGAM e
+ * com o saldo dos titulos.
  *
  * Instalacao (uma vez):
  *   1. Na planilha: Extensoes > Apps Script. Colar este arquivo.
@@ -23,6 +29,8 @@
 const PROJETO_BQ = 'hip-bonito-453017-m2';
 const ABA_TITULOS = 'ACORDOS_TITULOS';
 const ABA_CIGAM = 'CIGAM_TITULOS';
+const ABA_BAIXAS = 'CIGAM_BAIXAS';
+const CABECALHO_BAIXAS = ['EMPRESA', 'FATURA', 'CHAVE', 'DATA', 'TIPO (L = LIQUIDAÇÃO, J = JUROS)', 'VALOR', 'CONTA'];
 const CABECALHO = [
   'EMPRESA', 'FATURA', 'CHAVE', 'TIPO', 'SITUAÇÃO', 'VALOR', 'SALDO',
   'VENC. ATUAL', 'VENC. ORIGINAL', 'PORTADOR', 'LIQUIDADO (E/L)',
@@ -67,6 +75,43 @@ function atualizarCigamAcordos() {
     "WHERE t.codigoTipo IN ('R','c')\n" +
     'ORDER BY 1, 2';
 
+  const rows = consultar_(sql);
+
+  const num = function (v) { return v === null || v === undefined || v === '' ? '' : Number(v); };
+  const dt = function (v) {
+    if (!v) return '';
+    const p = String(v).split('-');  // AAAA-MM-DD
+    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  };
+  const dados = rows.map(function (r) {
+    const f = r.f.map(function (c) { return c.v; });
+    return [f[0], f[1], f[0] + '|' + f[1], f[2], f[3], num(f[4]), num(f[5]), dt(f[6]), dt(f[7]),
+            f[8] || '', num(f[9]), num(f[10]), num(f[11]), num(f[12]), dt(f[13])];
+  });
+
+  gravar_(ss, ABA_CIGAM, CABECALHO, dados);
+
+  // Entradas (pagamentos e juros) com data, para o ciclo de baixa.
+  const sqlBaixas =
+    'WITH alvo AS (SELECT * FROM UNNEST([STRUCT<emp STRING, fat STRING>' + lista.join(',') + '])),\n' +
+    "tit AS (SELECT l.codigoLancamento, l.codigoEmpresa emp, l.fatura fat, TRIM(IFNULL(l.complemento,'')) comp\n" +
+    '  FROM `' + PROJETO_BQ + '.silver.lancamentos_receber` l\n' +
+    "  JOIN alvo a ON l.codigoEmpresa = a.emp AND l.fatura = a.fat WHERE l.codigoTipo IN ('R','c'))\n" +
+    "SELECT t.emp, CONCAT(t.fat,'/',t.comp), SAFE.PARSE_DATE('%d/%m/%Y', e.data), e.situacao,\n" +
+    "  SAFE_CAST(e.valor AS NUMERIC), IFNULL(e.codigoPortador,'')\n" +
+    'FROM tit t JOIN `' + PROJETO_BQ + '.silver.lancamentos_receber` e\n' +
+    "  ON e.codigoPartida = t.codigoLancamento AND e.codigoTipo = 'E'\n" +
+    "WHERE e.situacao IN ('L','J') AND IFNULL(e.codigoPortador,'') NOT IN ('X90','X91','X92')\n" +
+    'ORDER BY 1, 2, 3';
+  const baixas = consultar_(sqlBaixas).map(function (r) {
+    const f = r.f.map(function (c) { return c.v; });
+    return [f[0], f[1], f[0] + '|' + f[1], dt(f[2]), f[3], num(f[4]), f[5]];
+  });
+  gravar_(ss, ABA_BAIXAS, CABECALHO_BAIXAS, baixas);
+}
+
+/** Roda a consulta no BigQuery e devolve todas as linhas (todas as paginas). */
+function consultar_(sql) {
   let resp = BigQuery.Jobs.query({ query: sql, useLegacySql: false, timeoutMs: 60000 }, PROJETO_BQ);
   const jobId = resp.jobReference.jobId;
   const local = resp.jobReference.location;
@@ -81,27 +126,19 @@ function atualizarCigamAcordos() {
     rows = rows.concat(pag.rows || []);
     token = pag.pageToken;
   }
+  return rows;
+}
 
-  const num = function (v) { return v === null || v === undefined || v === '' ? '' : Number(v); };
-  const dt = function (v) {
-    if (!v) return '';
-    const p = String(v).split('-');  // AAAA-MM-DD
-    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
-  };
-  const dados = rows.map(function (r) {
-    const f = r.f.map(function (c) { return c.v; });
-    return [f[0], f[1], f[0] + '|' + f[1], f[2], f[3], num(f[4]), num(f[5]), dt(f[6]), dt(f[7]),
-            f[8] || '', num(f[9]), num(f[10]), num(f[11]), num(f[12]), dt(f[13])];
-  });
-
-  let aba = ss.getSheetByName(ABA_CIGAM);
-  if (!aba) aba = ss.insertSheet(ABA_CIGAM);
-  aba.getRange(2, 1, Math.max(aba.getMaxRows() - 1, 1), CABECALHO.length).clearContent();
-  aba.getRange(1, 1, 1, CABECALHO.length).setValues([CABECALHO]);
+/** Substitui os dados da aba (colunas do cabecalho) e grava a data da carga em Q1/R1. */
+function gravar_(ss, nome, cabecalho, dados) {
+  let aba = ss.getSheetByName(nome);
+  if (!aba) aba = ss.insertSheet(nome);
+  aba.getRange(2, 1, Math.max(aba.getMaxRows() - 1, 1), cabecalho.length).clearContent();
+  aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]);
   if (dados.length) {
-    aba.getRange(2, 2, dados.length, 1).setNumberFormat('@');   // fatura como texto
-    aba.getRange(2, 3, dados.length, 1).setNumberFormat('@');
-    aba.getRange(2, 1, dados.length, CABECALHO.length).setValues(dados);
+    if (aba.getMaxRows() < dados.length + 1) aba.insertRowsAfter(aba.getMaxRows(), dados.length + 1 - aba.getMaxRows());
+    aba.getRange(2, 1, dados.length, 3).setNumberFormat('@');   // empresa, fatura e chave como texto
+    aba.getRange(2, 1, dados.length, cabecalho.length).setValues(dados);
   }
   aba.getRange('Q1').setValue('ATUALIZADO EM');
   aba.getRange('R1').setValue(new Date()).setNumberFormat('dd/mm/yyyy hh:mm');
