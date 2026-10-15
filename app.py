@@ -14,6 +14,8 @@ import re
 import concurrent.futures
 import os
 import tempfile
+import threading
+import time
 import unicodedata
 from datetime import date
 import pandas as pd
@@ -23,7 +25,6 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import streamlit as st
 
-import equipamentos_sistema
 import gerar_espelho_nfse
 import gerar_nota_debito
 
@@ -98,6 +99,63 @@ def extrair_periodo_do_texto_item(texto: str):
     if not mes_num:
         return None
     return pd.Period(f"{m.group(2)}-{mes_num:02d}", freq="M")
+
+
+# NF sem texto de período (aluguel) herda o período da NF irmã com texto
+# (licenciamento) do mesmo ciclo. As duas nem sempre saem no mesmo dia:
+# contrato 6765/6766 tem aluguel emitido 05/01/2026 e o licenciamento do
+# mesmo ciclo 08/01/2026. A janela é curta o bastante pra nunca alcançar o
+# ciclo vizinho — mesmo quando o CIGAM emite 2 ciclos no mesmo mês, eles
+# saem com 3 semanas de distância (LUCANO, 01/07 e 22/07/2025).
+JANELA_DIAS_NF_IRMA = 7
+
+
+class ResolvedorPeriodoNF:
+    """Mês de referência de cada NF de UM grupo de contratos (ou de um
+    cliente), sempre na MESMA convenção pra todas as NFs do grupo:
+      1. texto da própria NF ("PERIODO: X/Ano", ver extrair_periodo_do_texto_item);
+      2. período de uma NF irmã com texto emitida a até
+         JANELA_DIAS_NF_IRMA dias — a mais próxima (empate = ambíguo, pula);
+      3. mês de emissão + o deslocamento que o grupo mostra entre emissão
+         e texto (na prática sempre -1: a NF de período X sai no mês X+1);
+         sem nenhuma NF com texto no grupo, deslocamento 0.
+    Antes o passo 3 usava o mês de emissão cru, sem deslocamento: num grupo
+    em que o licenciamento era corrigido pelo texto e o aluguel não, os
+    dois lados ficavam em convenções diferentes e um mês somava 2 aluguéis
+    enquanto o anterior ficava sem nenhum (contrato 6765/6766: Jan/26 com
+    R$ 810 = 2 × R$ 135 + R$ 540, Dez/25 sem aluguel)."""
+
+    def __init__(self):
+        self._confirmados = {}  # date -> Period (texto de NF emitida nesse dia)
+
+    def registrar(self, data_emissao, periodo_do_texto):
+        if periodo_do_texto is None or data_emissao is None or pd.isna(data_emissao):
+            return
+        self._confirmados.setdefault(pd.Timestamp(data_emissao).date(), periodo_do_texto)
+
+    def _deslocamento(self) -> int:
+        if not self._confirmados:
+            return 0
+        difs = pd.Series([(p - pd.Period(d, freq="M")).n for d, p in self._confirmados.items()])
+        return int(difs.mode().iloc[0])
+
+    def resolver(self, periodo_do_texto, data_emissao, mes_bruto):
+        if periodo_do_texto is not None:
+            return periodo_do_texto
+        if data_emissao is not None and not pd.isna(data_emissao) and self._confirmados:
+            dia = pd.Timestamp(data_emissao).date()
+            if dia in self._confirmados:
+                return self._confirmados[dia]
+            distancias = sorted(
+                (abs((d - dia).days), p) for d, p in self._confirmados.items()
+                if abs((d - dia).days) <= JANELA_DIAS_NF_IRMA
+            )
+            if distancias and (len(distancias) == 1 or distancias[0][0] < distancias[1][0]
+                               or distancias[0][1] == distancias[1][1]):
+                return distancias[0][1]
+        if mes_bruto is None or pd.isna(mes_bruto):
+            return mes_bruto
+        return mes_bruto + self._deslocamento()
 
 
 def formatar_moeda(valor: float) -> str:
@@ -1064,7 +1122,7 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
     # pra servir de referência pras NFs SEM esse texto (aluguel) emitidas
     # no MESMO dia (ver 2ª passada).
     linhas_cruas = []
-    periodo_confirmado_por_dia = {}
+    resolvedores = {}  # codigo_cliente -> ResolvedorPeriodoNF
     for _, row in df.iterrows():
         if pd.isna(row.get("itensNf_json")):
             continue
@@ -1077,8 +1135,8 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
         if pd.isna(row["dataEmissao"]):
             continue
         mes_bruto = pd.Period(row["dataEmissao"], freq="M")
-        chave_dia = (row["codigo_cliente"], pd.Timestamp(row["dataEmissao"]).date())
         periodo_do_texto = None
+        itens_da_nf = []
         for item in itens:
             if str(item.get("documento", "")).strip().upper() != "NF":
                 continue
@@ -1092,24 +1150,27 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
                 continue
             if periodo_do_texto is None:
                 periodo_do_texto = extrair_periodo_do_texto_item(item.get("descricao"))
-            linhas_cruas.append({
-                "codigo_cliente": row["codigo_cliente"], "mes_bruto": mes_bruto, "chave_dia": chave_dia,
+            itens_da_nf.append({
+                "codigo_cliente": row["codigo_cliente"], "mes_bruto": mes_bruto,
+                "data_emissao": row["dataEmissao"],
                 "nf": str(row.get("nf", "")).strip(), "codigoMaterial": cod_material, "valor": valor_item,
             })
-        if periodo_do_texto is not None:
-            periodo_confirmado_por_dia.setdefault(chave_dia, periodo_do_texto)
+        # o texto pode estar em qualquer item da NF — vale pra todos eles
+        for item_nf in itens_da_nf:
+            item_nf["periodo_do_texto"] = periodo_do_texto
+        linhas_cruas.extend(itens_da_nf)
+        resolvedores.setdefault(row["codigo_cliente"], ResolvedorPeriodoNF()).registrar(
+            row["dataEmissao"], periodo_do_texto)
 
-    # 2ª passada: resolve o "mes" de cada item — texto da PRÓPRIA NF
-    # primeiro, senão o de uma NF IRMÃ emitida no mesmo dia (aluguel e
-    # licenciamento do mesmo ciclo sempre emitem juntos, confirmado com
-    # dado real), senão o mês de emissão cru como último recurso. Sem
-    # isso, duas NFs de períodos DIFERENTES emitidas no mesmo mês
-    # corrente (o CIGAM às vezes acelera e emite 2 ciclos seguidos antes
-    # do próximo mês fechar) caem juntas no mesmo "mes" e a soma parece
-    # cobrança em dobro num mês só.
+    # 2ª passada: resolve o "mes" de cada item com as regras de
+    # ResolvedorPeriodoNF (texto próprio > NF irmã próxima > emissão com o
+    # deslocamento do cliente). Sem isso, duas NFs de períodos DIFERENTES
+    # emitidas no mesmo mês corrente caem juntas no mesmo "mes" e a soma
+    # parece cobrança em dobro num mês só.
     linhas = []
     for linha in linhas_cruas:
-        mes = periodo_confirmado_por_dia.get(linha["chave_dia"], linha["mes_bruto"])
+        mes = resolvedores[linha["codigo_cliente"]].resolver(
+            linha["periodo_do_texto"], linha["data_emissao"], linha["mes_bruto"])
         linhas.append({
             "codigo_cliente": linha["codigo_cliente"], "mes": mes,
             "nf": linha["nf"], "codigoMaterial": linha["codigoMaterial"], "valor": linha["valor"],
@@ -1240,9 +1301,9 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
     # — agrupar pelo mês de emissão cru, sem corrigir isso, soma as duas
     # juntas num "mês" só, parecendo cobrança em dobro. O texto da NF
     # ("PERIODO: X") é o único dado que confirma o período de cada uma;
-    # NFs sem esse texto (aluguel, nunca carrega) herdam o período
-    # confirmado de uma NF IRMÃ emitida no MESMO dia (aluguel e
-    # licenciamento do mesmo ciclo sempre emitem juntos).
+    # NFs sem esse texto (aluguel, nunca carrega) seguem as regras de
+    # ResolvedorPeriodoNF (NF irmã próxima, senão emissão no mesmo
+    # deslocamento do grupo).
     todas_faturas_parcela = sorted(set(
         str(f) for det in detalhes_por_subcodigo.values() if not det.empty
         for f in det["fatura"].dropna() if str(f).strip()
@@ -1256,26 +1317,16 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
                 return periodo
         return None
 
-    periodo_confirmado_por_dia = {}
+    resolvedor = ResolvedorPeriodoNF()
     for det in detalhes_por_subcodigo.values():
         if det.empty:
             continue
         for _, linha in det.iterrows():
-            if pd.isna(linha["data_emissao_exata"]):
-                continue
-            periodo = _periodo_confirmado_da_fatura(linha["fatura"])
-            if periodo is not None:
-                periodo_confirmado_por_dia.setdefault(linha["data_emissao_exata"].date(), periodo)
+            resolvedor.registrar(linha["data_emissao_exata"], _periodo_confirmado_da_fatura(linha["fatura"]))
 
     def _resolver_mes(linha):
-        periodo = _periodo_confirmado_da_fatura(linha["fatura"])
-        if periodo is not None:
-            return periodo
-        if pd.notna(linha["data_emissao_exata"]):
-            periodo = periodo_confirmado_por_dia.get(linha["data_emissao_exata"].date())
-            if periodo is not None:
-                return periodo
-        return linha["mes_bruto"]
+        return resolvedor.resolver(
+            _periodo_confirmado_da_fatura(linha["fatura"]), linha["data_emissao_exata"], linha["mes_bruto"])
 
     partes = []
     partes_por_subcodigo = {}
@@ -2821,6 +2872,40 @@ def buscar_data_cancelamento_bq(codigo_contrato_grupo: str):
     return None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_datas_cancelamento_lote(codigos_grupos: tuple) -> dict:
+    """Mesma regra de buscar_data_cancelamento_bq (primeira data não
+    vazia entre os subcódigos do grupo, na ordem do grupo), mas numa
+    consulta só pra todos os grupos encerrados do cliente — antes era uma
+    consulta por subcódigo, uma depois da outra."""
+    if MODO_DEMO:
+        return {g: buscar_data_cancelamento_bq(g) for g in codigos_grupos}
+    subcodigos_por_grupo = {
+        g: [normalizar_codigo_contrato(c) for c in str(g).split("/")] for g in codigos_grupos
+    }
+    todos = sorted({c for subs in subcodigos_por_grupo.values() for c in subs})
+    if not todos:
+        return {}
+    query = f"""
+    SELECT codigoContrato, dataCancelamento
+    FROM `{PROJECT_ID}.bronze.cigam__contratos`
+    WHERE codigoContrato IN UNNEST(@codigos)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "STRING", todos)]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    data_por_subcodigo = {}
+    for _, linha in df.iterrows():
+        valor = linha["dataCancelamento"]
+        if pd.notna(valor) and str(valor).strip():
+            data_por_subcodigo.setdefault(str(linha["codigoContrato"]), str(valor))
+    return {
+        g: next((data_por_subcodigo[c] for c in subs if c in data_por_subcodigo), None)
+        for g, subs in subcodigos_por_grupo.items()
+    }
+
+
 def resumir_lista(itens: list, max_itens: int = 3, max_chars_item: int = 60) -> str:
     """Evita hover/legendas gigantes: mostra os primeiros N itens (truncados)
     e resume o resto como '(+M itens)'. Útil quando um único codigoContrato
@@ -3279,13 +3364,48 @@ def buscar_itens_notas_fiscais_lote(numeros_nf: list) -> dict:
     numeros_validos = tuple(sorted(set(str(n).strip() for n in numeros_nf if n and str(n).strip())))
     if not numeros_validos:
         return {}
-    return _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos)
+
+    # cache POR NF, não por lista: cada leitura de cigam__notas_fiscais
+    # varre a tabela inteira (~2 s, sem filtro de data possível — só temos
+    # o número), e o mesmo grupo pede quase as mesmas NFs duas vezes em
+    # obter_historico_unificado (faturas das parcelas, depois faturas por
+    # mês). Com cache por lista, qualquer NF a mais ou a menos virava uma
+    # leitura nova; aqui só vai ao BigQuery o que ainda não foi buscado.
+    # NF não encontrada também fica guardada (None) pra não repetir a
+    # leitura — expira junto, então NF que entrar no DW depois aparece.
+    cache = _cache_itens_nf_por_numero()
+    agora = time.monotonic()
+    with cache["lock"]:
+        encontrados = {
+            n: cache["itens"][n][1] for n in numeros_validos
+            if n in cache["itens"] and agora - cache["itens"][n][0] < TTL_ITENS_NF_SEGUNDOS
+        }
+    faltando = tuple(n for n in numeros_validos if n not in encontrados)
+    if faltando:
+        novos = _consultar_itens_notas_fiscais(faltando)
+        with cache["lock"]:
+            if len(cache["itens"]) > 200_000:
+                cache["itens"].clear()
+            for n in faltando:
+                cache["itens"][n] = (agora, novos.get(n))
+                encontrados[n] = novos.get(n)
+    return {n: itens for n, itens in encontrados.items() if itens is not None}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos: tuple) -> dict:
-    """Miolo cacheado de buscar_itens_notas_fiscais_lote — recebe tupla
-    já normalizada (ver docstring da casca acima)."""
+TTL_ITENS_NF_SEGUNDOS = 1800
+
+
+@st.cache_resource
+def _cache_itens_nf_por_numero():
+    """Dicionário {numero: (instante, itens|None)} compartilhado entre
+    sessões e threads (relatorio_cliente processa grupos em paralelo)."""
+    return {"itens": {}, "lock": threading.Lock()}
+
+
+def _consultar_itens_notas_fiscais(numeros_validos: tuple) -> dict:
+    """Consulta de fato os itens de NF no BigQuery — chamada só por
+    buscar_itens_notas_fiscais_lote, com as NFs que ainda não estão no
+    cache por NF (ver lá)."""
     numeros_validos = list(numeros_validos)
     if MODO_DEMO:
         _, itens_demo = obter_dados_demo_bq()
@@ -3341,6 +3461,29 @@ def _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos: tuple) -> dict:
                 # decidir qual "ganha"
                 resultado.setdefault(chave, lista_itens)
     return resultado
+
+
+def preaquecer_itens_nf_dos_grupos(codigos_grupos) -> None:
+    """Busca numa leitura só os itens de NF de TODAS as faturas das
+    parcelas dos grupos — antes cada grupo lia cigam__notas_fiscais por
+    conta própria (tabela inteira a cada leitura, ~2 s), então um cliente
+    com 16 grupos fazia 16+ leituras. Depois disso, obter_historico_unificado
+    encontra quase tudo no cache por NF de buscar_itens_notas_fiscais_lote.
+    As parcelas buscadas aqui também ficam no cache de buscar_parcelas_bq."""
+    subcodigos = sorted({
+        normalizar_codigo_contrato(c) for g in codigos_grupos for c in str(g).split("/") if str(c).strip()
+    })
+    if not subcodigos:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(subcodigos))) as executor:
+        todas_parcelas = list(executor.map(buscar_parcelas_bq, subcodigos))
+    faturas = set()
+    for df_parcelas in todas_parcelas:
+        detalhes = _detalhar_parcelas_subcontrato(df_parcelas)
+        if not detalhes.empty:
+            faturas.update(str(f).strip() for f in detalhes["fatura"].dropna() if str(f).strip())
+    if faturas:
+        buscar_itens_notas_fiscais_lote(sorted(faturas))
 
 
 def calcular_composicao_real(codigo_contrato_grupo: str) -> str:
@@ -3444,9 +3587,7 @@ def relatorio_cliente(
     # busca a data de cancelamento no BigQuery só para os grupos encerrados
     # (evita consulta desnecessária para contratos ainda ativos)
     grupos_encerrados = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].unique()
-    mapa_data_cancelamento = {}
-    for cod_grupo in grupos_encerrados:
-        mapa_data_cancelamento[cod_grupo] = buscar_data_cancelamento_bq(cod_grupo)
+    mapa_data_cancelamento = buscar_datas_cancelamento_lote(tuple(sorted(grupos_encerrados)))
     contratos["Data Cancelamento"] = contratos["codigoContrato"].map(mapa_data_cancelamento)
 
     equipamentos = df_bombas[df_bombas["cliente_cigam_pagante"].isin(codigos_cliente)].copy()
@@ -3610,6 +3751,7 @@ def relatorio_cliente(
         }
 
     with st.spinner(f"Buscando histórico de {len(grupos)} grupo(s) de contrato no BigQuery..."):
+        preaquecer_itens_nf_dos_grupos([cod_grupo for cod_grupo, _ in grupos])
         # cada grupo faz consultas de REDE independentes (BigQuery) — não
         # tem motivo pra esperar uma terminar pra começar a próxima.
         # ThreadPoolExecutor (não multiprocessing) porque o gargalo aqui
@@ -3869,13 +4011,13 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 
 def _renderizar_legenda_abas():
-    """Rótulo + cor por cima da barra de abas, separando 'Cliente', 'Grupo
-    econômico' e 'Equipamentos' (Análise, na ponta esquerda) de 'Espelho
-    NFS-e' e 'Nota de Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
+    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
+    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
     alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
-    (posição 0-4, estável entre versões do Streamlit; bem mais confiável que
+    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
     mirar pela classe emotion-cache, que muda a cada build):
-    - empurra a aba 3 (Espelho NFS-e) pra ponta direita com margin-left:auto
+    - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
       no container flex (truque clássico de flexbox pra "quebrar" um grupo
       de itens em dois blocos nas pontas), com uma borda antes marcando a
       separação;
@@ -3895,27 +4037,25 @@ def _renderizar_legenda_abas():
             display: flex !important;
             width: 100% !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"] {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
             margin-left: auto !important;
             border-left: 1px solid rgba(138,149,168,0.4);
             padding-left: 16px;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p {{
             color: {_COR_GRUPO_ANALISE} !important;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_ANALISE} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p {{
             color: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
         </style>
@@ -4099,6 +4239,16 @@ def relatorio_grupo(termo: str):
     # preparar_dados_subcontrato (ver comentário equivalente em
     # relatorio_cliente)
     mes_atual_validacao = pd.Timestamp.now().to_period("M") - 1
+    # uma leitura só das NFs de todas as empresas do grupo (ver
+    # preaquecer_itens_nf_dos_grupos) antes do laço, que é sequencial
+    with st.spinner("Buscando histórico dos contratos do grupo no BigQuery..."):
+        preaquecer_itens_nf_dos_grupos([
+            cod_grupo
+            for _, emp in df_resumo.iterrows()
+            if contratos_por_empresa.get(int(emp["Código"])) is not None
+            and not contratos_por_empresa.get(int(emp["Código"])).empty
+            for cod_grupo, _ in montar_grupos_contrato(contratos_por_empresa.get(int(emp["Código"])))
+        ])
     for _, emp in df_resumo.iterrows():
         cod = int(emp["Código"])
         contratos_emp = contratos_por_empresa.get(cod)
@@ -4821,8 +4971,8 @@ def renderizar_nota_debito():
 _renderizar_cabecalho()
 _renderizar_legenda_abas()
 
-aba_cliente, aba_grupo, aba_equipamentos, aba_espelho, aba_nota_debito = st.tabs(
-    ["Cliente", "Grupo econômico", "Equipamentos", "Espelho NFS-e", "Nota de Débito"])
+aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
+    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -4871,9 +5021,6 @@ with aba_grupo:
 
     if st.session_state.get("grupo_buscado"):
         relatorio_grupo(st.session_state["grupo_buscado"])
-
-with aba_equipamentos:
-    equipamentos_sistema.renderizar_aba_equipamentos(client_bq, PROJECT_ID, MODO_DEMO)
 
 with aba_espelho:
     renderizar_espelho_nfse()
