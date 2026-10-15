@@ -33,7 +33,13 @@ st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wid
 # --- 1. Configuração ---
 PROJECT_ID = "hip-bonito-453017-m2"
 
-PRIORIDADE_TIPO = ["E", "c", "R"]
+# qual linha da parcela vale como a mensalidade de uma fatura: a COBRANÇA
+# (c = recebida, R = a receber) traz o valor faturado. O recebimento (E)
+# fica por último: uma fatura paga em 2 vezes tem 2 linhas E (ex.: R$ 50 +
+# R$ 470 de uma cobrança de R$ 520), e pegar só uma delas fazia o mês
+# despencar no gráfico. Fatura sem cobrança (raríssimo: 1 em 143 mil desde
+# 2023) soma os recebimentos — ver _detalhar_parcelas_subcontrato.
+PRIORIDADE_TIPO = ["c", "R", "E"]
 TAMANHO_CODIGO_CONTRATO = 8
 
 SITUACAO_CONTRATO_LABELS = {"A": "Ativo", "E": "Encerrado/Cancelado", "S": "Suspenso", "C": "Cancelado", "P": "Pendente"}
@@ -1103,7 +1109,13 @@ def _detalhar_parcelas_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
         if not por_chave.empty else df["texto_parcela"]
 
     df["prioridade"] = df["tipo"].apply(lambda t: PRIORIDADE_TIPO.index(t) if t in PRIORIDADE_TIPO else 99)
-    df = df.sort_values("prioridade").drop_duplicates(subset="chave", keep="first")
+    soma_recebida = df[df["tipo"] == "E"].groupby("chave")["valor"].sum()
+    df = df.sort_values("prioridade", kind="stable").drop_duplicates(subset="chave", keep="first")
+    # sem linha de cobrança: o valor é a SOMA dos recebimentos (pagamento
+    # parcial), não o primeiro deles
+    so_recebimento = df["tipo"] == "E"
+    if so_recebimento.any():
+        df.loc[so_recebimento, "valor"] = df.loc[so_recebimento, "chave"].map(soma_recebida)
 
     return df.rename(columns={"mes": "mes_bruto", "data_emissao": "data_emissao_exata"})[
         ["fatura", "valor", "mes_bruto", "data_emissao_exata", "periodo_parcela", "texto_parcela"]
@@ -1295,7 +1307,7 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
     return pd.concat(partes).rename(columns={"fatura": "nf"})[colunas]
 
 
-def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes) -> pd.DataFrame:
+def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes, ignorar_nfs=()) -> pd.DataFrame:
     """Monta uma 'parte' (mes, valor, fatura) no mesmo formato que
     preparar_dados_subcontrato devolve, só que a partir de faturamento
     REAL (buscar_faturamento_recorrente_bq) em vez de parcelasContrato —
@@ -1316,7 +1328,16 @@ def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes
     df_fat = buscar_faturamento_recorrente_bq((codigo_cliente,), desde=(depois_de + 1).start_time.strftime("%Y-%m-%d"))
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
-    df_fat = df_fat[df_fat["codigoMaterial"].isin(materiais) & (df_fat["mes"] <= ate_mes)]
+    # o corte da consulta é pela EMISSÃO (depois_de + 1), mas o mês de cada NF
+    # é o PERÍODO dela — a NF emitida em 01/10 é do período de setembro, que
+    # já veio das parcelas. Sem filtrar pelo mês (e pelas NFs já contadas),
+    # setembro entrava duas vezes e o último ponto do gráfico dobrava.
+    ignorar = {str(n).strip() for n in ignorar_nfs}
+    df_fat = df_fat[
+        df_fat["codigoMaterial"].isin(materiais)
+        & (df_fat["mes"] > depois_de) & (df_fat["mes"] <= ate_mes)
+        & ~df_fat["nf"].astype(str).str.strip().isin(ignorar)
+    ]
     if df_fat.empty:
         return pd.DataFrame(columns=["mes", "valor", "fatura"])
     return df_fat.groupby("mes", as_index=False).agg(
@@ -1494,6 +1515,7 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
                 materiais=materiais_cod,
                 depois_de=ultimo_mes_cod,
                 ate_mes=validar_faturamento_real["ate_mes"],
+                ignorar_nfs=todas_faturas_parcela,
             )
             if not parte_real.empty:
                 partes.append(parte_real)
