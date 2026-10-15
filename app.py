@@ -23,7 +23,6 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import streamlit as st
 
-import equipamentos_sistema
 import gerar_espelho_nfse
 import gerar_nota_debito
 
@@ -98,6 +97,63 @@ def extrair_periodo_do_texto_item(texto: str):
     if not mes_num:
         return None
     return pd.Period(f"{m.group(2)}-{mes_num:02d}", freq="M")
+
+
+# NF sem texto de período (aluguel) herda o período da NF irmã com texto
+# (licenciamento) do mesmo ciclo. As duas nem sempre saem no mesmo dia:
+# contrato 6765/6766 tem aluguel emitido 05/01/2026 e o licenciamento do
+# mesmo ciclo 08/01/2026. A janela é curta o bastante pra nunca alcançar o
+# ciclo vizinho — mesmo quando o CIGAM emite 2 ciclos no mesmo mês, eles
+# saem com 3 semanas de distância (LUCANO, 01/07 e 22/07/2025).
+JANELA_DIAS_NF_IRMA = 7
+
+
+class ResolvedorPeriodoNF:
+    """Mês de referência de cada NF de UM grupo de contratos (ou de um
+    cliente), sempre na MESMA convenção pra todas as NFs do grupo:
+      1. texto da própria NF ("PERIODO: X/Ano", ver extrair_periodo_do_texto_item);
+      2. período de uma NF irmã com texto emitida a até
+         JANELA_DIAS_NF_IRMA dias — a mais próxima (empate = ambíguo, pula);
+      3. mês de emissão + o deslocamento que o grupo mostra entre emissão
+         e texto (na prática sempre -1: a NF de período X sai no mês X+1);
+         sem nenhuma NF com texto no grupo, deslocamento 0.
+    Antes o passo 3 usava o mês de emissão cru, sem deslocamento: num grupo
+    em que o licenciamento era corrigido pelo texto e o aluguel não, os
+    dois lados ficavam em convenções diferentes e um mês somava 2 aluguéis
+    enquanto o anterior ficava sem nenhum (contrato 6765/6766: Jan/26 com
+    R$ 810 = 2 × R$ 135 + R$ 540, Dez/25 sem aluguel)."""
+
+    def __init__(self):
+        self._confirmados = {}  # date -> Period (texto de NF emitida nesse dia)
+
+    def registrar(self, data_emissao, periodo_do_texto):
+        if periodo_do_texto is None or data_emissao is None or pd.isna(data_emissao):
+            return
+        self._confirmados.setdefault(pd.Timestamp(data_emissao).date(), periodo_do_texto)
+
+    def _deslocamento(self) -> int:
+        if not self._confirmados:
+            return 0
+        difs = pd.Series([(p - pd.Period(d, freq="M")).n for d, p in self._confirmados.items()])
+        return int(difs.mode().iloc[0])
+
+    def resolver(self, periodo_do_texto, data_emissao, mes_bruto):
+        if periodo_do_texto is not None:
+            return periodo_do_texto
+        if data_emissao is not None and not pd.isna(data_emissao) and self._confirmados:
+            dia = pd.Timestamp(data_emissao).date()
+            if dia in self._confirmados:
+                return self._confirmados[dia]
+            distancias = sorted(
+                (abs((d - dia).days), p) for d, p in self._confirmados.items()
+                if abs((d - dia).days) <= JANELA_DIAS_NF_IRMA
+            )
+            if distancias and (len(distancias) == 1 or distancias[0][0] < distancias[1][0]
+                               or distancias[0][1] == distancias[1][1]):
+                return distancias[0][1]
+        if mes_bruto is None or pd.isna(mes_bruto):
+            return mes_bruto
+        return mes_bruto + self._deslocamento()
 
 
 def formatar_moeda(valor: float) -> str:
@@ -1064,7 +1120,7 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
     # pra servir de referência pras NFs SEM esse texto (aluguel) emitidas
     # no MESMO dia (ver 2ª passada).
     linhas_cruas = []
-    periodo_confirmado_por_dia = {}
+    resolvedores = {}  # codigo_cliente -> ResolvedorPeriodoNF
     for _, row in df.iterrows():
         if pd.isna(row.get("itensNf_json")):
             continue
@@ -1077,8 +1133,8 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
         if pd.isna(row["dataEmissao"]):
             continue
         mes_bruto = pd.Period(row["dataEmissao"], freq="M")
-        chave_dia = (row["codigo_cliente"], pd.Timestamp(row["dataEmissao"]).date())
         periodo_do_texto = None
+        itens_da_nf = []
         for item in itens:
             if str(item.get("documento", "")).strip().upper() != "NF":
                 continue
@@ -1092,24 +1148,27 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
                 continue
             if periodo_do_texto is None:
                 periodo_do_texto = extrair_periodo_do_texto_item(item.get("descricao"))
-            linhas_cruas.append({
-                "codigo_cliente": row["codigo_cliente"], "mes_bruto": mes_bruto, "chave_dia": chave_dia,
+            itens_da_nf.append({
+                "codigo_cliente": row["codigo_cliente"], "mes_bruto": mes_bruto,
+                "data_emissao": row["dataEmissao"],
                 "nf": str(row.get("nf", "")).strip(), "codigoMaterial": cod_material, "valor": valor_item,
             })
-        if periodo_do_texto is not None:
-            periodo_confirmado_por_dia.setdefault(chave_dia, periodo_do_texto)
+        # o texto pode estar em qualquer item da NF — vale pra todos eles
+        for item_nf in itens_da_nf:
+            item_nf["periodo_do_texto"] = periodo_do_texto
+        linhas_cruas.extend(itens_da_nf)
+        resolvedores.setdefault(row["codigo_cliente"], ResolvedorPeriodoNF()).registrar(
+            row["dataEmissao"], periodo_do_texto)
 
-    # 2ª passada: resolve o "mes" de cada item — texto da PRÓPRIA NF
-    # primeiro, senão o de uma NF IRMÃ emitida no mesmo dia (aluguel e
-    # licenciamento do mesmo ciclo sempre emitem juntos, confirmado com
-    # dado real), senão o mês de emissão cru como último recurso. Sem
-    # isso, duas NFs de períodos DIFERENTES emitidas no mesmo mês
-    # corrente (o CIGAM às vezes acelera e emite 2 ciclos seguidos antes
-    # do próximo mês fechar) caem juntas no mesmo "mes" e a soma parece
-    # cobrança em dobro num mês só.
+    # 2ª passada: resolve o "mes" de cada item com as regras de
+    # ResolvedorPeriodoNF (texto próprio > NF irmã próxima > emissão com o
+    # deslocamento do cliente). Sem isso, duas NFs de períodos DIFERENTES
+    # emitidas no mesmo mês corrente caem juntas no mesmo "mes" e a soma
+    # parece cobrança em dobro num mês só.
     linhas = []
     for linha in linhas_cruas:
-        mes = periodo_confirmado_por_dia.get(linha["chave_dia"], linha["mes_bruto"])
+        mes = resolvedores[linha["codigo_cliente"]].resolver(
+            linha["periodo_do_texto"], linha["data_emissao"], linha["mes_bruto"])
         linhas.append({
             "codigo_cliente": linha["codigo_cliente"], "mes": mes,
             "nf": linha["nf"], "codigoMaterial": linha["codigoMaterial"], "valor": linha["valor"],
@@ -1240,9 +1299,9 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
     # — agrupar pelo mês de emissão cru, sem corrigir isso, soma as duas
     # juntas num "mês" só, parecendo cobrança em dobro. O texto da NF
     # ("PERIODO: X") é o único dado que confirma o período de cada uma;
-    # NFs sem esse texto (aluguel, nunca carrega) herdam o período
-    # confirmado de uma NF IRMÃ emitida no MESMO dia (aluguel e
-    # licenciamento do mesmo ciclo sempre emitem juntos).
+    # NFs sem esse texto (aluguel, nunca carrega) seguem as regras de
+    # ResolvedorPeriodoNF (NF irmã próxima, senão emissão no mesmo
+    # deslocamento do grupo).
     todas_faturas_parcela = sorted(set(
         str(f) for det in detalhes_por_subcodigo.values() if not det.empty
         for f in det["fatura"].dropna() if str(f).strip()
@@ -1256,26 +1315,16 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
                 return periodo
         return None
 
-    periodo_confirmado_por_dia = {}
+    resolvedor = ResolvedorPeriodoNF()
     for det in detalhes_por_subcodigo.values():
         if det.empty:
             continue
         for _, linha in det.iterrows():
-            if pd.isna(linha["data_emissao_exata"]):
-                continue
-            periodo = _periodo_confirmado_da_fatura(linha["fatura"])
-            if periodo is not None:
-                periodo_confirmado_por_dia.setdefault(linha["data_emissao_exata"].date(), periodo)
+            resolvedor.registrar(linha["data_emissao_exata"], _periodo_confirmado_da_fatura(linha["fatura"]))
 
     def _resolver_mes(linha):
-        periodo = _periodo_confirmado_da_fatura(linha["fatura"])
-        if periodo is not None:
-            return periodo
-        if pd.notna(linha["data_emissao_exata"]):
-            periodo = periodo_confirmado_por_dia.get(linha["data_emissao_exata"].date())
-            if periodo is not None:
-                return periodo
-        return linha["mes_bruto"]
+        return resolvedor.resolver(
+            _periodo_confirmado_da_fatura(linha["fatura"]), linha["data_emissao_exata"], linha["mes_bruto"])
 
     partes = []
     partes_por_subcodigo = {}
@@ -3869,13 +3918,13 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 
 def _renderizar_legenda_abas():
-    """Rótulo + cor por cima da barra de abas, separando 'Cliente', 'Grupo
-    econômico' e 'Equipamentos' (Análise, na ponta esquerda) de 'Espelho
-    NFS-e' e 'Nota de Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
+    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
+    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
     alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
-    (posição 0-4, estável entre versões do Streamlit; bem mais confiável que
+    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
     mirar pela classe emotion-cache, que muda a cada build):
-    - empurra a aba 3 (Espelho NFS-e) pra ponta direita com margin-left:auto
+    - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
       no container flex (truque clássico de flexbox pra "quebrar" um grupo
       de itens em dois blocos nas pontas), com uma borda antes marcando a
       separação;
@@ -3895,27 +3944,25 @@ def _renderizar_legenda_abas():
             display: flex !important;
             width: 100% !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"] {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"] {{
             margin-left: auto !important;
             border-left: 1px solid rgba(138,149,168,0.4);
             padding-left: 16px;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] p {{
             color: {_COR_GRUPO_ANALISE} !important;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="0"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="1"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_ANALISE} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p {{
             color: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator,
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
         </style>
@@ -4821,8 +4868,8 @@ def renderizar_nota_debito():
 _renderizar_cabecalho()
 _renderizar_legenda_abas()
 
-aba_cliente, aba_grupo, aba_equipamentos, aba_espelho, aba_nota_debito = st.tabs(
-    ["Cliente", "Grupo econômico", "Equipamentos", "Espelho NFS-e", "Nota de Débito"])
+aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
+    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -4871,9 +4918,6 @@ with aba_grupo:
 
     if st.session_state.get("grupo_buscado"):
         relatorio_grupo(st.session_state["grupo_buscado"])
-
-with aba_equipamentos:
-    equipamentos_sistema.renderizar_aba_equipamentos(client_bq, PROJECT_ID, MODO_DEMO)
 
 with aba_espelho:
     renderizar_espelho_nfse()
