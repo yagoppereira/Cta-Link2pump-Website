@@ -14,6 +14,8 @@ import re
 import concurrent.futures
 import os
 import tempfile
+import threading
+import time
 import unicodedata
 from datetime import date
 import pandas as pd
@@ -2870,6 +2872,40 @@ def buscar_data_cancelamento_bq(codigo_contrato_grupo: str):
     return None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def buscar_datas_cancelamento_lote(codigos_grupos: tuple) -> dict:
+    """Mesma regra de buscar_data_cancelamento_bq (primeira data não
+    vazia entre os subcódigos do grupo, na ordem do grupo), mas numa
+    consulta só pra todos os grupos encerrados do cliente — antes era uma
+    consulta por subcódigo, uma depois da outra."""
+    if MODO_DEMO:
+        return {g: buscar_data_cancelamento_bq(g) for g in codigos_grupos}
+    subcodigos_por_grupo = {
+        g: [normalizar_codigo_contrato(c) for c in str(g).split("/")] for g in codigos_grupos
+    }
+    todos = sorted({c for subs in subcodigos_por_grupo.values() for c in subs})
+    if not todos:
+        return {}
+    query = f"""
+    SELECT codigoContrato, dataCancelamento
+    FROM `{PROJECT_ID}.bronze.cigam__contratos`
+    WHERE codigoContrato IN UNNEST(@codigos)
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("codigos", "STRING", todos)]
+    )
+    df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    data_por_subcodigo = {}
+    for _, linha in df.iterrows():
+        valor = linha["dataCancelamento"]
+        if pd.notna(valor) and str(valor).strip():
+            data_por_subcodigo.setdefault(str(linha["codigoContrato"]), str(valor))
+    return {
+        g: next((data_por_subcodigo[c] for c in subs if c in data_por_subcodigo), None)
+        for g, subs in subcodigos_por_grupo.items()
+    }
+
+
 def resumir_lista(itens: list, max_itens: int = 3, max_chars_item: int = 60) -> str:
     """Evita hover/legendas gigantes: mostra os primeiros N itens (truncados)
     e resume o resto como '(+M itens)'. Útil quando um único codigoContrato
@@ -3328,13 +3364,48 @@ def buscar_itens_notas_fiscais_lote(numeros_nf: list) -> dict:
     numeros_validos = tuple(sorted(set(str(n).strip() for n in numeros_nf if n and str(n).strip())))
     if not numeros_validos:
         return {}
-    return _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos)
+
+    # cache POR NF, não por lista: cada leitura de cigam__notas_fiscais
+    # varre a tabela inteira (~2 s, sem filtro de data possível — só temos
+    # o número), e o mesmo grupo pede quase as mesmas NFs duas vezes em
+    # obter_historico_unificado (faturas das parcelas, depois faturas por
+    # mês). Com cache por lista, qualquer NF a mais ou a menos virava uma
+    # leitura nova; aqui só vai ao BigQuery o que ainda não foi buscado.
+    # NF não encontrada também fica guardada (None) pra não repetir a
+    # leitura — expira junto, então NF que entrar no DW depois aparece.
+    cache = _cache_itens_nf_por_numero()
+    agora = time.monotonic()
+    with cache["lock"]:
+        encontrados = {
+            n: cache["itens"][n][1] for n in numeros_validos
+            if n in cache["itens"] and agora - cache["itens"][n][0] < TTL_ITENS_NF_SEGUNDOS
+        }
+    faltando = tuple(n for n in numeros_validos if n not in encontrados)
+    if faltando:
+        novos = _consultar_itens_notas_fiscais(faltando)
+        with cache["lock"]:
+            if len(cache["itens"]) > 200_000:
+                cache["itens"].clear()
+            for n in faltando:
+                cache["itens"][n] = (agora, novos.get(n))
+                encontrados[n] = novos.get(n)
+    return {n: itens for n, itens in encontrados.items() if itens is not None}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos: tuple) -> dict:
-    """Miolo cacheado de buscar_itens_notas_fiscais_lote — recebe tupla
-    já normalizada (ver docstring da casca acima)."""
+TTL_ITENS_NF_SEGUNDOS = 1800
+
+
+@st.cache_resource
+def _cache_itens_nf_por_numero():
+    """Dicionário {numero: (instante, itens|None)} compartilhado entre
+    sessões e threads (relatorio_cliente processa grupos em paralelo)."""
+    return {"itens": {}, "lock": threading.Lock()}
+
+
+def _consultar_itens_notas_fiscais(numeros_validos: tuple) -> dict:
+    """Consulta de fato os itens de NF no BigQuery — chamada só por
+    buscar_itens_notas_fiscais_lote, com as NFs que ainda não estão no
+    cache por NF (ver lá)."""
     numeros_validos = list(numeros_validos)
     if MODO_DEMO:
         _, itens_demo = obter_dados_demo_bq()
@@ -3390,6 +3461,29 @@ def _buscar_itens_notas_fiscais_lote_cacheado(numeros_validos: tuple) -> dict:
                 # decidir qual "ganha"
                 resultado.setdefault(chave, lista_itens)
     return resultado
+
+
+def preaquecer_itens_nf_dos_grupos(codigos_grupos) -> None:
+    """Busca numa leitura só os itens de NF de TODAS as faturas das
+    parcelas dos grupos — antes cada grupo lia cigam__notas_fiscais por
+    conta própria (tabela inteira a cada leitura, ~2 s), então um cliente
+    com 16 grupos fazia 16+ leituras. Depois disso, obter_historico_unificado
+    encontra quase tudo no cache por NF de buscar_itens_notas_fiscais_lote.
+    As parcelas buscadas aqui também ficam no cache de buscar_parcelas_bq."""
+    subcodigos = sorted({
+        normalizar_codigo_contrato(c) for g in codigos_grupos for c in str(g).split("/") if str(c).strip()
+    })
+    if not subcodigos:
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(subcodigos))) as executor:
+        todas_parcelas = list(executor.map(buscar_parcelas_bq, subcodigos))
+    faturas = set()
+    for df_parcelas in todas_parcelas:
+        detalhes = _detalhar_parcelas_subcontrato(df_parcelas)
+        if not detalhes.empty:
+            faturas.update(str(f).strip() for f in detalhes["fatura"].dropna() if str(f).strip())
+    if faturas:
+        buscar_itens_notas_fiscais_lote(sorted(faturas))
 
 
 def calcular_composicao_real(codigo_contrato_grupo: str) -> str:
@@ -3493,9 +3587,7 @@ def relatorio_cliente(
     # busca a data de cancelamento no BigQuery só para os grupos encerrados
     # (evita consulta desnecessária para contratos ainda ativos)
     grupos_encerrados = contratos.loc[contratos["situacaoContrato"] == "E", "codigoContrato"].unique()
-    mapa_data_cancelamento = {}
-    for cod_grupo in grupos_encerrados:
-        mapa_data_cancelamento[cod_grupo] = buscar_data_cancelamento_bq(cod_grupo)
+    mapa_data_cancelamento = buscar_datas_cancelamento_lote(tuple(sorted(grupos_encerrados)))
     contratos["Data Cancelamento"] = contratos["codigoContrato"].map(mapa_data_cancelamento)
 
     equipamentos = df_bombas[df_bombas["cliente_cigam_pagante"].isin(codigos_cliente)].copy()
@@ -3659,6 +3751,7 @@ def relatorio_cliente(
         }
 
     with st.spinner(f"Buscando histórico de {len(grupos)} grupo(s) de contrato no BigQuery..."):
+        preaquecer_itens_nf_dos_grupos([cod_grupo for cod_grupo, _ in grupos])
         # cada grupo faz consultas de REDE independentes (BigQuery) — não
         # tem motivo pra esperar uma terminar pra começar a próxima.
         # ThreadPoolExecutor (não multiprocessing) porque o gargalo aqui
@@ -4146,6 +4239,16 @@ def relatorio_grupo(termo: str):
     # preparar_dados_subcontrato (ver comentário equivalente em
     # relatorio_cliente)
     mes_atual_validacao = pd.Timestamp.now().to_period("M") - 1
+    # uma leitura só das NFs de todas as empresas do grupo (ver
+    # preaquecer_itens_nf_dos_grupos) antes do laço, que é sequencial
+    with st.spinner("Buscando histórico dos contratos do grupo no BigQuery..."):
+        preaquecer_itens_nf_dos_grupos([
+            cod_grupo
+            for _, emp in df_resumo.iterrows()
+            if contratos_por_empresa.get(int(emp["Código"])) is not None
+            and not contratos_por_empresa.get(int(emp["Código"])).empty
+            for cod_grupo, _ in montar_grupos_contrato(contratos_por_empresa.get(int(emp["Código"])))
+        ])
     for _, emp in df_resumo.iterrows():
         cod = int(emp["Código"])
         contratos_emp = contratos_por_empresa.get(cod)
