@@ -91,7 +91,10 @@ def extrair_periodo_do_texto_item(texto: str):
     pareado)."""
     if not texto:
         return None
-    m = re.search(r"PERIODO:\s*([A-Za-zçÇãÃ]+)\s*/\s*(\d{4})", str(texto), re.IGNORECASE)
+    # sem acento antes de procurar: o histórico da parcela escreve
+    # "PERÍODO: Março/2026", o item da NF "PERIODO: Março/2026"
+    texto_ascii = unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode()
+    m = re.search(r"PERIODO:\s*([A-Za-z]+)\s*/\s*(\d{4})", texto_ascii, re.IGNORECASE)
     if not m:
         return None
     nome_mes = unicodedata.normalize("NFKD", m.group(1)).encode("ascii", "ignore").decode().lower()
@@ -832,6 +835,11 @@ def normalizar_codigo_contrato(codigo: str) -> str:
 COLUNAS_PARCELA = [
     "lancamento", "fatura", "complemento", "situacao", "tipo", "valor",
     "vencimento", "vencimentoOriginal", "emissao", "data", "previsao",
+    # "Compl. Histórico" do lançamento no CIGAM — traz "PERÍODO: Maio/2025"
+    # em ~100% das faturas desde 2022, aluguel E licenciamento (o texto do
+    # item da NF só existe no licenciamento). É o mês de referência oficial
+    # de cada mensalidade.
+    "complementoHistorico",
 ]
 
 # contador de quantas vezes o fallback pro campo JSON foi usado nesta sessão
@@ -934,7 +942,8 @@ def buscar_parcelas_bq(codigo_contrato: str) -> pd.DataFrame:
 
     query = f"""
     SELECT p.lancamento, p.fatura, p.complemento, p.situacao, p.tipo, p.valor,
-           p.vencimento, p.vencimentoOriginal, p.emissao, p.data, p.previsao
+           p.vencimento, p.vencimentoOriginal, p.emissao, p.data, p.previsao,
+           p.complementoHistorico
     FROM `{PROJECT_ID}.bronze.cigam__contratos` c, UNNEST(c.parcelasContrato) AS p
     WHERE c.codigoContrato = @codigo_contrato
     ORDER BY p.vencimento
@@ -990,9 +999,12 @@ def _detalhar_parcelas_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     correção — usado como mês final por preparar_dados_subcontrato, e
     como fallback por obter_historico_unificado), data_emissao_exata
     (Timestamp; NaT quando a linha veio do fallback de vencimento, que
-    não tem a mesma confiabilidade pra casar com NFs irmãs)."""
+    não tem a mesma confiabilidade pra casar com NFs irmãs),
+    periodo_parcela (Period do "PERÍODO: X/Ano" do histórico da parcela,
+    ou None) e texto_parcela (esse histórico cru, pra exibir)."""
     if df_parcelas.empty:
-        return pd.DataFrame(columns=["fatura", "valor", "mes_bruto", "data_emissao_exata"])
+        return pd.DataFrame(columns=["fatura", "valor", "mes_bruto", "data_emissao_exata",
+                                     "periodo_parcela", "texto_parcela"])
 
     df = df_parcelas.copy()
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
@@ -1076,11 +1088,25 @@ def _detalhar_parcelas_subcontrato(df_parcelas: pd.DataFrame) -> pd.DataFrame:
     df["chave"] = df["fatura"].fillna(df["lancamento"].astype(str))
 
     df = df[df["situacao"] != "J"].copy()  # juros à parte, não entram na mensalidade
+
+    # período de referência pelo histórico da parcela ("PERÍODO: Maio/2025")
+    # — lido ANTES do dedup e por fatura, porque as linhas c/E/R da mesma
+    # fatura repetem o texto, mas nem toda linha precisa ter
+    if "complementoHistorico" in df.columns:
+        df["texto_parcela"] = df["complementoHistorico"].fillna("").astype(str).str.strip()
+    else:
+        df["texto_parcela"] = ""
+    df["periodo_parcela"] = df["texto_parcela"].map(extrair_periodo_do_texto_item)
+    por_chave = df.dropna(subset=["periodo_parcela"]).groupby("chave").first()
+    df["periodo_parcela"] = df["chave"].map(por_chave["periodo_parcela"]) if not por_chave.empty else None
+    df["texto_parcela"] = df["chave"].map(por_chave["texto_parcela"]).fillna(df["texto_parcela"]) \
+        if not por_chave.empty else df["texto_parcela"]
+
     df["prioridade"] = df["tipo"].apply(lambda t: PRIORIDADE_TIPO.index(t) if t in PRIORIDADE_TIPO else 99)
     df = df.sort_values("prioridade").drop_duplicates(subset="chave", keep="first")
 
     return df.rename(columns={"mes": "mes_bruto", "data_emissao": "data_emissao_exata"})[
-        ["fatura", "valor", "mes_bruto", "data_emissao_exata"]
+        ["fatura", "valor", "mes_bruto", "data_emissao_exata", "periodo_parcela", "texto_parcela"]
     ]
 
 
@@ -1393,14 +1419,34 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
     # NFs sem esse texto (aluguel, nunca carrega) seguem as regras de
     # ResolvedorPeriodoNF (NF irmã próxima, senão emissão no mesmo
     # deslocamento do grupo).
+    # 1º o histórico da própria parcela ("PERÍODO: Maio/2025", ~100% das
+    # faturas, aluguel e licenciamento); só as faturas SEM ele vão buscar o
+    # texto do item da NF — uma leitura de cigam__notas_fiscais a menos na
+    # grande maioria dos grupos
+    periodo_da_parcela = {}
+    texto_da_parcela = {}
+    for det in detalhes_por_subcodigo.values():
+        if det.empty:
+            continue
+        for fatura, periodo, texto in zip(det["fatura"], det["periodo_parcela"], det["texto_parcela"]):
+            if pd.isna(fatura) or not str(fatura).strip():
+                continue
+            if periodo is not None and not pd.isna(periodo):
+                periodo_da_parcela[str(fatura).strip()] = periodo
+            if texto:
+                texto_da_parcela[str(fatura).strip()] = texto
     todas_faturas_parcela = sorted(set(
-        str(f) for det in detalhes_por_subcodigo.values() if not det.empty
+        str(f).strip() for det in detalhes_por_subcodigo.values() if not det.empty
         for f in det["fatura"].dropna() if str(f).strip()
     ))
-    mapa_itens_parcela = buscar_itens_notas_fiscais_lote(todas_faturas_parcela) if todas_faturas_parcela else {}
+    faturas_sem_periodo = [f for f in todas_faturas_parcela if f not in periodo_da_parcela]
+    mapa_itens_parcela = buscar_itens_notas_fiscais_lote(faturas_sem_periodo) if faturas_sem_periodo else {}
 
     def _periodo_confirmado_da_fatura(fatura):
-        for _desc, _val, texto in mapa_itens_parcela.get(str(fatura), []):
+        fatura = str(fatura).strip()
+        if fatura in periodo_da_parcela:
+            return periodo_da_parcela[fatura]
+        for _desc, _val, texto in mapa_itens_parcela.get(fatura, []):
             periodo = extrair_periodo_do_texto_item(texto)
             if periodo is not None:
                 return periodo
@@ -1499,7 +1545,12 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
                 # pra montar um card por item (aluguel/licenciamento
                 # separados) no detalhe do ponto clicado, cada um com
                 # sua própria nota fiscal demarcada
-                itens_mes.extend((f, desc, val, texto) for desc, val, texto in mapa_itens_por_nf[f])
+                # NF de aluguel não tem texto no item — usa o histórico da
+                # parcela ("PERÍODO: Maio/2025"), que é o mesmo dado
+                # que o CIGAM mostra na tela da parcela
+                itens_mes.extend(
+                    (f, desc, val, texto or texto_da_parcela.get(f, ""))
+                    for desc, val, texto in mapa_itens_por_nf[f])
         return itens_mes
 
     def _composicao_do_mes(fatura_str):
