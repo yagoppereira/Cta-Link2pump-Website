@@ -126,18 +126,26 @@ class ResolvedorPeriodoNF:
     R$ 810 = 2 × R$ 135 + R$ 540, Dez/25 sem aluguel)."""
 
     def __init__(self):
-        self._confirmados = {}  # date -> Period (texto de NF emitida nesse dia)
+        self._confirmados = {}  # date -> [Period, ...] (textos de NFs emitidas nesse dia)
 
     def registrar(self, data_emissao, periodo_do_texto):
         if periodo_do_texto is None or data_emissao is None or pd.isna(data_emissao):
             return
-        self._confirmados.setdefault(pd.Timestamp(data_emissao).date(), periodo_do_texto)
+        periodos = self._confirmados.setdefault(pd.Timestamp(data_emissao).date(), [])
+        if periodo_do_texto not in periodos:
+            periodos.append(periodo_do_texto)
+            periodos.sort()
 
     def _deslocamento(self) -> int:
         if not self._confirmados:
             return 0
-        difs = pd.Series([(p - pd.Period(d, freq="M")).n for d, p in self._confirmados.items()])
+        difs = pd.Series([(p - pd.Period(d, freq="M")).n for d, ps in self._confirmados.items() for p in ps])
         return int(difs.mode().iloc[0])
+
+    def periodos_do_dia(self, data_emissao) -> list:
+        if data_emissao is None or pd.isna(data_emissao):
+            return []
+        return self._confirmados.get(pd.Timestamp(data_emissao).date(), [])
 
     def resolver(self, periodo_do_texto, data_emissao, mes_bruto):
         if periodo_do_texto is not None:
@@ -145,10 +153,12 @@ class ResolvedorPeriodoNF:
         if data_emissao is not None and not pd.isna(data_emissao) and self._confirmados:
             dia = pd.Timestamp(data_emissao).date()
             if dia in self._confirmados:
-                return self._confirmados[dia]
+                # mais de um período no mesmo dia (ciclos atrasados emitidos
+                # juntos): devolve o primeiro, e distribuir_no_dia reparte
+                return self._confirmados[dia][0]
             distancias = sorted(
-                (abs((d - dia).days), p) for d, p in self._confirmados.items()
-                if abs((d - dia).days) <= JANELA_DIAS_NF_IRMA
+                (abs((d - dia).days), ps[0]) for d, ps in self._confirmados.items()
+                if abs((d - dia).days) <= JANELA_DIAS_NF_IRMA and len(ps) == 1
             )
             if distancias and (len(distancias) == 1 or distancias[0][0] < distancias[1][0]
                                or distancias[0][1] == distancias[1][1]):
@@ -156,6 +166,69 @@ class ResolvedorPeriodoNF:
         if mes_bruto is None or pd.isna(mes_bruto):
             return mes_bruto
         return mes_bruto + self._deslocamento()
+
+    def distribuir_no_dia(self, det: pd.DataFrame) -> pd.DataFrame:
+        """Ciclos atrasados emitidos no MESMO dia (contratos 6423/6424: NFs
+        de Fev e Mar/26 todas emitidas em 02/04/2026). O licenciamento se
+        separa pelo texto, mas os aluguéis desse dia não têm texto e
+        cairiam todos no mesmo período. Se o subcontrato tem tantas NFs
+        sem texto naquele dia quanto períodos distintos confirmados no dia,
+        reparte uma por período (ordem do número da fatura — os valores
+        são a mesma mensalidade, então a ordem não muda o total do mês).
+        `det`: linhas de UM subcontrato, com mes, data_emissao_exata e
+        tem_texto."""
+        det = det.copy()
+        sem_texto = det[~det["tem_texto"] & det["data_emissao_exata"].notna()]
+        for dia, linhas in sem_texto.groupby(sem_texto["data_emissao_exata"].dt.date):
+            periodos = self.periodos_do_dia(dia)
+            if len(periodos) > 1 and len(linhas) == len(periodos):
+                ordem = sorted(linhas.index, key=lambda i: _chave_numero_fatura(det.at[i, "fatura"]))
+                for i, periodo in zip(ordem, periodos):
+                    det.at[i, "mes"] = periodo
+        return det
+
+
+def _chave_numero_fatura(fatura):
+    texto = str(fatura).strip()
+    return (0, int(texto), "") if texto.isdigit() else (1, 0, texto)
+
+
+def espalhar_colisoes_mensais(det: pd.DataFrame) -> pd.DataFrame:
+    """Último recurso pra uma regra simples: UM subcontrato cobra UMA
+    mensalidade por mês. Se mesmo assim sobrar mês com 2+ faturas do
+    mesmo subcontrato e o mês vizinho estiver vazio, a fatura sem texto de
+    período (nunca a que tem "PERIODO: X") vai pro vizinho vazio — a mais
+    antiga pro mês anterior, ou a mais nova pro seguinte. Sem isso, um
+    ciclo atrasado aparece como mensalidade em dobro num mês e buraco no
+    outro, e a variação mês a mês do gráfico mostra um salto que não
+    existiu. Só age em subcontrato que normalmente tem 1 fatura por mês
+    (mediana 1) — um contrato que sempre cobra 2 faturas no mês fica como
+    está. `det`: linhas de UM subcontrato, com mes, data_emissao_exata,
+    tem_texto."""
+    det = det.copy()
+    meses_validos = det["mes"].dropna()
+    if meses_validos.empty or det.groupby("mes").size().median() > 1:
+        return det
+    primeiro, ultimo = meses_validos.min(), meses_validos.max()
+    for _ in range(len(det)):
+        contagem = det.groupby("mes").size()
+        mudou = False
+        for mes in sorted(contagem[contagem > 1].index):
+            moviveis = det[(det["mes"] == mes) & ~det["tem_texto"]].sort_values("data_emissao_exata")
+            if moviveis.empty:
+                continue
+            anterior, seguinte = mes - 1, mes + 1
+            if anterior >= primeiro - 1 and anterior not in contagem.index:
+                det.at[moviveis.index[0], "mes"] = anterior
+                mudou = True
+            elif seguinte <= ultimo and seguinte not in contagem.index:
+                det.at[moviveis.index[-1], "mes"] = seguinte
+                mudou = True
+            if mudou:
+                break
+        if not mudou:
+            break
+    return det
 
 
 def formatar_moeda(valor: float) -> str:
@@ -1174,10 +1247,21 @@ def buscar_faturamento_recorrente_bq(codigos_cliente: tuple, desde: str) -> pd.D
         linhas.append({
             "codigo_cliente": linha["codigo_cliente"], "mes": mes,
             "nf": linha["nf"], "codigoMaterial": linha["codigoMaterial"], "valor": linha["valor"],
+            "data_emissao_exata": pd.Timestamp(linha["data_emissao"]),
+            "tem_texto": linha["periodo_do_texto"] is not None,
         })
     if not linhas:
         return pd.DataFrame(columns=colunas)
-    return pd.DataFrame(linhas)
+    df_linhas = pd.DataFrame(linhas).rename(columns={"nf": "fatura"})
+    # ciclos atrasados emitidos no mesmo dia: reparte as NFs sem texto
+    # (aluguel) pelos períodos do dia — por cliente e material, que é o
+    # mais perto de "subcontrato" que a NF permite (ela não traz o código
+    # do contrato)
+    partes = [
+        resolvedores[cliente].distribuir_no_dia(grupo)
+        for (cliente, _material), grupo in df_linhas.groupby(["codigo_cliente", "codigoMaterial"])
+    ]
+    return pd.concat(partes).rename(columns={"fatura": "nf"})[colunas]
 
 
 def _montar_parte_faturamento_real(codigo_cliente, materiais, depois_de, ate_mes) -> pd.DataFrame:
@@ -1337,6 +1421,8 @@ def obter_historico_unificado(codigo_contrato_grupo: str, validar_faturamento_re
         else:
             det = det.copy()
             det["mes"] = det.apply(_resolver_mes, axis=1)
+            det["tem_texto"] = det["fatura"].map(lambda f: _periodo_confirmado_da_fatura(f) is not None)
+            det = espalhar_colisoes_mensais(resolvedor.distribuir_no_dia(det))
             parte = det.groupby("mes", as_index=False).agg(
                 valor=("valor", "sum"),
                 fatura=("fatura", lambda s: ", ".join(sorted(set(str(x) for x in s if pd.notna(x) and str(x).strip())))),
