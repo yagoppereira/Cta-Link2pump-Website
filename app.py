@@ -423,12 +423,14 @@ def gerar_planilhas_demo():
 
     linhas_bombas = [
         {
+            "base": "cta", "cliente_id_app": "DEMO-APP-1",
             "bomba_nome": "Demo - Pedestal", "serial_equipamento": "DEMO0090012",
             "cliente_cigam_local": "900001", "cliente_cigam_pagante": "900001",
             "local_nome": "TRANSPORTE DEMO LTDA", "pagante_nome": "TRANSPORTE DEMO LTDA",
             "local_cnpj": "12.345.678/0001-00", "pagante_cnpj": "12.345.678/0001-00",
         },
         {
+            "base": "cta", "cliente_id_app": "DEMO-APP-2",
             "bomba_nome": "Demo - S10", "serial_equipamento": "DEMO0090021",
             "cliente_cigam_local": "900002", "cliente_cigam_pagante": "900002",
             "local_nome": "INDÚSTRIA EXEMPLO S.A.", "pagante_nome": "INDÚSTRIA EXEMPLO S.A.",
@@ -436,6 +438,7 @@ def gerar_planilhas_demo():
         },
         {
             # mesmo serial que a linha acima -> equipamento "duplo"
+            "base": "cta", "cliente_id_app": "DEMO-APP-2",
             "bomba_nome": "Demo - S500", "serial_equipamento": "DEMO0090021",
             "cliente_cigam_local": "900002", "cliente_cigam_pagante": "900002",
             "local_nome": "INDÚSTRIA EXEMPLO S.A.", "pagante_nome": "INDÚSTRIA EXEMPLO S.A.",
@@ -462,6 +465,8 @@ def carregar_bombas_do_dw():
     """
     query = f"""
     SELECT
+      b.base,
+      CAST(b.cliente_id AS STRING) AS cliente_id_app,
       b.bomba_nome,
       b.serial_equipamento,
       CAST(b.id_op_operacional AS STRING) AS id_op_operacional,
@@ -4161,6 +4166,20 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
          completo OU raiz de CNPJ isolada) — resolve a "semente" a partir
          da qual a raiz de CNPJ expande.
 
+      3. ID DO APP — o cliente do sistema (gold.bombas_alocadas.cliente_id,
+         por base) é a conta que opera as bombas; toda empresa CIGAM que
+         paga ou recebe bomba dessa MESMA conta é do mesmo grupo
+         operacional, mesmo com raiz de CNPJ e nome diferentes (Orizon:
+         uma conta do app liga 28 códigos CIGAM — Orizon, CTRs, Vital,
+         Econit, EBMA…, nenhum achável por nome ou raiz). Um salto só:
+         parte das empresas achadas por 1 e 2, sem expandir de novo a
+         raiz das que o app trouxe.
+
+    O nome casa só no INÍCIO de uma palavra, sem acento e sem caixa:
+    "ORIZON" acha "ORIZON SOROCABA", mas não "HORIZONTE" — antes casava
+    em qualquer posição e trazia HORIZONTE/HORIZONTINA, que ainda
+    expandiam pela raiz de CNPJ delas, sem vínculo nenhum com o grupo.
+
     Antes também expandia por PALAVRA-CHAVE do nome (pegar toda empresa
     cujo nome contivesse a mesma palavra da semente, ex: "HOK") — removido:
     esse critério é fraco (basta duas empresas sem nenhum vínculo real
@@ -4179,9 +4198,12 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     digitos = "".join(ch for ch in termo if ch.isdigit())
 
     # --- quem casa diretamente com o termo digitado? ---
-    casa_nome = dir_df["Cliente_Nome"].astype(str).str.upper().str.contains(
-        re.escape(termo.upper()), na=False
-    )
+    def _sem_acento(texto):
+        return unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().upper()
+    termo_norm = re.sub(r"\s+", " ", _sem_acento(termo)).strip()
+    casa_nome = dir_df["Cliente_Nome"].fillna("").map(_sem_acento).str.contains(
+        r"(?<![A-Z0-9])" + re.escape(termo_norm), regex=True, na=False
+    ) if termo_norm else False
     casa_codigo = dir_df["codigo_cliente"].astype(str) == digitos if digitos else False
     casa_cnpj = dir_df["_cnpj_norm"].astype(str) == digitos if len(digitos) >= 11 else False
     # raiz de CNPJ digitada direto (8 dígitos, sem sufixo de filial) — sem
@@ -4198,7 +4220,26 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     raizes = {r for r in semente["_raiz_cnpj"] if r and len(r) == 8 and not cnpj_invalido(r)}
     por_raiz = dir_df["_raiz_cnpj"].isin(raizes) if raizes else False
 
-    grupo = dir_df[por_raiz | casa_nome | casa_codigo | casa_cnpj | casa_raiz_direta].copy()
+    achados = por_raiz | casa_nome | casa_codigo | casa_cnpj | casa_raiz_direta
+
+    # --- vínculo pelo ID do app (um salto, a partir de quem já foi achado) ---
+    por_app = pd.Series(False, index=dir_df.index)
+    contas_por_codigo = {}
+    if df_bombas is not None and not df_bombas.empty and "cliente_id_app" in df_bombas.columns:
+        bombas = df_bombas.dropna(subset=["cliente_id_app"])
+        codigos_achados = set(dir_df.loc[achados, "codigo_cliente"].dropna().astype(int))
+        ligadas = bombas[bombas["cliente_cigam_pagante"].isin(codigos_achados)
+                         | bombas["cliente_cigam_local"].isin(codigos_achados)]
+        contas = set(zip(ligadas["base"], ligadas["cliente_id_app"]))
+        if contas:
+            da_conta = bombas[[c in contas for c in zip(bombas["base"], bombas["cliente_id_app"])]]
+            for col in ("cliente_cigam_pagante", "cliente_cigam_local"):
+                for codigo, base, conta in zip(da_conta[col], da_conta["base"], da_conta["cliente_id_app"]):
+                    if pd.notna(codigo):
+                        contas_por_codigo.setdefault(int(codigo), set()).add(f"{base} {conta}")
+            por_app = dir_df["codigo_cliente"].isin(list(contas_por_codigo))
+
+    grupo = dir_df[achados | por_app].copy()
     # rótulo do critério que trouxe cada empresa — "raiz CNPJ" só quando a
     # raiz aparece em MAIS DE UMA empresa do grupo final (matriz/filial de
     # verdade); empresa sozinha no grupo é "busca direta", mesmo que a raiz
@@ -4207,6 +4248,10 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     grupo["_origem_match"] = grupo["_raiz_cnpj"].apply(
         lambda r: "raiz CNPJ" if (r and contagem_raiz_grupo.get(r, 0) > 1) else "busca direta"
     )
+    # quem só entrou pelo app (não casou nome/código/CNPJ nem raiz)
+    so_app = ~achados.loc[grupo.index]
+    grupo.loc[so_app, "_origem_match"] = grupo.loc[so_app, "codigo_cliente"].map(
+        lambda c: "ID do app (" + ", ".join(sorted(contas_por_codigo.get(int(c), []))) + ")")
     return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
 
 
@@ -4237,7 +4282,7 @@ def relatorio_grupo(termo: str):
     # antes deixava o cabeçalho com o número em vez de um nome de verdade
     nome_grupo = grupo["Cliente_Nome"].astype(str).mode().iloc[0]
     st.header(f"Grupo econômico — {nome_grupo}", anchor=False)
-    st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por raiz de CNPJ e/ou busca direta.")
+    st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por busca direta, raiz de CNPJ e/ou ID do app.")
 
     codigos_grupo = tuple(int(c) for c in grupo["codigo_cliente"].dropna().unique())
     municipios_uf = buscar_municipio_uf_lote(codigos_grupo)
@@ -4312,8 +4357,11 @@ def relatorio_grupo(termo: str):
 
     st.caption(
         "A coluna 'Casou por' mostra o critério que trouxe cada empresa: 'raiz CNPJ' é "
-        "match forte (matriz/filial do mesmo CNPJ base); 'busca direta' bateu só com o "
-        "termo digitado (nome/código/CNPJ), sem raiz de CNPJ em comum com o resto do grupo."
+        "match forte (matriz/filial do mesmo CNPJ base); 'ID do app' é empresa ligada à "
+        "mesma conta do sistema CTA (base e cliente_id entre parênteses) que uma empresa já "
+        "achada — paga ou recebe bomba dessa conta, mesmo com nome e CNPJ diferentes; "
+        "'busca direta' bateu só com o termo digitado (início de palavra do nome, código ou "
+        "CNPJ), sem raiz de CNPJ em comum com o resto do grupo."
     )
 
     # ------------------------------------------------------------------
