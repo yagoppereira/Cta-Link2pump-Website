@@ -14,13 +14,17 @@ Divisão de responsabilidade na planilha:
   devolve cada valor na linha da mesma NF (chave = NF + série);
 - colunas S e T (dias em atraso, próxima ação) são fórmulas da planilha.
 
-Roda de dois jeitos:
+Roda de três jeitos:
+- dentro da própria planilha, pelo Apps Script apps_script/ControleVibra.gs
+  (menu "Controle Vibra"), com o login de quem executa, sem service
+  account. É o espelho deste módulo: mesmo SQL e mesmas regras, conferidos
+  por tests/test_apps_script.py. Ao mudar uma regra aqui, mude lá também;
 - pela aba "NFs Vibra" do app Streamlit (app.py), botão "Atualizar planilha";
 - pelo terminal, pra agendar (cron, GitHub Actions etc.):
       python controle_vibra.py --credenciais sa.json
       python controle_vibra.py --credenciais sa.json --somente-ler   # só mostra
 
-A service account precisa de leitura no BigQuery (bronze.cigam__empresas,
+Nos dois últimos, a service account precisa de leitura no BigQuery (bronze.cigam__empresas,
 bronze.cigam__notas_fiscais, silver.lancamentos_receber,
 silver.cadastro_materiais_cigam) e de acesso de EDITOR à planilha
 (compartilhar a planilha com o e-mail da service account).
