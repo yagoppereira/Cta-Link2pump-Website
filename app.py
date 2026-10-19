@@ -21,12 +21,10 @@ from datetime import date
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import gspread
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import streamlit as st
 
-import controle_vibra
 import gerar_espelho_nfse
 import gerar_nota_debito
 
@@ -379,18 +377,6 @@ def obter_clientes():
 
 
 client_bq = None if MODO_DEMO else obter_clientes()
-
-
-@st.cache_resource(show_spinner="Conectando ao Google Sheets...")
-def obter_cliente_sheets():
-    """Cliente gspread com a mesma service account, só pra aba NFs Vibra
-    (grava a planilha de controle). Separado de obter_clientes porque
-    precisa do escopo de planilhas, que o BigQuery não usa."""
-    creds = service_account.Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return gspread.authorize(creds)
 
 
 def cnpj_invalido(cnpj: str) -> bool:
@@ -4155,91 +4141,6 @@ def relatorio_cliente(
     )
 
 
-def renderizar_controle_vibra():
-    """Aba NFs Vibra: monta o controle de NFs emitidas pra Vibra direto do
-    DW (controle_vibra.py) e grava na planilha PENDENCIAS VIBRA, onde a
-    Emissão confirma a entrega. A prévia só lê; o botão de atualizar
-    reescreve as colunas do CIGAM e preserva as que o time preenche."""
-    url_planilha = f"https://docs.google.com/spreadsheets/d/{controle_vibra.PLANILHA_ID_PADRAO}/edit"
-    st.caption(
-        "Controle das NFs emitidas para a Vibra: valor, pedido, material e situação do título vêm do "
-        "CIGAM; status de entrega e observações são preenchidos na planilha pelo time de Emissão e "
-        f"pelo Financeiro. [Abrir a planilha]({url_planilha})"
-    )
-    if MODO_DEMO:
-        st.info("A aba NFs Vibra precisa da service account configurada: ela lê o DW e grava na planilha.")
-        return
-
-    with st.form("controle_vibra_form"):
-        col_desde, col_previa, col_gravar = st.columns([2, 1, 1], vertical_alignment="bottom")
-        with col_desde:
-            desde = st.date_input(
-                "NFs emitidas desde", value=controle_vibra.DESDE_PADRAO, format="DD/MM/YYYY",
-                help="NFs mais antigas entram só se ainda estiverem em aberto ou se já estiverem na planilha.")
-        with col_previa:
-            ver_previa = st.form_submit_button("Ver prévia", use_container_width=True)
-        with col_gravar:
-            gravar = st.form_submit_button("Atualizar planilha", use_container_width=True, type="primary")
-
-    if not (ver_previa or gravar):
-        return
-
-    try:
-        gc = obter_cliente_sheets()
-        if gravar:
-            with st.spinner("Consultando o DW e gravando a planilha..."):
-                resultado = controle_vibra.sincronizar_planilha(
-                    client_bq, gc, desde=desde, solicitado_por="app (aba NFs Vibra)")
-            tabela = resultado["tabela"]
-            st.success(
-                f"Planilha atualizada com {resultado['linhas']} NFs em "
-                f"{resultado['atualizado_em']:%d/%m/%Y %H:%M}. [Abrir a planilha]({resultado['url']})")
-            if resultado["locais_novos"]:
-                st.info(f"{resultado['locais_novos']} local(is) de entrega novo(s) acrescentado(s) na aba "
-                        f"\"{controle_vibra.ABA_LOCAIS}\": falta preencher o cliente final.")
-        else:
-            with st.spinner("Consultando o DW..."):
-                planilha = gc.open_by_key(controle_vibra.PLANILHA_ID_PADRAO)
-                aba = planilha.worksheet(controle_vibra.ABA_CONTROLE)
-                try:
-                    valores_locais = planilha.worksheet(controle_vibra.ABA_LOCAIS).get_all_values()
-                except gspread.WorksheetNotFound:
-                    valores_locais = []
-                tabela = controle_vibra.preparar_controle(client_bq, aba.get_all_values(), desde, valores_locais)
-            st.caption("Prévia: nada foi gravado na planilha.")
-    except PermissionError as erro:
-        st.error(str(erro))
-        return
-    except (gspread.exceptions.APIError, gspread.exceptions.SpreadsheetNotFound) as erro:
-        st.error(
-            "Não consegui abrir ou gravar a planilha de controle. Ela precisa estar compartilhada como editora "
-            f"com o e-mail da service account ({st.secrets['gcp_service_account'].get('client_email', '')}). "
-            f"Detalhe: {erro}")
-        return
-
-    abertas = tabela[tabela["Status financeiro"].isin(controle_vibra.STATUS_ABERTOS)]
-    vencidas = abertas[pd.to_datetime(abertas["Vencimento"], errors="coerce") < pd.Timestamp(date.today())]
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Em aberto", formatar_moeda(abertas["Saldo em aberto (R$)"].fillna(0).sum()), f"{len(abertas)} NFs",
-                delta_color="off")
-    col2.metric("Vencido", formatar_moeda(vencidas["Saldo em aberto (R$)"].fillna(0).sum()), f"{len(vencidas)} NFs",
-                delta_color="off")
-    col3.metric("NFs na planilha", len(tabela))
-    st.dataframe(
-        tabela[["NF", "Série", "Emissão", "Vencimento", "Valor (R$)", "Saldo em aberto (R$)", "Nº Pedido Vibra",
-                "Tipo de NF", "Status financeiro", "Data pagamento / baixa", "Local de entrega (nº)",
-                "Cliente final", "Status entrega"]],
-        use_container_width=True, hide_index=True,
-        column_config={
-            "Emissão": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Vencimento": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Data pagamento / baixa": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "Valor (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
-            "Saldo em aberto (R$)": st.column_config.NumberColumn(format="R$ %.2f"),
-        },
-    )
-
-
 # ============================================================================
 # --- 8. Interface (Streamlit) ---
 # ============================================================================
@@ -4275,10 +4176,10 @@ _COR_GRUPO_FERRAMENTAS = "#00A97A"
 
 def _renderizar_legenda_abas():
     """Rótulo + cor por cima da barra de abas, separando 'Cliente' e 'Grupo
-    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e', 'Nota de
-    Débito' e 'NFs Vibra' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
+    econômico' (Análise, na ponta esquerda) de 'Espelho NFS-e' e 'Nota de
+    Débito' (Ferramentas, na ponta direita). st.tabs não tem grupo/cor nem
     alinhamento por grupo nativo — o CSS mira as abas pelo atributo data-key
-    (posição 0-4, estável entre versões do Streamlit; bem mais confiável que
+    (posição 0-3, estável entre versões do Streamlit; bem mais confiável que
     mirar pela classe emotion-cache, que muda a cada build):
     - empurra a aba 2 (Espelho NFS-e) pra ponta direita com margin-left:auto
       no container flex (truque clássico de flexbox pra "quebrar" um grupo
@@ -4314,13 +4215,11 @@ def _renderizar_legenda_abas():
             background: {_COR_GRUPO_ANALISE} !important;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] p {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] p {{
             color: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
         div[data-testid="stTabs"] div[data-testid="stTab"][data-key="2"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator,
-        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="4"][aria-selected="true"] .react-aria-SelectionIndicator {{
+        div[data-testid="stTabs"] div[data-testid="stTab"][data-key="3"][aria-selected="true"] .react-aria-SelectionIndicator {{
             background: {_COR_GRUPO_FERRAMENTAS} !important;
         }}
         </style>
@@ -5279,8 +5178,8 @@ def renderizar_nota_debito():
 _renderizar_cabecalho()
 _renderizar_legenda_abas()
 
-aba_cliente, aba_grupo, aba_espelho, aba_nota_debito, aba_vibra = st.tabs(
-    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito", "NFs Vibra"])
+aba_cliente, aba_grupo, aba_espelho, aba_nota_debito = st.tabs(
+    ["Cliente", "Grupo econômico", "Espelho NFS-e", "Nota de Débito"])
 
 with aba_cliente:
     st.caption("Digite o nome do cliente, código CIGAM ou CNPJ/CPF e clique em Buscar.")
@@ -5335,6 +5234,3 @@ with aba_espelho:
 
 with aba_nota_debito:
     renderizar_nota_debito()
-
-with aba_vibra:
-    renderizar_controle_vibra()
