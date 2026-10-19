@@ -7,8 +7,11 @@ const vm = require('vm');
 
 const contexto = {};
 vm.createContext(contexto);
-const codigo = fs.readFileSync(__dirname + '/../apps_script/ControleVibra.gs', 'utf8');
-vm.runInContext(codigo + '\nthis.__api = {montarTabela, linhasParaPlanilha, locaisSemCadastro, lerLocaisEntrega, SQL_NOTAS_VIBRA};', contexto);
+// os .gs do projeto dividem o mesmo escopo global, como no Apps Script
+const codigo = ['ControleVibra.gs', 'FiltrosVibra.gs']
+  .map(nome => fs.readFileSync(__dirname + '/../apps_script/' + nome, 'utf8')).join('\n');
+vm.runInContext(codigo + '\nthis.__api = {montarTabela, linhasParaPlanilha, locaisSemCadastro, lerLocaisEntrega, '
+  + 'SQL_NOTAS_VIBRA, FILTROS_VIBRA, formulaFiltro, resumirFiltro};', contexto);
 const api = contexto.__api;
 
 const entrada = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -17,7 +20,19 @@ const serializar = v => (v && typeof v.getFullYear === 'function')
   ? `${doisDigitos(v.getDate())}/${doisDigitos(v.getMonth() + 1)}/${v.getFullYear()}`
   : v;
 
-if (entrada.somente_sql) {
+if (entrada.filtros) {
+  // células {"data": "aaaa-mm-dd"} viram Date, como no getValues
+  const celula = v => (v && v.data ? new Date(v.data + 'T00:00:00') : v);
+  const { colunas, linhas, de, ate } = entrada.filtros;
+  const valores = linhas.map(l => l.map(celula));
+  const saida = {};
+  Object.keys(api.FILTROS_VIBRA).forEach(opcao => {
+    const condicoes = api.FILTROS_VIBRA[opcao].condicoes(de, ate);
+    saida[opcao] = { formula: api.formulaFiltro(condicoes, colunas, 3),
+                     resumo: api.resumirFiltro(condicoes, colunas, valores) };
+  });
+  process.stdout.write(JSON.stringify(saida));
+} else if (entrada.somente_sql) {
   process.stdout.write(JSON.stringify({ sql: api.SQL_NOTAS_VIBRA }));
 } else {
   const tabela = api.montarTabela(entrada.linhas, entrada.aba, entrada.desde, entrada.locais || []);

@@ -183,9 +183,12 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Controle Vibra')
     .addItem('Atualizar agora', 'atualizarControleVibra')
+    .addItem('Filtros', 'abrirFiltros')
     .addSeparator()
     .addItem('Agendar atualização diária', 'agendarAtualizacaoDiaria')
     .addItem('Remover agendamento', 'removerAgendamento')
+    .addSeparator()
+    .addItem('Criar botão de filtros na aba', 'criarBotaoFiltros')
     .addToUi();
 }
 

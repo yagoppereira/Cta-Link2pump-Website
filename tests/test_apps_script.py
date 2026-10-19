@@ -105,3 +105,63 @@ def test_mesmas_celulas_nas_duas_versoes():
 
 def test_mesmas_celulas_sem_planilha_anterior():
     assert _js(CASOS, [], "2026-01-01") == tuple(map(list, _python(CASOS, [], date(2026, 1, 1))))
+
+
+# ----------------------------------------------------------------------------
+# Painel de filtros (apps_script/FiltrosVibra.gs)
+# ----------------------------------------------------------------------------
+def _linha_planilha(nf, status, entrega="", pagamento=None, atraso="", valor=100.0, saldo=""):
+    """Linha como o getValues devolve da aba de controle (A a U)."""
+    linha = [""] * len(cv.COLUNAS)
+    linha[cv.COLUNAS.index("NF")] = nf
+    linha[cv.COLUNAS.index("Status financeiro")] = status
+    linha[cv.COLUNAS.index("Status entrega")] = entrega
+    linha[cv.COLUNAS.index("Data pagamento / baixa")] = {"data": pagamento} if pagamento else ""
+    linha[cv.COLUNAS.index("Dias em atraso")] = atraso
+    linha[cv.COLUNAS.index("Valor (R$)")] = valor
+    linha[cv.COLUNAS.index("Saldo em aberto (R$)")] = saldo
+    return linha
+
+
+def _filtros():
+    linhas = [
+        _linha_planilha(1, "Em aberto", "NF assinada recebida", atraso=12, saldo=100.0),
+        _linha_planilha(2, "Pago parcial", "Não se aplica", valor=200.0, saldo=150.0),
+        _linha_planilha(3, "Em aberto", "A validar", atraso=40, saldo=100.0),
+        _linha_planilha(4, "Sem título", ""),
+        _linha_planilha(5, "Pago", "NF assinada recebida", pagamento="2026-09-08"),
+        _linha_planilha(6, "Pago", "", pagamento="2026-09-30"),
+        _linha_planilha(7, "Pago", "", pagamento="2026-10-01"),
+        _linha_planilha(8, "Devolvida", "A validar", pagamento="2026-09-10"),
+        _linha_planilha(9, "Cancelada", ""),
+        _linha_planilha(10, "em aberto", "não se aplica", saldo=100.0),  # planilha ignora maiúsculas
+    ]
+    colunas = {nome: i for i, nome in enumerate(cv.COLUNAS)}
+    return _rodar_node({"filtros": {"colunas": colunas, "linhas": linhas, "de": "2026-09-01", "ate": "2026-09-30"}})
+
+
+def test_filtros_contam_as_nfs_de_cada_condicao():
+    saida = _filtros()
+    contagem = {opcao: r["resumo"]["nfs"] for opcao, r in saida.items()}
+    assert contagem == {
+        "pendentes_pagamento": 3,       # 1, 2 e 10: em aberto/parcial com entrega concluída ou não se aplica
+        "pendentes_vencidos": 1,        # só a 1 tem dias em atraso
+        "aguardando_emissao": 2,        # 3 (a validar) e 4 (sem título, entrega em branco)
+        "pagos": 3,
+        "pagos_periodo": 2,             # 08/09 e 30/09 (o fim do período entra); 01/10 fica fora
+        "encerradas_sem_pagamento": 2,  # devolvida e cancelada
+    }
+    assert saida["pendentes_pagamento"]["resumo"] == {"nfs": 3, "valor": 400, "saldo": 350}
+
+
+def test_formula_do_filtro_usa_as_colunas_do_layout_e_nao_depende_da_localidade():
+    saida = _filtros()
+    k, l, p = cv._letra("Status financeiro"), cv._letra("Data pagamento / baixa"), cv._letra("Status entrega")
+    # 46266 = 01/09/2026 e 46295 = 30/09/2026 em nº de série de data da planilha
+    assert saida["pagos_periodo"]["formula"] == (
+        f'=(((${k}3="Pago")>0)*((${l}3>=46266)*(${l}3<=46295)>0))>0')
+    assert saida["pendentes_pagamento"]["formula"] == (
+        f'=(((${k}3="Em aberto")+(${k}3="Pago parcial")>0)'
+        f'*((${p}3="NF assinada recebida")+(${p}3="Não se aplica")>0))>0')
+    for resultado in saida.values():  # sem função de vários argumentos: nada de ";" nem ","
+        assert ";" not in resultado["formula"] and "," not in resultado["formula"]
