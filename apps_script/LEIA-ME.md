@@ -23,7 +23,11 @@ service account: basta a pessoa conseguir rodar consultas no projeto
    Na primeira vez o Google pede autorização (planilha e BigQuery).
 5. Recarregue a planilha: aparece o menu **Controle Vibra**.
 6. **Controle Vibra > Criar botão de filtros na aba** põe o botão "Filtrar
-   NFs" na linha 1 da aba de controle (rodar de novo troca o botão).
+   NFs" na linha 1 da aba de controle (rodar de novo troca o botão). Se o
+   item não aparece no menu, o `ControleVibra.gs` colado é anterior aos
+   filtros: cole o atual e recarregue. Também dá pra rodar a função
+   `criarBotaoFiltros` direto no editor. Para mover o botão sem acionar o
+   script, clique nele com o botão direito (isso só seleciona) e arraste.
 
 ## Usar
 

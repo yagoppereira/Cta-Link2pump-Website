@@ -194,9 +194,17 @@ function onOpen() {
 
 function agendarAtualizacaoDiaria() {
   removerAgendamento();
-  ScriptApp.newTrigger('atualizarControleVibra').timeBased().everyDays(1).atHour(HORA_AGENDAMENTO).create();
+  ScriptApp.newTrigger('atualizarControleVibra').timeBased().everyDays(1).atHour(HORA_AGENDAMENTO)
+    .inTimezone(fusoDaPlanilha_()).create();
   SpreadsheetApp.getActive().toast(
     `Atualização diária agendada para ${HORA_AGENDAMENTO}h, com o seu login.`, 'Controle Vibra', 8);
+}
+
+/** Horário de Brasília da planilha, e não o fuso do projeto do Apps Script,
+ * que só é São Paulo se o appsscript.json deste diretório foi colado (com o
+ * padrão, a hora de "atualizado em" e do agendamento saía deslocada). */
+function fusoDaPlanilha_() {
+  return SpreadsheetApp.getActive().getSpreadsheetTimeZone() || 'America/Sao_Paulo';
 }
 
 function removerAgendamento() {
@@ -303,7 +311,7 @@ function gravarControle_(aba, tabela, agora) {
       .setValues(linhas.map(l => l.slice(nDw + 1)));
   }
   aba.getRange(1, 1).setValue(
-    `Do CIGAM (extrator, atualizado em ${Utilities.formatDate(agora, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm')})`);
+    `Do CIGAM (extrator, atualizado em ${Utilities.formatDate(agora, fusoDaPlanilha_(), 'dd/MM/yyyy HH:mm')})`);
 }
 
 function atualizarFontes_(planilha, agora, linhas) {
@@ -312,7 +320,7 @@ function atualizarFontes_(planilha, agora, linhas) {
   const quem = Session.getEffectiveUser().getEmail() || 'agendamento';
   fontes.getRange('D2').setValue('Apps Script da planilha (ControleVibra.gs), com o login de quem executa');
   fontes.getRange('G2:I2').setValues([[
-    "'" + Utilities.formatDate(agora, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm'), quem, linhas]]);
+    "'" + Utilities.formatDate(agora, fusoDaPlanilha_(), 'dd/MM/yyyy HH:mm'), quem, linhas]]);
 }
 
 
