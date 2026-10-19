@@ -184,18 +184,23 @@ function indiceColuna_(colunas, nome) {
 }
 
 /** Fórmula personalizada do filtro, relativa à primeira linha de dados. Ex.:
- * =((($K3="Em aberto")+($K3="Pago parcial")>0)*(($P3="Não se aplica")>0))>0 */
+ * =((($K3="Em aberto")+($K3="Pago parcial")+0>0)*(($P3="Não se aplica")+0>0)*1)>0
+ * O "+0" e o "*1" não são enfeite: na planilha VERDADEIRO/FALSO é maior que
+ * qualquer número (FALSO>0 dá VERDADEIRO) e nunca igual a um número (FALSO=0
+ * dá FALSO). Um lógico sozinho comparado com 0 deixava passar todas as
+ * linhas (o "Pagos" mostrava as devolvidas). Somar 0 / multiplicar por 1
+ * converte o lógico em 1/0 antes de comparar. */
 function formulaFiltro(condicoes, colunas, primeiraLinha) {
   const partes = condicoes.map(c => {
     const ref = `$${letraColuna_(indiceColuna_(colunas, c.coluna))}${primeiraLinha}`;
     const iguais = valores => valores.map(v => `(${ref}="${v}")`).join('+');
-    if (c.em) return `(${iguais(c.em)}>0)`;
-    if (c.foraDe) return `(${iguais(c.foraDe)}=0)`;
+    if (c.em) return `(${iguais(c.em)}+0>0)`;
+    if (c.foraDe) return `(${iguais(c.foraDe)}+0=0)`;
     if (c.acimaDe !== undefined) return `(${ref}>${c.acimaDe})`;
     if (c.de) return `((${ref}>=${serialData_(c.de)})*(${ref}<=${serialData_(c.ate)})>0)`;
     throw new Error('Condição de filtro inválida');
   });
-  return partes.length ? `=(${partes.join('*')})>0` : '=TRUE';
+  return partes.length ? `=(${partes.join('*')}*1)>0` : '=TRUE';
 }
 
 /** A mesma regra da fórmula, em JavaScript: a planilha compara texto sem

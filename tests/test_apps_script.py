@@ -159,9 +159,14 @@ def test_formula_do_filtro_usa_as_colunas_do_layout_e_nao_depende_da_localidade(
     k, l, p = cv._letra("Status financeiro"), cv._letra("Data pagamento / baixa"), cv._letra("Status entrega")
     # 46266 = 01/09/2026 e 46295 = 30/09/2026 em nº de série de data da planilha
     assert saida["pagos_periodo"]["formula"] == (
-        f'=(((${k}3="Pago")>0)*((${l}3>=46266)*(${l}3<=46295)>0))>0')
+        f'=(((${k}3="Pago")+0>0)*((${l}3>=46266)*(${l}3<=46295)>0)*1)>0')
+    # lógico sozinho comparado com número: FALSO>0 é VERDADEIRO na planilha
+    # (lógico é maior que número) e passava tudo. O +0 e o *1 viram 1/0.
+    assert saida["pagos"]["formula"] == f'=(((${k}3="Pago")+0>0)*1)>0'
     assert saida["pendentes_pagamento"]["formula"] == (
-        f'=(((${k}3="Em aberto")+(${k}3="Pago parcial")>0)'
-        f'*((${p}3="NF assinada recebida")+(${p}3="Não se aplica")>0))>0')
+        f'=(((${k}3="Em aberto")+(${k}3="Pago parcial")+0>0)'
+        f'*((${p}3="NF assinada recebida")+(${p}3="Não se aplica")+0>0)*1)>0')
+    for resultado in saida.values():
+        assert resultado["formula"].endswith("*1)>0")
     for resultado in saida.values():  # sem função de vários argumentos: nada de ";" nem ","
         assert ";" not in resultado["formula"] and "," not in resultado["formula"]
