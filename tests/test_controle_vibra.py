@@ -17,7 +17,7 @@ def nf_dw(**campos):
         "valor_titulo": Decimal("35861.37"), "pago": Decimal("0"), "abatido": Decimal("0"),
         "perda": Decimal("0"), "data_baixa": None, "nfs_devolucao": None, "data_devolucao": None,
         "material": "1x SONDA ALISONIC + 1x CTA SMART DUPLO", "tem_cta": True, "tem_sonda": True,
-        "tem_licenciamento": False, "textos": "",
+        "tem_licenciamento": False, "textos": "", "local_entrega": 8,
     }
     base.update(campos)
     return base
@@ -213,21 +213,22 @@ def test_valores_da_aba_tem_texto_protegido_e_formulas_no_cabecalho():
     valores = cv.valores_aba_controle(tabela, datetime(2026, 10, 19, 9, 30))
     assert all(len(linha) == len(cv.COLUNAS) for linha in valores)
     assert valores[0][0] == "Do CIGAM (extrator, atualizado em 19/10/2026 09:30)"
-    assert valores[1][:13] == cv.COLUNAS_DW
+    assert valores[1][:14] == cv.COLUNAS_DW
     assert valores[1][-2].startswith('={"Dias em atraso"') and valores[1][-1].startswith('={"Próxima ação"')
     dados = valores[2]
     assert dados[0] == 21897 and dados[1] == "'2"
     assert dados[2] == "14/01/2026" and dados[3] == "13/02/2026"
     assert dados[6] == "'4503762321" and dados[7] == "'34.274.233/0025-71"
+    assert dados[cv.COLUNAS.index("Local de entrega (nº)")] == 8
     assert dados[-2:] == ["", ""]
 
 
 def test_formulas_apontam_pras_colunas_certas():
     assert cv._letra("Status financeiro") == "K"
-    assert cv._letra("Status entrega") == "O"
-    assert cv._letra("Próxima ação") == "T"
+    assert cv._letra("Status entrega") == "P"
+    assert cv._letra("Próxima ação") == "U"
     assert "K3:K" in cv.formula_dias_em_atraso() and "D3:D" in cv.formula_dias_em_atraso()
-    assert "VLOOKUP(O3:O;Listas!$A$2:$B$20" in cv.formula_proxima_acao()
+    assert "VLOOKUP(P3:P;Listas!$A$2:$B$20" in cv.formula_proxima_acao()
 
 
 def test_resumo_cobre_todos_os_status_e_acoes():
@@ -303,7 +304,13 @@ class _AbaFalsa:
     def update(self, values, range_name=None, value_input_option=None):
         assert value_input_option == "USER_ENTERED"
         self.gravacoes.append((range_name, values))
+        if range_name == "A1" and not self.valores:
+            self.valores = [list(l) for l in values]
         _EVENTOS.append(("valores", self.title))
+
+    def append_rows(self, values, value_input_option=None):
+        assert value_input_option == "USER_ENTERED"
+        self.valores.extend(values)
 
 
 class _PlanilhaFalsa:
@@ -366,6 +373,11 @@ def test_sincronizar_planilha_preserva_o_time_e_reformata(monkeypatch):
     linha_21897 = next(l for l in valores[2:] if l[0] == 21897)
     assert linha_21897[cv.COLUNAS.index("Status entrega")] == "Aguardando NF assinada"
     assert linha_21897[cv.COLUNAS.index("Obs. Emissão")] == "canhoto pedido"
+    # aba Locais de entrega criada com cabeçalho e o local da Vibra Betim acrescentado pra preencher
+    locais = planilha.abas[cv.ABA_LOCAIS].valores
+    assert locais[0] == cv.CABECALHO_LOCAIS
+    assert locais[1] == ["'34.274.233/0025-71", 8, "", "", "Preencher: visto nas NFs 21897, 21903"]
+    assert resultado["locais_novos"] == 1
     assert cv.ABA_FONTES in planilha.abas  # criada quando não existe
     requests = planilha.lotes[-1]["requests"]
     assert [r["deleteConditionalFormatRule"]["index"] for r in requests if "deleteConditionalFormatRule" in r] == [2, 1, 0]
@@ -399,3 +411,55 @@ def test_texto_vazio_do_dataframe_nao_vira_nan():
     assert controle.loc["20272263", "Status financeiro"] == cv.STATUS_ABATIDA
     assert controle.loc["22114", "Status financeiro"] == cv.STATUS_DEVOLVIDA
     assert controle.loc["21897", "Material"] == "" and controle.loc["21897", "NF de devolução"] == ""
+
+
+# --- locais de entrega -----------------------------------------------------------------
+def aba_locais():
+    return [
+        cv.CABECALHO_LOCAIS,
+        ["34.274.233/0080-06", "1", "CIA. DE FERRO LIGAS DA BAHIA - FERBASA (Andorinha/BA)", "005511", "CIGAM"],
+        ["34.274.233/0269-18", "4", "Louis Dreyfus", "", "planilha"],
+        ["34.274.233/0025-71", "9", "", "", "Preencher"],
+    ]
+
+
+def test_le_locais_por_filial_e_numero():
+    locais = cv.ler_locais_entrega(aba_locais())
+    assert locais[("34274233008006", 1)].startswith("CIA. DE FERRO LIGAS DA BAHIA")
+    assert locais[("34274233026918", 4)] == "Louis Dreyfus"
+    assert locais[("34274233002571", 9)] == ""
+    assert ("34274233008006", 4) not in locais  # o local 4 da Vibra BA é outro cliente
+    assert cv.ler_locais_entrega([]) == {} and cv.ler_locais_entrega([["x"]]) == {}
+
+
+def test_cliente_final_vem_da_aba_de_locais_e_vence_o_digitado():
+    controle = cv.montar_controle(pd.DataFrame([
+        nf_dw(nf="24056", cnpj="34274233008006", local_entrega=1),
+        nf_dw(nf="22100", cnpj="34274233026918", local_entrega=4),
+        nf_dw(nf="24865", cnpj="34274233002571", local_entrega=9),
+        nf_dw(nf="21897", cnpj="34274233002571", local_entrega=None),
+    ]))
+    manuais = {("24056", "2"): {"Cliente final / local de entrega": "FERBASA digitado"},
+               ("24865", "2"): {"Cliente final / local de entrega": "TRANSPORTES OLSEN UBERABA"},
+               ("21897", "2"): {"Cliente final / local de entrega": "Gerdau Lassance"}}
+    final = cv.mesclar_manuais(controle, manuais, cv.ler_locais_entrega(aba_locais())).set_index("NF")
+    coluna = "Cliente final / local de entrega"
+    assert final.loc["24056", coluna] == "CIA. DE FERRO LIGAS DA BAHIA - FERBASA (Andorinha/BA)"
+    assert final.loc["22100", coluna] == "Louis Dreyfus"
+    assert final.loc["24865", coluna] == "TRANSPORTES OLSEN UBERABA"  # local sem cliente na aba: fica o digitado
+    assert final.loc["21897", coluna] == "Gerdau Lassance"  # NF sem local: fica o digitado
+
+
+def test_locais_sem_cadastro_listam_as_nfs():
+    controle = cv.montar_controle(pd.DataFrame([
+        nf_dw(nf="26133", cnpj="34274233000102", local_entrega=12),
+        nf_dw(nf="26049", cnpj="34274233000102", local_entrega=12),
+        nf_dw(nf="24579", cnpj="34274233000102", local_entrega=11),
+        nf_dw(nf="24056", cnpj="34274233008006", local_entrega=1),
+        nf_dw(nf="21903", serie="S1", cnpj="34274233000102", local_entrega=None),
+    ]))
+    novos = cv.locais_sem_cadastro(controle, cv.ler_locais_entrega(aba_locais()))
+    assert novos == [
+        ["'34.274.233/0001-02", 11, "", "", "Preencher: visto na NF 24579"],
+        ["'34.274.233/0001-02", 12, "", "", "Preencher: visto nas NFs 26049, 26133"],
+    ]

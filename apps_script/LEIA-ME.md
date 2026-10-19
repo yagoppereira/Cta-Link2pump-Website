@@ -21,15 +21,19 @@ service account: basta a pessoa conseguir rodar consultas no projeto
 
 ## Usar
 
-- **Controle Vibra > Atualizar agora**: reescreve as colunas A a M a partir do
-  CIGAM e preserva as colunas N a R preenchidas pelo time.
+- **Controle Vibra > Atualizar agora**: reescreve as colunas A a N a partir do
+  CIGAM e preserva as colunas O a S preenchidas pelo time. O cliente final vem
+  da aba **Locais de entrega** (filial Vibra + nº do "Local de Entrega" da aba
+  Transporte da NF no CIGAM). Local que aparece numa NF e ainda não está na
+  aba é acrescentado no fim dela com o cliente final em branco: preencha uma
+  vez e todas as NFs daquele local passam a mostrar o cliente.
 - **Controle Vibra > Agendar atualização diária**: roda todo dia às 7h com o
   login de quem agendou. Se essa pessoa perder o acesso ao DW, o agendamento
   para de funcionar; outra pessoa com acesso agenda de novo.
 - **Controle Vibra > Remover agendamento**.
 
 O script só grava valores: a formatação, as listas suspensas e as fórmulas das
-colunas S e T (linha 2) já estão na planilha. Para refazer a formatação do
+colunas T e U (linha 2) já estão na planilha. Para refazer a formatação do
 zero, rode o extrator em Python (`controle_vibra.py`), que reaplica o layout.
 
 ## Manutenção

@@ -7,12 +7,14 @@ grava na planilha "PENDENCIAS VIBRA" (aba "Controle NFs Vibra"), onde o time
 de Emissão confirma a entrega e o Financeiro anota a cobrança.
 
 Divisão de responsabilidade na planilha:
-- colunas A a M ("Do CIGAM") são do extrator: reescritas a cada execução,
+- colunas A a N ("Do CIGAM") são do extrator: reescritas a cada execução,
   ninguém edita à mão;
-- colunas N a R (cliente final, status de entrega, data, observações) são
+- colunas O a S (cliente final, status de entrega, data, observações) são
   do time: o extrator lê o que já está lá antes de reescrever a aba e
   devolve cada valor na linha da mesma NF (chave = NF + série);
-- colunas S e T (dias em atraso, próxima ação) são fórmulas da planilha.
+- colunas T e U (dias em atraso, próxima ação) são fórmulas da planilha.
+O cliente final vem da aba "Locais de entrega" (filial Vibra + nº do local
+de entrega da NF), mantida pelo time; local novo é acrescentado lá em branco.
 
 Roda de três jeitos:
 - dentro da própria planilha, pelo Apps Script apps_script/ControleVibra.gs
@@ -48,6 +50,7 @@ ABA_CONTROLE = "Controle NFs Vibra"
 ABA_RESUMO = "Resumo"
 ABA_LISTAS = "Listas"
 ABA_FONTES = "Fontes"
+ABA_LOCAIS = "Locais de entrega"
 
 # Vibra Energia é reconhecida pela raiz do CNPJ, não pela divisão do
 # cadastro: das 6 filiais com raiz 34274233 só uma está na divisão
@@ -101,7 +104,7 @@ ACAO_ENCERRADA = "Encerrada"
 COLUNAS_DW = [
     "NF", "Série", "Emissão", "Vencimento", "Valor (R$)", "Saldo em aberto (R$)",
     "Nº Pedido Vibra", "Filial Vibra (CNPJ)", "Tipo de NF", "Material",
-    "Status financeiro", "Data pagamento / baixa", "NF de devolução",
+    "Status financeiro", "Data pagamento / baixa", "NF de devolução", "Local de entrega (nº)",
 ]
 COLUNAS_EMISSAO = ["Cliente final / local de entrega", "Status entrega", "Data entrega / NF assinada", "Obs. Emissão"]
 COLUNAS_FINANCEIRO = ["Obs. financeiro"]
@@ -139,6 +142,13 @@ WITH vibra AS (
 notas AS (
   SELECT n.nf, n.serie, n.cliente, n.dataEmissao, n.status, n.especieNota,
          NULLIF(TRIM(n.dataCancelamento), '') AS dataCancelamento,
+         -- "Local de Entrega" da aba Transporte da NF: o CIGAM guarda o nº
+         -- como um caractere (! = 1, " = 2, # = 3...), código ASCII menos 32.
+         -- O nº aponta pra lista de endereços de entrega do cliente (a
+         -- filial da Vibra), que não está no DW: o nome do cliente final
+         -- vem da aba "Locais de entrega" da planilha.
+         IF(TRIM(IFNULL(n.ordemEnderecoEntrega, '')) = '', NULL,
+            ASCII(n.ordemEnderecoEntrega) - 32) AS localEntrega,
          SAFE_CAST(n.totalNF AS NUMERIC) AS totalNF, n.itensNf_json
   FROM `{PROJECT_ID}.bronze.cigam__notas_fiscais` n
   WHERE n.dataEmissao >= @piso AND n.cliente IN (SELECT codigo FROM vibra)
@@ -216,7 +226,7 @@ itens_nf AS (
 SELECT n.nf, n.serie, n.cliente, v.cnpj, n.dataEmissao AS emissao, n.status,
        n.dataCancelamento AS data_cancelamento, n.totalNF AS total_nf,
        t.vencimento, t.valor_titulo, t.pago, t.abatido, t.perda, t.data_baixa,
-       d.nfs_devolucao, d.data_devolucao,
+       d.nfs_devolucao, d.data_devolucao, n.localEntrega AS local_entrega,
        i.material, i.tem_cta, i.tem_sonda, i.tem_licenciamento, i.textos
 FROM notas n
 JOIN vibra v ON v.codigo = n.cliente
@@ -334,6 +344,11 @@ def classificar_status(linha) -> tuple:
     return STATUS_ABATIDA, data_baixa, 0.0
 
 
+def _inteiro(valor):
+    numero = pd.to_numeric(_str(valor), errors="coerce")
+    return None if pd.isna(numero) else int(numero)
+
+
 def _verdadeiro(valor) -> bool:
     """LOGICAL_OR do BigQuery volta NULL (pd.NA) pra NF sem item, e
     bool(pd.NA) levanta erro."""
@@ -392,6 +407,7 @@ def montar_controle(df_dw: pd.DataFrame) -> pd.DataFrame:
             "Status financeiro": status,
             "Data pagamento / baixa": data_status,
             "NF de devolução": _str(linha.get("nfs_devolucao")),
+            "Local de entrega (nº)": _inteiro(linha.get("local_entrega")),
         })
     return pd.DataFrame(linhas, columns=COLUNAS_DW)
 
@@ -471,9 +487,57 @@ def selecionar_linhas(controle: pd.DataFrame, manuais: dict, desde: date) -> pd.
     return pd.concat([abertas, fechadas]).drop(columns=["_aberta", "_venc", "_emis"]).reset_index(drop=True)
 
 
-def mesclar_manuais(selecionado: pd.DataFrame, manuais: dict) -> pd.DataFrame:
+CABECALHO_LOCAIS = ["Filial Vibra (CNPJ)", "Local de entrega (nº)", "Cliente final",
+                    "Cód. CIGAM do cliente final", "Origem"]
+
+
+def chave_local(cnpj, numero):
+    """O nº do local de entrega é por cadastro de cliente: o local 4 da Vibra
+    Santo André (Louis Dreyfus) não é o local 4 da Vibra BA (Ferbasa)."""
+    digitos = re.sub(r"\D", "", _str(cnpj))
+    numero = _inteiro(numero)
+    return None if not digitos or numero is None else (digitos, numero)
+
+
+def ler_locais_entrega(valores_aba: list) -> dict:
+    """{(CNPJ da filial, nº do local): cliente final} da aba Locais de
+    entrega, mantida pelo time. Local listado sem cliente final vem com ""."""
+    indice = next((i for i, linha in enumerate(valores_aba[:10] if valores_aba else [])
+                   if linha and _str(linha[0]) == CABECALHO_LOCAIS[0]), None)
+    if indice is None:
+        return {}
+    locais = {}
+    for linha in valores_aba[indice + 1:]:
+        linha = list(linha) + [""] * (3 - len(linha))
+        chave = chave_local(linha[0], linha[1])
+        if chave is not None:
+            locais[chave] = _str(linha[2])
+    return locais
+
+
+def locais_sem_cadastro(tabela: pd.DataFrame, locais: dict) -> list:
+    """Linhas pra acrescentar na aba Locais de entrega: cada (filial, nº)
+    que aparece nas NFs e ainda não está lá, com as NFs onde apareceu."""
+    vistos = {}
+    for _, linha in tabela.iterrows():
+        chave = chave_local(linha["Filial Vibra (CNPJ)"], linha["Local de entrega (nº)"])
+        if chave is not None and chave not in locais:
+            vistos.setdefault(chave, (linha["Filial Vibra (CNPJ)"], []))[1].append(str(linha["NF"]))
+    linhas = []
+    for chave in sorted(vistos):
+        cnpj, nfs = vistos[chave]
+        nfs = ", ".join(sorted(nfs, key=lambda nf: int(nf) if nf.isdigit() else 0))
+        origem = f"Preencher: visto na NF {nfs}" if "," not in nfs else f"Preencher: visto nas NFs {nfs}"
+        linhas.append([_texto(cnpj), chave[1], "", "", origem])
+    return linhas
+
+
+def mesclar_manuais(selecionado: pd.DataFrame, manuais: dict, locais: dict = None) -> pd.DataFrame:
     """Põe as colunas manuais de volta em cada NF. O nº do pedido digitado à
-    mão só vale quando o DW não achou nenhum no texto da NF."""
+    mão só vale quando o DW não achou nenhum no texto da NF. O cliente final
+    vem da aba Locais de entrega quando o local da NF está cadastrado lá;
+    senão fica o que foi digitado na linha."""
+    locais = locais or {}
     resultado = selecionado.copy()
     for nome in COLUNAS_MANUAIS:
         resultado[nome] = ""
@@ -486,6 +550,10 @@ def mesclar_manuais(selecionado: pd.DataFrame, manuais: dict) -> pd.DataFrame:
             resultado.at[indice, nome] = anterior.get(nome, "")
         if not linha["Nº Pedido Vibra"] and anterior.get("Nº Pedido Vibra"):
             resultado.at[indice, "Nº Pedido Vibra"] = anterior["Nº Pedido Vibra"]
+    for indice, linha in resultado.iterrows():
+        cliente = locais.get(chave_local(linha["Filial Vibra (CNPJ)"], linha["Local de entrega (nº)"]))
+        if cliente:
+            resultado.at[indice, "Cliente final / local de entrega"] = cliente
     return resultado
 
 
@@ -526,7 +594,7 @@ def formula_proxima_acao() -> str:
 
 
 def valores_aba_controle(df: pd.DataFrame, atualizado_em: datetime) -> list:
-    """Linhas 1 (grupos), 2 (cabeçalho com as fórmulas de S e T) e os dados,
+    """Linhas 1 (grupos), 2 (cabeçalho com as fórmulas automáticas) e os dados,
     prontos pra gravar com value_input_option USER_ENTERED."""
     grupos = [""] * len(COLUNAS)
     grupos[0] = f"Do CIGAM (extrator, atualizado em {atualizado_em.strftime('%d/%m/%Y %H:%M')})"
@@ -553,6 +621,8 @@ def valores_aba_controle(df: pd.DataFrame, atualizado_em: datetime) -> list:
             linha["Status financeiro"],
             _celula_data(linha["Data pagamento / baixa"]),
             _texto(linha["NF de devolução"]),
+            "" if linha["Local de entrega (nº)"] is None or pd.isna(linha["Local de entrega (nº)"])
+            else int(linha["Local de entrega (nº)"]),
             *[linha[nome] for nome in COLUNAS_MANUAIS],
             "", "",
         ])
@@ -641,8 +711,9 @@ def valores_aba_fontes(atualizado_em: datetime, desde: date, qtd_linhas: int, so
             solicitado_por,
             qtd_linhas,
             "Status financeiro, tipo de NF e nº do pedido calculados no extrator (regras em controle_vibra.py). "
-            "Colunas N a R preservadas da planilha.",
-            "As colunas A a M são reescritas a cada execução.",
+            f"Colunas {_letra(COLUNAS_MANUAIS[0])} a {_letra(COLUNAS_MANUAIS[-1])} preservadas da planilha; "
+            f"cliente final pela aba {ABA_LOCAIS}.",
+            f"As colunas A a {_letra(COLUNAS_DW[-1])} são reescritas a cada execução.",
         ],
         [""] * 11,
     ]
@@ -665,7 +736,7 @@ FAIXA = {"red": 0.9647, "green": 0.9725, "blue": 0.9765}
 LARGURAS = {
     "NF": 70, "Série": 50, "Emissão": 90, "Vencimento": 90, "Valor (R$)": 110, "Saldo em aberto (R$)": 120,
     "Nº Pedido Vibra": 115, "Filial Vibra (CNPJ)": 150, "Tipo de NF": 140, "Material": 320,
-    "Status financeiro": 120, "Data pagamento / baixa": 110, "NF de devolução": 95,
+    "Status financeiro": 120, "Data pagamento / baixa": 110, "NF de devolução": 95, "Local de entrega (nº)": 80,
     "Cliente final / local de entrega": 250, "Status entrega": 170, "Data entrega / NF assinada": 120,
     "Obs. Emissão": 220, "Obs. financeiro": 300, "Dias em atraso": 80, "Próxima ação": 210,
 }
@@ -792,7 +863,8 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
     req.append({"setBasicFilter": {"filter": {"range": _faixa(sheet_id, LINHA_CABECALHO - 1, total_linhas, 0, n_col)}}})
     req.append({"updateCells": {
         "rows": [{"values": [{"note":
-            "Colunas A a M vêm do CIGAM pelo extrator (controle_vibra.py) e são reescritas a cada atualização: "
+            f"Colunas A a {_letra(COLUNAS_DW[-1])} vêm do CIGAM pelo extrator (controle_vibra.py) e são "
+            "reescritas a cada atualização: "
             "não edite. Detalhes da consulta na aba Fontes."}]}],
         "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": 0}}})
     req.append({"updateCells": {
@@ -871,23 +943,31 @@ def _obter_ou_criar_aba(planilha, titulo: str, linhas: int, colunas: int):
     return aba
 
 
-def preparar_controle(client_bq, valores_aba_atual: list, desde: date = DESDE_PADRAO) -> pd.DataFrame:
+def preparar_controle(client_bq, valores_aba_atual: list, desde: date = DESDE_PADRAO,
+                      valores_locais: list = None) -> pd.DataFrame:
     """Consulta o DW, aplica as regras e devolve a tabela final (DW +
     colunas manuais), sem gravar nada. Usado pela prévia do app e pela
     sincronização."""
     manuais = ler_preenchimento_manual(valores_aba_atual)
     controle = montar_controle(buscar_notas_vibra(client_bq))
-    return mesclar_manuais(selecionar_linhas(controle, manuais, desde), manuais)
+    return mesclar_manuais(selecionar_linhas(controle, manuais, desde), manuais,
+                           ler_locais_entrega(valores_locais or []))
 
 
 def sincronizar_planilha(client_bq, gc, planilha_id: str = PLANILHA_ID_PADRAO, desde: date = DESDE_PADRAO,
                          solicitado_por: str = "") -> dict:
     """Atualiza a planilha inteira: lê o que o time preencheu, consulta o
-    DW, reescreve as abas Controle, Resumo, Listas e Fontes e reaplica a
+    DW, reescreve as abas Controle, Resumo, Listas e Fontes, acrescenta na
+    aba Locais de entrega os locais que ainda não estão lá e reaplica a
     formatação. Devolve um resumo com a tabela gravada."""
     planilha = gc.open_by_key(planilha_id)
     aba = _obter_ou_criar_aba(planilha, ABA_CONTROLE, 500, len(COLUNAS))
-    tabela = preparar_controle(client_bq, aba.get_all_values(), desde)
+    locais_aba = _obter_ou_criar_aba(planilha, ABA_LOCAIS, 100, len(CABECALHO_LOCAIS))
+    valores_locais = locais_aba.get_all_values()
+    if not ler_locais_entrega(valores_locais) and not any(any(c for c in l) for l in valores_locais):
+        locais_aba.update(values=[CABECALHO_LOCAIS], range_name="A1", value_input_option="USER_ENTERED")
+        valores_locais = [CABECALHO_LOCAIS]
+    tabela = preparar_controle(client_bq, aba.get_all_values(), desde, valores_locais)
     atualizado_em = agora()
 
     valores = valores_aba_controle(tabela, atualizado_em)
@@ -921,9 +1001,13 @@ def sincronizar_planilha(client_bq, gc, planilha_id: str = PLANILHA_ID_PADRAO, d
     fontes.batch_clear([f"A1:K{fontes.row_count}"])
     fontes.update(values=valores_aba_fontes(atualizado_em, desde, len(tabela), solicitado_por),
                   range_name="A1", value_input_option="USER_ENTERED")
+    novos_locais = locais_sem_cadastro(tabela, ler_locais_entrega(valores_locais))
+    if novos_locais:
+        locais_aba.append_rows(novos_locais, value_input_option="USER_ENTERED")
 
     return {
         "linhas": len(tabela),
+        "locais_novos": len(novos_locais),
         "atualizado_em": atualizado_em,
         "url": f"https://docs.google.com/spreadsheets/d/{planilha_id}/edit#gid={aba.id}",
         "tabela": tabela,

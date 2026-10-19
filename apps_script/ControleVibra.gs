@@ -3,11 +3,15 @@
  *
  * Consulta o DW (BigQuery) com o login de quem executa, monta a lista de
  * NFs emitidas para a Vibra e grava na aba "Controle NFs Vibra":
- * - colunas A a M ("Do CIGAM") são reescritas a cada execução;
- * - colunas N a R (cliente final, status de entrega, data, observações) são
+ * - colunas A a N ("Do CIGAM") são reescritas a cada execução;
+ * - colunas O a S (cliente final, status de entrega, data, observações) são
  *   do time: o script lê o que já está lá e devolve cada valor na linha da
  *   mesma NF (chave = NF + série);
- * - colunas S e T são fórmulas da própria planilha (linha 2) e não são tocadas.
+ * - colunas T e U são fórmulas da própria planilha (linha 2) e não são tocadas.
+ *
+ * O cliente final vem da aba "Locais de entrega" (filial Vibra + nº do local
+ * de entrega da NF); local que aparece nas NFs e não está lá é acrescentado
+ * no fim da aba pra alguém preencher.
  *
  * Menu "Controle Vibra" na planilha: Atualizar agora, Agendar atualização
  * diária e Remover agendamento. O agendamento roda com o login de quem o
@@ -24,6 +28,7 @@ const PISO_CONSULTA = '2024-01-01';
 const DESDE_PADRAO = '2026-01-01';
 const ABA_CONTROLE = 'Controle NFs Vibra';
 const ABA_FONTES = 'Fontes';
+const ABA_LOCAIS = 'Locais de entrega';
 const HORA_AGENDAMENTO = 7;
 
 const STATUS_EM_ABERTO = 'Em aberto';
@@ -39,7 +44,10 @@ const STATUS_ABERTOS = [STATUS_EM_ABERTO, STATUS_PAGO_PARCIAL, STATUS_SEM_TITULO
 const COLUNAS_DW = [
   'NF', 'Série', 'Emissão', 'Vencimento', 'Valor (R$)', 'Saldo em aberto (R$)',
   'Nº Pedido Vibra', 'Filial Vibra (CNPJ)', 'Tipo de NF', 'Material',
-  'Status financeiro', 'Data pagamento / baixa', 'NF de devolução',
+  'Status financeiro', 'Data pagamento / baixa', 'NF de devolução', 'Local de entrega (nº)',
+];
+const CABECALHO_LOCAIS = [
+  'Filial Vibra (CNPJ)', 'Local de entrega (nº)', 'Cliente final', 'Cód. CIGAM do cliente final', 'Origem',
 ];
 const COLUNAS_MANUAIS = [
   'Cliente final / local de entrega', 'Status entrega', 'Data entrega / NF assinada', 'Obs. Emissão',
@@ -65,6 +73,13 @@ WITH vibra AS (
 notas AS (
   SELECT n.nf, n.serie, n.cliente, n.dataEmissao, n.status, n.especieNota,
          NULLIF(TRIM(n.dataCancelamento), '') AS dataCancelamento,
+         -- "Local de Entrega" da aba Transporte da NF: o CIGAM guarda o nº
+         -- como um caractere (! = 1, " = 2, # = 3...), código ASCII menos 32.
+         -- O nº aponta pra lista de endereços de entrega do cliente (a
+         -- filial da Vibra), que não está no DW: o nome do cliente final
+         -- vem da aba "Locais de entrega" da planilha.
+         IF(TRIM(IFNULL(n.ordemEnderecoEntrega, '')) = '', NULL,
+            ASCII(n.ordemEnderecoEntrega) - 32) AS localEntrega,
          SAFE_CAST(n.totalNF AS NUMERIC) AS totalNF, n.itensNf_json
   FROM \`${PROJECT_ID}.bronze.cigam__notas_fiscais\` n
   WHERE n.dataEmissao >= @piso AND n.cliente IN (SELECT codigo FROM vibra)
@@ -142,7 +157,7 @@ itens_nf AS (
 SELECT n.nf, n.serie, n.cliente, v.cnpj, n.dataEmissao AS emissao, n.status,
        n.dataCancelamento AS data_cancelamento, n.totalNF AS total_nf,
        t.vencimento, t.valor_titulo, t.pago, t.abatido, t.perda, t.data_baixa,
-       d.nfs_devolucao, d.data_devolucao,
+       d.nfs_devolucao, d.data_devolucao, n.localEntrega AS local_entrega,
        i.material, i.tem_cta, i.tem_sonda, i.tem_licenciamento, i.textos
 FROM notas n
 JOIN vibra v ON v.codigo = n.cliente
@@ -193,12 +208,26 @@ function atualizarControleVibra() {
     const aba = planilha.getSheetByName(ABA_CONTROLE);
     if (!aba) throw new Error(`Aba "${ABA_CONTROLE}" não encontrada.`);
 
+    let abaLocais = planilha.getSheetByName(ABA_LOCAIS);
+    if (!abaLocais) {
+      abaLocais = planilha.insertSheet(ABA_LOCAIS);
+      abaLocais.getRange(1, 1, 1, CABECALHO_LOCAIS.length).setValues([CABECALHO_LOCAIS]);
+    }
+    const valoresLocais = abaLocais.getDataRange().getValues();
+
     const atual = aba.getDataRange().getValues();
-    const tabela = montarTabela(consultarNotasVibra_(), atual, DESDE_PADRAO);
+    const tabela = montarTabela(consultarNotasVibra_(), atual, DESDE_PADRAO, valoresLocais);
     const agora = new Date();
     gravarControle_(aba, tabela, agora);
     atualizarFontes_(planilha, agora, tabela.length);
-    planilha.toast(`${tabela.length} NFs atualizadas a partir do CIGAM.`, 'Controle Vibra', 8);
+    const novos = locaisSemCadastro(tabela, lerLocaisEntrega(valoresLocais));
+    if (novos.length) {
+      abaLocais.getRange(abaLocais.getLastRow() + 1, 1, novos.length, CABECALHO_LOCAIS.length).setValues(novos);
+    }
+    planilha.toast(
+      `${tabela.length} NFs atualizadas a partir do CIGAM.` +
+      (novos.length ? ` ${novos.length} local(is) de entrega novo(s) na aba "${ABA_LOCAIS}" para preencher.` : ''),
+      'Controle Vibra', 10);
   } finally {
     trava.releaseLock();
   }
@@ -287,6 +316,11 @@ function numero_(valor) {
   return isNaN(n) ? 0 : n;
 }
 
+function inteiro_(valor) {
+  const n = parseInt(texto_(valor), 10);
+  return isNaN(n) ? null : n;
+}
+
 function verdadeiro_(valor) {
   return valor === true || valor === 'true';
 }
@@ -371,6 +405,7 @@ function montarControle(linhasDw) {
       'Status financeiro': st.status,
       'Data pagamento / baixa': st.data,
       'NF de devolução': texto_(linha.nfs_devolucao),
+      'Local de entrega (nº)': inteiro_(linha.local_entrega),
     };
   });
 }
@@ -430,29 +465,74 @@ function selecionarLinhas(controle, manuais, desde) {
   return abertas.concat(fechadas);
 }
 
-function mesclarManuais(selecionado, manuais) {
+/** O nº do local de entrega é por cadastro de cliente: o local 4 da Vibra
+ * Santo André (Louis Dreyfus) não é o local 4 da Vibra BA (Ferbasa). */
+function chaveLocal(cnpj, numero) {
+  const digitos = texto_(cnpj).replace(/\D/g, '');
+  const n = inteiro_(numero);
+  return !digitos || n === null ? null : `${digitos}|${n}`;
+}
+
+/** {chave: cliente final} da aba Locais de entrega, mantida pelo time. */
+function lerLocaisEntrega(valoresAba) {
+  const indice = (valoresAba || []).slice(0, 10).findIndex(l => l && texto_(l[0]) === CABECALHO_LOCAIS[0]);
+  if (indice < 0) return {};
+  const locais = {};
+  valoresAba.slice(indice + 1).forEach(linha => {
+    const chave = chaveLocal(linha[0], linha[1]);
+    if (chave !== null) locais[chave] = texto_(linha[2]);
+  });
+  return locais;
+}
+
+/** Linhas pra acrescentar na aba Locais de entrega: cada (filial, nº) que
+ * aparece nas NFs e ainda não está lá, com as NFs onde apareceu. */
+function locaisSemCadastro(tabela, locais) {
+  const vistos = {};
+  tabela.forEach(l => {
+    const chave = chaveLocal(l['Filial Vibra (CNPJ)'], l['Local de entrega (nº)']);
+    if (chave === null || chave in locais) return;
+    if (!vistos[chave]) vistos[chave] = { cnpj: l['Filial Vibra (CNPJ)'], numero: l['Local de entrega (nº)'], nfs: [] };
+    vistos[chave].nfs.push(l['NF']);
+  });
+  return Object.keys(vistos)
+    .map(chave => vistos[chave])
+    .sort((a, b) => (a.cnpj.replace(/\D/g, '') < b.cnpj.replace(/\D/g, '') ? -1
+      : a.cnpj.replace(/\D/g, '') > b.cnpj.replace(/\D/g, '') ? 1 : a.numero - b.numero))
+    .map(v => {
+      const nfs = v.nfs.slice().sort((x, y) => (Number(x) || 0) - (Number(y) || 0)).join(', ');
+      const origem = v.nfs.length === 1 ? `Preencher: visto na NF ${nfs}` : `Preencher: visto nas NFs ${nfs}`;
+      return [`'${v.cnpj}`, v.numero, '', '', origem];
+    });
+}
+
+function mesclarManuais(selecionado, manuais, locais) {
+  locais = locais || {};
   return selecionado.map(original => {
     const linha = Object.assign({}, original);
     COLUNAS_MANUAIS.forEach(nome => { linha[nome] = ''; });
     const anterior = manuais[chaveNf(linha['NF'], linha['Série'])];
     if (!anterior) {
       linha['Status entrega'] = statusEntregaInicial(linha);
-      return linha;
+    } else {
+      COLUNAS_MANUAIS.forEach(nome => { linha[nome] = anterior[nome] === undefined ? '' : anterior[nome]; });
+      if (!linha['Nº Pedido Vibra'] && anterior['Nº Pedido Vibra']) {
+        linha['Nº Pedido Vibra'] = anterior['Nº Pedido Vibra'];
+      }
     }
-    COLUNAS_MANUAIS.forEach(nome => { linha[nome] = anterior[nome] === undefined ? '' : anterior[nome]; });
-    if (!linha['Nº Pedido Vibra'] && anterior['Nº Pedido Vibra']) {
-      linha['Nº Pedido Vibra'] = anterior['Nº Pedido Vibra'];
-    }
+    const cliente = locais[chaveLocal(linha['Filial Vibra (CNPJ)'], linha['Local de entrega (nº)'])];
+    if (cliente) linha['Cliente final / local de entrega'] = cliente;
     return linha;
   });
 }
 
-function montarTabela(linhasDw, valoresAba, desde) {
+function montarTabela(linhasDw, valoresAba, desde, valoresLocais) {
   const manuais = lerPreenchimentoManual(valoresAba);
-  return mesclarManuais(selecionarLinhas(montarControle(linhasDw), manuais, desde), manuais);
+  return mesclarManuais(selecionarLinhas(montarControle(linhasDw), manuais, desde), manuais,
+    lerLocaisEntrega(valoresLocais));
 }
 
-/** Linhas A a R prontas pro setValues: texto que a planilha não deve
+/** Linhas A a S prontas pro setValues: texto que a planilha não deve
  * converter (série, pedido, CNPJ, NF de devolução) vai com apóstrofo. */
 function linhasParaPlanilha(tabela) {
   const protegido = v => (v ? `'${v}` : '');
@@ -473,6 +553,7 @@ function linhasParaPlanilha(tabela) {
       l['Status financeiro'],
       l['Data pagamento / baixa'] || '',
       protegido(l['NF de devolução']),
+      l['Local de entrega (nº)'] === null ? '' : l['Local de entrega (nº)'],
     ].concat(COLUNAS_MANUAIS.map(nome => l[nome]));
   });
 }

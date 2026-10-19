@@ -4194,10 +4194,18 @@ def renderizar_controle_vibra():
             st.success(
                 f"Planilha atualizada com {resultado['linhas']} NFs em "
                 f"{resultado['atualizado_em']:%d/%m/%Y %H:%M}. [Abrir a planilha]({resultado['url']})")
+            if resultado["locais_novos"]:
+                st.info(f"{resultado['locais_novos']} local(is) de entrega novo(s) acrescentado(s) na aba "
+                        f"\"{controle_vibra.ABA_LOCAIS}\": falta preencher o cliente final.")
         else:
             with st.spinner("Consultando o DW..."):
-                aba = gc.open_by_key(controle_vibra.PLANILHA_ID_PADRAO).worksheet(controle_vibra.ABA_CONTROLE)
-                tabela = controle_vibra.preparar_controle(client_bq, aba.get_all_values(), desde)
+                planilha = gc.open_by_key(controle_vibra.PLANILHA_ID_PADRAO)
+                aba = planilha.worksheet(controle_vibra.ABA_CONTROLE)
+                try:
+                    valores_locais = planilha.worksheet(controle_vibra.ABA_LOCAIS).get_all_values()
+                except gspread.WorksheetNotFound:
+                    valores_locais = []
+                tabela = controle_vibra.preparar_controle(client_bq, aba.get_all_values(), desde, valores_locais)
             st.caption("Prévia: nada foi gravado na planilha.")
     except PermissionError as erro:
         st.error(str(erro))
@@ -4219,8 +4227,8 @@ def renderizar_controle_vibra():
     col3.metric("NFs na planilha", len(tabela))
     st.dataframe(
         tabela[["NF", "Série", "Emissão", "Vencimento", "Valor (R$)", "Saldo em aberto (R$)", "Nº Pedido Vibra",
-                "Tipo de NF", "Status financeiro", "Data pagamento / baixa", "Status entrega",
-                "Cliente final / local de entrega"]],
+                "Tipo de NF", "Status financeiro", "Data pagamento / baixa", "Local de entrega (nº)",
+                "Cliente final / local de entrega", "Status entrega"]],
         use_container_width=True, hide_index=True,
         column_config={
             "Emissão": st.column_config.DateColumn(format="DD/MM/YYYY"),

@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 import controle_vibra as cv
-from test_controle_vibra import nf_dw, planilha_layout_antigo
+from test_controle_vibra import aba_locais, nf_dw, planilha_layout_antigo
 
 HARNESS = Path(__file__).parent / "harness_apps_script.js"
 pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="Node não instalado")
@@ -46,7 +46,10 @@ def test_sql_e_o_mesmo_nas_duas_versoes():
 
 
 CASOS = [
-    nf_dw(textos="OC: 4503762321"),                                                  # aberta, já na planilha
+    nf_dw(textos="OC: 4503762321", local_entrega=None),                              # aberta, já na planilha
+    nf_dw(nf="24056", cnpj="34274233008006", local_entrega=1, emissao=date(2026, 6, 15)),  # local cadastrado
+    nf_dw(nf="24865", cnpj="34274233002571", local_entrega=9, emissao=date(2026, 7, 23)),  # local sem cliente
+    nf_dw(nf="26133", cnpj="34274233000102", local_entrega=12, emissao=date(2026, 10, 8)),  # local novo
     nf_dw(nf="23224", vencimento=date(2026, 5, 17), tem_cta=False),                  # aberta, venda de sonda
     nf_dw(nf="12121", serie="S1", emissao=date(2026, 2, 20), valor_titulo=Decimal("7851.02"),
           total_nf=Decimal("7851.02"), pago=Decimal("7851.02"), data_baixa=date(2026, 2, 27),
@@ -75,24 +78,30 @@ CASOS = [
 ]
 
 
-def _python(casos, aba, desde):
-    tabela = cv.mesclar_manuais(
-        cv.selecionar_linhas(cv.montar_controle(pd.DataFrame(casos)), cv.ler_preenchimento_manual(aba), desde),
-        cv.ler_preenchimento_manual(aba))
+def _python(casos, aba, desde, locais=()):
+    manuais = cv.ler_preenchimento_manual(aba)
+    tabela = cv.mesclar_manuais(cv.selecionar_linhas(cv.montar_controle(pd.DataFrame(casos)), manuais, desde),
+                                manuais, cv.ler_locais_entrega(list(locais)))
     largura = len(cv.COLUNAS_DW) + len(cv.COLUNAS_MANUAIS)
-    return [linha[:largura] for linha in cv.valores_aba_controle(tabela, datetime(2026, 10, 19))[2:]]
+    linhas = [linha[:largura] for linha in cv.valores_aba_controle(tabela, datetime(2026, 10, 19))[2:]]
+    return linhas, cv.locais_sem_cadastro(tabela, cv.ler_locais_entrega(list(locais)))
+
+
+def _js(casos, aba, desde, locais=()):
+    saida = _rodar_node({"linhas": [_como_bigquery(c) for c in casos], "aba": aba, "desde": desde,
+                         "locais": list(locais)})
+    return saida["linhas"], saida["novos"]
 
 
 def test_mesmas_celulas_nas_duas_versoes():
     aba = planilha_layout_antigo()
-    esperado = _python(CASOS, aba, date(2026, 1, 1))
-    obtido = _rodar_node({"linhas": [_como_bigquery(c) for c in CASOS], "aba": aba, "desde": "2026-01-01"})["linhas"]
+    esperado, novos_py = _python(CASOS, aba, date(2026, 1, 1), aba_locais())
+    obtido, novos_js = _js(CASOS, aba, "2026-01-01", aba_locais())
     assert [l[0] for l in obtido] == [l[0] for l in esperado]
     for linha_js, linha_py in zip(obtido, esperado):
         assert linha_js == linha_py, linha_py[0]
+    assert novos_js == novos_py and novos_py
 
 
 def test_mesmas_celulas_sem_planilha_anterior():
-    esperado = _python(CASOS, [], date(2026, 1, 1))
-    obtido = _rodar_node({"linhas": [_como_bigquery(c) for c in CASOS], "aba": [], "desde": "2026-01-01"})["linhas"]
-    assert obtido == esperado
+    assert _js(CASOS, [], "2026-01-01") == tuple(map(list, _python(CASOS, [], date(2026, 1, 1))))
