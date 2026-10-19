@@ -190,7 +190,9 @@ def test_mescla_devolve_preenchimento_e_inicia_status_entrega():
     selecionado = cv.selecionar_linhas(controle_exemplo(), manuais, date(2026, 1, 1))
     final = cv.mesclar_manuais(selecionado, manuais).set_index("NF")
     assert final.loc["21897", "Status entrega"] == "Aguardando NF assinada"
-    assert final.loc["21897", "Cliente final / local de entrega"] == "Gerdau Aços Longos Lassance/MG"
+    # cliente final digitado no layout antigo, sem a aba Locais: vai pra obs
+    assert final.loc["21897", "Cliente final"] == ""
+    assert final.loc["21897", "Obs. Emissão"] == "Cliente final: Gerdau Aços Longos Lassance/MG | canhoto pedido"
     assert final.loc["21903", "Status entrega"] == "Não se aplica"
     assert final.loc["17000", "Status entrega"] == "A validar"  # nova e aberta
     assert final.loc["25272", "Status entrega"] == ""  # nova e já paga
@@ -372,7 +374,12 @@ def test_sincronizar_planilha_preserva_o_time_e_reformata(monkeypatch):
     assert faixa == "A1" and len(valores) == 4
     linha_21897 = next(l for l in valores[2:] if l[0] == 21897)
     assert linha_21897[cv.COLUNAS.index("Status entrega")] == "Aguardando NF assinada"
-    assert linha_21897[cv.COLUNAS.index("Obs. Emissão")] == "canhoto pedido"
+    # o cliente final digitado no layout antigo não se perde: vai pra obs, e
+    # a coluna vira fórmula (cabeçalho com ARRAYFORMULA, células vazias)
+    assert linha_21897[cv.COLUNAS.index("Obs. Emissão")] == (
+        "Cliente final: Gerdau Aços Longos Lassance/MG | canhoto pedido")
+    assert linha_21897[cv.COLUNAS.index("Cliente final")] == ""
+    assert valores[1][cv.COLUNAS.index("Cliente final")] == cv.formula_cliente_final()
     # aba Locais de entrega criada com cabeçalho e o local da Vibra Betim acrescentado pra preencher
     locais = planilha.abas[cv.ABA_LOCAIS].valores
     assert locais[0] == cv.CABECALHO_LOCAIS
@@ -443,11 +450,25 @@ def test_cliente_final_vem_da_aba_de_locais_e_vence_o_digitado():
                ("24865", "2"): {"Cliente final / local de entrega": "TRANSPORTES OLSEN UBERABA"},
                ("21897", "2"): {"Cliente final / local de entrega": "Gerdau Lassance"}}
     final = cv.mesclar_manuais(controle, manuais, cv.ler_locais_entrega(aba_locais())).set_index("NF")
-    coluna = "Cliente final / local de entrega"
-    assert final.loc["24056", coluna] == "CIA. DE FERRO LIGAS DA BAHIA - FERBASA (Andorinha/BA)"
-    assert final.loc["22100", coluna] == "Louis Dreyfus"
-    assert final.loc["24865", coluna] == "TRANSPORTES OLSEN UBERABA"  # local sem cliente na aba: fica o digitado
-    assert final.loc["21897", coluna] == "Gerdau Lassance"  # NF sem local: fica o digitado
+    assert final.loc["24056", "Cliente final"] == "CIA. DE FERRO LIGAS DA BAHIA - FERBASA (Andorinha/BA)"
+    assert final.loc["22100", "Cliente final"] == "Louis Dreyfus"
+    assert final.loc["24865", "Cliente final"] == ""  # local sem cliente na aba
+    # o digitado que não bate com a aba Locais vai pra Obs. Emissão
+    assert final.loc["24056", "Obs. Emissão"] == "Cliente final: FERBASA digitado"
+    assert final.loc["24865", "Obs. Emissão"] == "Cliente final: TRANSPORTES OLSEN UBERABA"
+    assert final.loc["21897", "Obs. Emissão"] == "Cliente final: Gerdau Lassance"  # NF sem local
+    assert final.loc["22100", "Obs. Emissão"] == ""
+
+
+def test_cliente_final_e_formula_pela_aba_de_locais():
+    formula = cv.formula_cliente_final()
+    assert formula.startswith('={"Cliente final";ARRAYFORMULA(')
+    # filial (H) só com dígitos + nº do local (N), procurados na aba Locais
+    assert 'REGEXREPLACE(H3:H&"";"\\D";"")&"|"&N3:N' in formula
+    assert "HSTACK(REGEXREPLACE('Locais de entrega'!$A:$A" in formula
+    assert "MATCH(" not in formula  # não roda linha a linha no ARRAYFORMULA
+    assert cv._letra("Cliente final") == "O" and cv._letra("Status entrega") == "P"
+    assert cv._letra("Próxima ação") == "U"
 
 
 def test_locais_sem_cadastro_listam_as_nfs():

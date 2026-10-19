@@ -4228,7 +4228,7 @@ def renderizar_controle_vibra():
     st.dataframe(
         tabela[["NF", "Série", "Emissão", "Vencimento", "Valor (R$)", "Saldo em aberto (R$)", "Nº Pedido Vibra",
                 "Tipo de NF", "Status financeiro", "Data pagamento / baixa", "Local de entrega (nº)",
-                "Cliente final / local de entrega", "Status entrega"]],
+                "Cliente final", "Status entrega"]],
         use_container_width=True, hide_index=True,
         column_config={
             "Emissão": st.column_config.DateColumn(format="DD/MM/YYYY"),

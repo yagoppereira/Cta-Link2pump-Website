@@ -4,14 +4,14 @@
  * Consulta o DW (BigQuery) com o login de quem executa, monta a lista de
  * NFs emitidas para a Vibra e grava na aba "Controle NFs Vibra":
  * - colunas A a N ("Do CIGAM") são reescritas a cada execução;
- * - colunas O a S (cliente final, status de entrega, data, observações) são
- *   do time: o script lê o que já está lá e devolve cada valor na linha da
- *   mesma NF (chave = NF + série);
+ * - coluna O (cliente final) é fórmula da planilha (linha 2) e não é tocada:
+ *   procura a filial Vibra + o nº do local de entrega da NF na aba "Locais
+ *   de entrega"; local que aparece nas NFs e não está lá é acrescentado no
+ *   fim da aba pra alguém preencher;
+ * - colunas P a S (status de entrega, data, observações) são do time: o
+ *   script lê o que já está lá e devolve cada valor na linha da mesma NF
+ *   (chave = NF + série);
  * - colunas T e U são fórmulas da própria planilha (linha 2) e não são tocadas.
- *
- * O cliente final vem da aba "Locais de entrega" (filial Vibra + nº do local
- * de entrega da NF); local que aparece nas NFs e não está lá é acrescentado
- * no fim da aba pra alguém preencher.
  *
  * Menu "Controle Vibra" na planilha: Atualizar agora, Agendar atualização
  * diária e Remover agendamento. O agendamento roda com o login de quem o
@@ -49,10 +49,12 @@ const COLUNAS_DW = [
 const CABECALHO_LOCAIS = [
   'Filial Vibra (CNPJ)', 'Local de entrega (nº)', 'Cliente final', 'Cód. CIGAM do cliente final', 'Origem',
 ];
-const COLUNAS_MANUAIS = [
-  'Cliente final / local de entrega', 'Status entrega', 'Data entrega / NF assinada', 'Obs. Emissão',
-  'Obs. financeiro',
-];
+// O é fórmula (cliente final pela aba Locais de entrega); P a S são do time
+const COLUNA_CLIENTE_FINAL = 'Cliente final';
+const COLUNAS_MANUAIS = ['Status entrega', 'Data entrega / NF assinada', 'Obs. Emissão', 'Obs. financeiro'];
+// coluna que a Emissão preenchia à mão antes de virar fórmula: o que foi
+// digitado e não bate com a aba Locais de entrega vai pra Obs. Emissão
+const COLUNA_CLIENTE_FINAL_DIGITADO = 'Cliente final / local de entrega';
 const PRIMEIRA_LINHA_DADOS = 3;
 const TOLERANCIA_CENTAVOS = 0.01;
 
@@ -282,7 +284,8 @@ function consultarNotasVibra_() {
 }
 
 function gravarControle_(aba, tabela, agora) {
-  const nColunas = COLUNAS_DW.length + COLUNAS_MANUAIS.length;
+  const nDw = COLUNAS_DW.length;
+  const nColunas = nDw + 1 + COLUNAS_MANUAIS.length;
   const necessarias = PRIMEIRA_LINHA_DADOS - 1 + tabela.length;
   if (aba.getMaxRows() < necessarias) {
     aba.insertRowsAfter(aba.getMaxRows(), necessarias - aba.getMaxRows());
@@ -290,7 +293,11 @@ function gravarControle_(aba, tabela, agora) {
   const sobra = aba.getMaxRows() - PRIMEIRA_LINHA_DADOS + 1;
   aba.getRange(PRIMEIRA_LINHA_DADOS, 1, sobra, nColunas).clearContent();
   if (tabela.length) {
-    aba.getRange(PRIMEIRA_LINHA_DADOS, 1, tabela.length, nColunas).setValues(linhasParaPlanilha(tabela));
+    // a coluna do cliente final fica vazia pro ARRAYFORMULA da linha 2 se espalhar
+    const linhas = linhasParaPlanilha(tabela);
+    aba.getRange(PRIMEIRA_LINHA_DADOS, 1, linhas.length, nDw).setValues(linhas.map(l => l.slice(0, nDw)));
+    aba.getRange(PRIMEIRA_LINHA_DADOS, nDw + 2, linhas.length, COLUNAS_MANUAIS.length)
+      .setValues(linhas.map(l => l.slice(nDw + 1)));
   }
   aba.getRange(1, 1).setValue(
     `Do CIGAM (extrator, atualizado em ${Utilities.formatDate(agora, Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm')})`);
@@ -430,7 +437,8 @@ function lerPreenchimentoManual(valoresAba) {
   if (indiceCabecalho < 0) return {};
   const cabecalho = valoresAba[indiceCabecalho].map(texto_);
   const posicoes = {};
-  COLUNAS_MANUAIS.concat(['Nº Pedido Vibra', 'Série']).forEach(nome => {
+  const lidas = COLUNAS_MANUAIS.concat(['Nº Pedido Vibra', COLUNA_CLIENTE_FINAL_DIGITADO]);
+  lidas.concat(['Série']).forEach(nome => {
     const pos = cabecalho.indexOf(nome);
     if (pos >= 0) posicoes[nome] = pos;
   });
@@ -446,7 +454,7 @@ function lerPreenchimentoManual(valoresAba) {
       return valor instanceof Date ? valor : texto_(valor);
     };
     const registro = {};
-    COLUNAS_MANUAIS.concat(['Nº Pedido Vibra']).forEach(nome => { registro[nome] = celula(nome); });
+    lidas.forEach(nome => { registro[nome] = celula(nome); });
     manuais[chaveNf(linha[0], celula('Série'))] = registro;
   });
   return manuais;
@@ -526,8 +534,13 @@ function mesclarManuais(selecionado, manuais, locais) {
         linha['Nº Pedido Vibra'] = anterior['Nº Pedido Vibra'];
       }
     }
-    const cliente = locais[chaveLocal(linha['Filial Vibra (CNPJ)'], linha['Local de entrega (nº)'])];
-    if (cliente) linha['Cliente final / local de entrega'] = cliente;
+    const cliente = locais[chaveLocal(linha['Filial Vibra (CNPJ)'], linha['Local de entrega (nº)'])] || '';
+    linha[COLUNA_CLIENTE_FINAL] = cliente;
+    const digitado = anterior ? anterior[COLUNA_CLIENTE_FINAL_DIGITADO] || '' : '';
+    if (digitado && digitado !== cliente) {
+      const obs = linha['Obs. Emissão'];
+      linha['Obs. Emissão'] = `Cliente final: ${digitado}` + (obs ? ` | ${obs}` : '');
+    }
     return linha;
   });
 }
@@ -539,7 +552,8 @@ function montarTabela(linhasDw, valoresAba, desde, valoresLocais) {
 }
 
 /** Linhas A a S prontas pro setValues: texto que a planilha não deve
- * converter (série, pedido, CNPJ, NF de devolução) vai com apóstrofo. */
+ * converter (série, pedido, CNPJ, NF de devolução) vai com apóstrofo. A
+ * coluna O (cliente final) vai vazia: é fórmula e gravarControle_ pula. */
 function linhasParaPlanilha(tabela) {
   const protegido = v => (v ? `'${v}` : '');
   return tabela.map(l => {
@@ -560,6 +574,7 @@ function linhasParaPlanilha(tabela) {
       l['Data pagamento / baixa'] || '',
       protegido(l['NF de devolução']),
       l['Local de entrega (nº)'] === null ? '' : l['Local de entrega (nº)'],
+      '',
     ].concat(COLUNAS_MANUAIS.map(nome => l[nome]));
   });
 }

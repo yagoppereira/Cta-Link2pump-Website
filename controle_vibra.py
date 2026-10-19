@@ -9,12 +9,13 @@ de Emissão confirma a entrega e o Financeiro anota a cobrança.
 Divisão de responsabilidade na planilha:
 - colunas A a N ("Do CIGAM") são do extrator: reescritas a cada execução,
   ninguém edita à mão;
-- colunas O a S (cliente final, status de entrega, data, observações) são
-  do time: o extrator lê o que já está lá antes de reescrever a aba e
-  devolve cada valor na linha da mesma NF (chave = NF + série);
+- coluna O (cliente final) é fórmula da planilha: procura a filial Vibra +
+  o nº do local de entrega da NF na aba "Locais de entrega", mantida pelo
+  time; local novo é acrescentado lá em branco pelo extrator;
+- colunas P a S (status de entrega, data, observações) são do time: o
+  extrator lê o que já está lá antes de reescrever a aba e devolve cada
+  valor na linha da mesma NF (chave = NF + série);
 - colunas T e U (dias em atraso, próxima ação) são fórmulas da planilha.
-O cliente final vem da aba "Locais de entrega" (filial Vibra + nº do local
-de entrega da NF), mantida pelo time; local novo é acrescentado lá em branco.
 
 Roda de três jeitos:
 - dentro da própria planilha, pelo Apps Script apps_script/ControleVibra.gs
@@ -99,6 +100,7 @@ STATUS_ENTREGA_ACAO = [
 ACAO_SEM_TITULO = "Financeiro: conferir título no CIGAM"
 ACAO_SEM_STATUS = "Preencher status entrega"
 ACAO_ENCERRADA = "Encerrada"
+LOCAL_SEM_CADASTRO = "Cadastrar na aba Locais de entrega"
 
 # --- layout da aba de controle ----------------------------------------------
 COLUNAS_DW = [
@@ -106,11 +108,18 @@ COLUNAS_DW = [
     "Nº Pedido Vibra", "Filial Vibra (CNPJ)", "Tipo de NF", "Material",
     "Status financeiro", "Data pagamento / baixa", "NF de devolução", "Local de entrega (nº)",
 ]
-COLUNAS_EMISSAO = ["Cliente final / local de entrega", "Status entrega", "Data entrega / NF assinada", "Obs. Emissão"]
+# o cliente final é fórmula na planilha (procura filial + nº do local na aba
+# Locais de entrega), pra que um local cadastrado lá apareça na hora em
+# todas as NFs, sem depender de rodar o extrator nem de alguém digitar
+COLUNA_CLIENTE_FINAL = "Cliente final"
+COLUNAS_EMISSAO = ["Status entrega", "Data entrega / NF assinada", "Obs. Emissão"]
 COLUNAS_FINANCEIRO = ["Obs. financeiro"]
 COLUNAS_MANUAIS = COLUNAS_EMISSAO + COLUNAS_FINANCEIRO
 COLUNAS_FORMULA = ["Dias em atraso", "Próxima ação"]
-COLUNAS = COLUNAS_DW + COLUNAS_MANUAIS + COLUNAS_FORMULA
+COLUNAS = COLUNAS_DW + [COLUNA_CLIENTE_FINAL] + COLUNAS_MANUAIS + COLUNAS_FORMULA
+# coluna que a Emissão preenchia à mão antes de virar fórmula: o que foi
+# digitado e não bate com a aba Locais de entrega vai pra Obs. Emissão
+COLUNA_CLIENTE_FINAL_DIGITADO = "Cliente final / local de entrega"
 
 
 def _letra(nome_coluna: str) -> str:
@@ -442,8 +451,8 @@ def ler_preenchimento_manual(valores_aba: list) -> dict:
     if indice_cabecalho is None:
         return {}
     cabecalho = [str(c).strip() for c in valores_aba[indice_cabecalho]]
-    posicoes = {nome: cabecalho.index(nome) for nome in COLUNAS_MANUAIS + ["Nº Pedido Vibra", "Série"]
-                if nome in cabecalho}
+    lidas = COLUNAS_MANUAIS + ["Nº Pedido Vibra", COLUNA_CLIENTE_FINAL_DIGITADO]
+    posicoes = {nome: cabecalho.index(nome) for nome in lidas + ["Série"] if nome in cabecalho}
     if "Série" not in posicoes:
         return {}
 
@@ -455,7 +464,7 @@ def ler_preenchimento_manual(valores_aba: list) -> dict:
             pos = posicoes.get(nome)
             return str(linha[pos]).strip() if pos is not None and pos < len(linha) else ""
         chave = chave_nf(linha[0], celula("Série"))
-        manuais[chave] = {nome: celula(nome) for nome in COLUNAS_MANUAIS + ["Nº Pedido Vibra"]}
+        manuais[chave] = {nome: celula(nome) for nome in lidas}
     return manuais
 
 
@@ -541,8 +550,9 @@ def locais_sem_cadastro(tabela: pd.DataFrame, locais: dict) -> list:
 def mesclar_manuais(selecionado: pd.DataFrame, manuais: dict, locais: dict = None) -> pd.DataFrame:
     """Põe as colunas manuais de volta em cada NF. O nº do pedido digitado à
     mão só vale quando o DW não achou nenhum no texto da NF. O cliente final
-    vem da aba Locais de entrega quando o local da NF está cadastrado lá;
-    senão fica o que foi digitado na linha."""
+    vem da aba Locais de entrega (na planilha é fórmula; aqui serve pra
+    prévia do app). Cliente final digitado no layout anterior que não bate
+    com a aba Locais vai pra Obs. Emissão, pra não se perder."""
     locais = locais or {}
     resultado = selecionado.copy()
     for nome in COLUNAS_MANUAIS:
@@ -556,10 +566,15 @@ def mesclar_manuais(selecionado: pd.DataFrame, manuais: dict, locais: dict = Non
             resultado.at[indice, nome] = anterior.get(nome, "")
         if not linha["Nº Pedido Vibra"] and anterior.get("Nº Pedido Vibra"):
             resultado.at[indice, "Nº Pedido Vibra"] = anterior["Nº Pedido Vibra"]
+    resultado[COLUNA_CLIENTE_FINAL] = ""
     for indice, linha in resultado.iterrows():
-        cliente = locais.get(chave_local(linha["Filial Vibra (CNPJ)"], linha["Local de entrega (nº)"]))
-        if cliente:
-            resultado.at[indice, "Cliente final / local de entrega"] = cliente
+        cliente = locais.get(chave_local(linha["Filial Vibra (CNPJ)"], linha["Local de entrega (nº)"]), "")
+        resultado.at[indice, COLUNA_CLIENTE_FINAL] = cliente
+        anterior = manuais.get(chave_nf(linha["NF"], linha["Série"])) or {}
+        digitado = anterior.get(COLUNA_CLIENTE_FINAL_DIGITADO, "")
+        if digitado and digitado != cliente:
+            obs = _str(linha["Obs. Emissão"])
+            resultado.at[indice, "Obs. Emissão"] = f"Cliente final: {digitado}" + (f" | {obs}" if obs else "")
     return resultado
 
 
@@ -588,6 +603,23 @@ def formula_dias_em_atraso() -> str:
     )
 
 
+def formula_cliente_final() -> str:
+    """Procura filial (só os dígitos do CNPJ) + nº do local na aba Locais de
+    entrega. NF sem local fica em branco; local que não está lá avisa.
+    VLOOKUP + HSTACK porque MATCH não roda linha a linha no ARRAYFORMULA
+    (devolve o primeiro resultado pra todas), e HSTACK evita o separador de
+    colunas do {} que muda com a localidade da planilha."""
+    a, h, n = _letra("NF"), _letra("Filial Vibra (CNPJ)"), _letra("Local de entrega (nº)")
+    p = PRIMEIRA_LINHA_DADOS
+    locais = f"'{ABA_LOCAIS}'"
+    return (
+        f'={{"{COLUNA_CLIENTE_FINAL}";ARRAYFORMULA(IF(LEN({a}{p}:{a})*LEN({n}{p}:{n});'
+        f'IFERROR(VLOOKUP(REGEXREPLACE({h}{p}:{h}&"";"\\D";"")&"|"&{n}{p}:{n};'
+        f'HSTACK(REGEXREPLACE({locais}!$A:$A&"";"\\D";"")&"|"&{locais}!$B:$B;{locais}!$C:$C);2;FALSE);'
+        f'"{LOCAL_SEM_CADASTRO}");))}}'
+    )
+
+
 def formula_proxima_acao() -> str:
     a, k, o = _letra("NF"), _letra("Status financeiro"), _letra("Status entrega")
     p = PRIMEIRA_LINHA_DADOS
@@ -607,7 +639,8 @@ def valores_aba_controle(df: pd.DataFrame, atualizado_em: datetime) -> list:
     grupos[COLUNAS.index(COLUNAS_EMISSAO[0])] = "Emissão preenche"
     grupos[COLUNAS.index(COLUNAS_FINANCEIRO[0])] = "Financeiro preenche"
     grupos[COLUNAS.index(COLUNAS_FORMULA[0])] = "Automático"
-    cabecalho = COLUNAS_DW + COLUNAS_MANUAIS + [formula_dias_em_atraso(), formula_proxima_acao()]
+    cabecalho = (COLUNAS_DW + [formula_cliente_final()] + COLUNAS_MANUAIS
+                 + [formula_dias_em_atraso(), formula_proxima_acao()])
 
     valores = [grupos, cabecalho]
     for _, linha in df.iterrows():
@@ -629,6 +662,7 @@ def valores_aba_controle(df: pd.DataFrame, atualizado_em: datetime) -> list:
             _texto(linha["NF de devolução"]),
             "" if linha["Local de entrega (nº)"] is None or pd.isna(linha["Local de entrega (nº)"])
             else int(linha["Local de entrega (nº)"]),
+            "",
             *[linha[nome] for nome in COLUNAS_MANUAIS],
             "", "",
         ])
@@ -718,7 +752,7 @@ def valores_aba_fontes(atualizado_em: datetime, desde: date, qtd_linhas: int, so
             qtd_linhas,
             "Status financeiro, tipo de NF e nº do pedido calculados no extrator (regras em controle_vibra.py). "
             f"Colunas {_letra(COLUNAS_MANUAIS[0])} a {_letra(COLUNAS_MANUAIS[-1])} preservadas da planilha; "
-            f"cliente final pela aba {ABA_LOCAIS}.",
+            f"Cliente final (coluna {_letra(COLUNA_CLIENTE_FINAL)}) é fórmula pela aba {ABA_LOCAIS}.",
             f"As colunas A a {_letra(COLUNAS_DW[-1])} são reescritas a cada execução.",
         ],
         [""] * 11,
@@ -743,7 +777,7 @@ LARGURAS = {
     "NF": 70, "Série": 50, "Emissão": 90, "Vencimento": 90, "Valor (R$)": 110, "Saldo em aberto (R$)": 120,
     "Nº Pedido Vibra": 115, "Filial Vibra (CNPJ)": 150, "Tipo de NF": 140, "Material": 320,
     "Status financeiro": 120, "Data pagamento / baixa": 110, "NF de devolução": 95, "Local de entrega (nº)": 80,
-    "Cliente final / local de entrega": 250, "Status entrega": 170, "Data entrega / NF assinada": 120,
+    COLUNA_CLIENTE_FINAL: 250, "Status entrega": 170, "Data entrega / NF assinada": 120,
     "Obs. Emissão": 220, "Obs. financeiro": 300, "Dias em atraso": 80, "Próxima ação": 210,
 }
 
@@ -787,7 +821,7 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
                         "userEnteredFormat"))
 
     grupos = [
-        (0, len(COLUNAS_DW), VERDE, BRANCO),
+        (0, idx[COLUNA_CLIENTE_FINAL] + 1, VERDE, BRANCO),
         (idx[COLUNAS_EMISSAO[0]], idx[COLUNAS_EMISSAO[-1]] + 1, AMARELO_CLARO, PRETO),
         (idx[COLUNAS_FINANCEIRO[0]], idx[COLUNAS_FINANCEIRO[-1]] + 1, AZUL_CLARO, PRETO),
         (idx[COLUNAS_FORMULA[0]], idx[COLUNAS_FORMULA[-1]] + 1, CINZA_CLARO, PRETO),
@@ -823,7 +857,7 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
                             "userEnteredFormat.numberFormat,userEnteredFormat.horizontalAlignment"))
     req.append(_formato(dados(idx["Série"], idx["Série"] + 1), {"horizontalAlignment": "CENTER"},
                         "userEnteredFormat.horizontalAlignment"))
-    for nome in ("Material", "Cliente final / local de entrega", "Obs. Emissão", "Obs. financeiro"):
+    for nome in ("Material", COLUNA_CLIENTE_FINAL, "Obs. Emissão", "Obs. financeiro"):
         req.append(_formato(dados(idx[nome], idx[nome] + 1), {"wrapStrategy": "WRAP"},
                             "userEnteredFormat.wrapStrategy"))
 
@@ -873,6 +907,12 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
             "reescritas a cada atualização: "
             "não edite. Detalhes da consulta na aba Fontes."}]}],
         "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": 0}}})
+    req.append({"updateCells": {
+        "rows": [{"values": [{"note":
+            f"Fórmula: procura a filial (coluna {_letra('Filial Vibra (CNPJ)')}) e o nº do local "
+            f"(coluna {_letra('Local de entrega (nº)')}) na aba {ABA_LOCAIS}. "
+            "Para corrigir ou cadastrar um cliente final, edite lá."}]}],
+        "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": idx[COLUNA_CLIENTE_FINAL]}}})
     req.append({"updateCells": {
         "rows": [{"values": [{"note": "Opções vêm da aba Listas. Para incluir uma nova, acrescente lá."}]}],
         "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": idx["Status entrega"]}}})

@@ -82,7 +82,7 @@ def _python(casos, aba, desde, locais=()):
     manuais = cv.ler_preenchimento_manual(aba)
     tabela = cv.mesclar_manuais(cv.selecionar_linhas(cv.montar_controle(pd.DataFrame(casos)), manuais, desde),
                                 manuais, cv.ler_locais_entrega(list(locais)))
-    largura = len(cv.COLUNAS_DW) + len(cv.COLUNAS_MANUAIS)
+    largura = len(cv.COLUNAS_DW) + 1 + len(cv.COLUNAS_MANUAIS)  # A a S (O = cliente final, fórmula)
     linhas = [linha[:largura] for linha in cv.valores_aba_controle(tabela, datetime(2026, 10, 19))[2:]]
     return linhas, cv.locais_sem_cadastro(tabela, cv.ler_locais_entrega(list(locais)))
 
