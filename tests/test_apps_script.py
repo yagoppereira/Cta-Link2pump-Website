@@ -137,7 +137,8 @@ def _filtros():
         _linha_planilha(10, "em aberto", "não se aplica", saldo=100.0),  # planilha ignora maiúsculas
     ]
     colunas = {nome: i for i, nome in enumerate(cv.COLUNAS)}
-    return _rodar_node({"filtros": {"colunas": colunas, "linhas": linhas, "de": "2026-09-01", "ate": "2026-09-30"}})
+    return _rodar_node({"filtros": {"colunas": colunas, "linhas": linhas, "de": "2026-09-01",
+                                    "ate": "2026-09-30"}})["filtros"]
 
 
 def test_filtros_contam_as_nfs_de_cada_condicao():
@@ -170,3 +171,13 @@ def test_formula_do_filtro_usa_as_colunas_do_layout_e_nao_depende_da_localidade(
         assert resultado["formula"].endswith("*1)>0")
     for resultado in saida.values():  # sem função de vários argumentos: nada de ";" nem ","
         assert ";" not in resultado["formula"] and "," not in resultado["formula"]
+
+
+def test_filtro_rapido_da_linha_1_tem_as_mesmas_opcoes_nas_duas_versoes():
+    colunas = {nome: i for i, nome in enumerate(cv.COLUNAS)}
+    saida = _rodar_node({"filtros": {"colunas": colunas, "linhas": [], "de": "2026-09-01", "ate": "2026-09-30"}})
+    # a validação da lista em A1 vem do Python; o onEdit do .gs procura pelo rótulo
+    assert saida["opcoes"] == cv.OPCOES_FILTRO_RAPIDO
+    assert saida["opcao_por_rotulo"]["Todas as NFs"] is None
+    assert all(saida["opcao_por_rotulo"][r] for r in cv.OPCOES_FILTRO_RAPIDO[1:])
+    assert saida["aviso"] == "Pagos: 3 NF(s) · valor R$ 1.234.567,80"

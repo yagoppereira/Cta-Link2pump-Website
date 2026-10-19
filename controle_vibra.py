@@ -117,6 +117,15 @@ COLUNAS_FINANCEIRO = ["Obs. financeiro"]
 COLUNAS_MANUAIS = COLUNAS_EMISSAO + COLUNAS_FINANCEIRO
 COLUNAS_FORMULA = ["Dias em atraso", "Próxima ação"]
 COLUNAS = COLUNAS_DW + [COLUNA_CLIENTE_FINAL] + COLUNAS_MANUAIS + COLUNAS_FORMULA
+# filtro rápido na linha 1 (congelada, fica sempre à vista): lista em A1:D1
+# e período em E1 / F1. Quem aplica é o onEdit do apps_script/FiltrosVibra.gs;
+# os rótulos têm que ser os mesmos de lá (conferido em tests/test_apps_script.py)
+OPCOES_FILTRO_RAPIDO = ["Todas as NFs", "Pendentes de pagamento", "Pendentes vencidos", "Aguardando a Emissão",
+                        "Pagos", "Pagos no período", "Canceladas / devolvidas"]
+COLUNAS_FILTRO_RAPIDO = 4          # A a D, mescladas
+COLUNA_PERIODO_DE = 4              # E
+COLUNA_PERIODO_ATE = 5             # F
+COLUNA_TITULO = 6                  # G: "Do CIGAM (...)" vai de G até o cliente final
 # coluna que a Emissão preenchia à mão antes de virar fórmula: o que foi
 # digitado e não bate com a aba Locais de entrega vai pra Obs. Emissão
 COLUNA_CLIENTE_FINAL_DIGITADO = "Cliente final / local de entrega"
@@ -635,7 +644,9 @@ def valores_aba_controle(df: pd.DataFrame, atualizado_em: datetime) -> list:
     """Linhas 1 (grupos), 2 (cabeçalho com as fórmulas automáticas) e os dados,
     prontos pra gravar com value_input_option USER_ENTERED."""
     grupos = [""] * len(COLUNAS)
-    grupos[0] = f"Do CIGAM (extrator, atualizado em {atualizado_em.strftime('%d/%m/%Y %H:%M')})"
+    # o extrator recria o filtro da aba sem critério: a lista volta pra "Todas"
+    grupos[0] = OPCOES_FILTRO_RAPIDO[0]
+    grupos[COLUNA_TITULO] = f"Do CIGAM (extrator, atualizado em {atualizado_em.strftime('%d/%m/%Y %H:%M')})"
     grupos[COLUNAS.index(COLUNAS_EMISSAO[0])] = "Emissão preenche"
     grupos[COLUNAS.index(COLUNAS_FINANCEIRO[0])] = "Financeiro preenche"
     grupos[COLUNAS.index(COLUNAS_FORMULA[0])] = "Automático"
@@ -821,7 +832,10 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
                         "userEnteredFormat"))
 
     grupos = [
-        (0, idx[COLUNA_CLIENTE_FINAL] + 1, VERDE, BRANCO),
+        (0, COLUNAS_FILTRO_RAPIDO, BRANCO, VERDE),
+        (COLUNA_PERIODO_DE, COLUNA_PERIODO_DE + 1, BRANCO, VERDE),
+        (COLUNA_PERIODO_ATE, COLUNA_PERIODO_ATE + 1, BRANCO, VERDE),
+        (COLUNA_TITULO, idx[COLUNA_CLIENTE_FINAL] + 1, VERDE, BRANCO),
         (idx[COLUNAS_EMISSAO[0]], idx[COLUNAS_EMISSAO[-1]] + 1, AMARELO_CLARO, PRETO),
         (idx[COLUNAS_FINANCEIRO[0]], idx[COLUNAS_FINANCEIRO[-1]] + 1, AZUL_CLARO, PRETO),
         (idx[COLUNAS_FORMULA[0]], idx[COLUNAS_FORMULA[-1]] + 1, CINZA_CLARO, PRETO),
@@ -834,6 +848,21 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
                              "textFormat": {"bold": True, "foregroundColor": texto, "fontFamily": "Arial"}},
                             "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat,"
                             "userEnteredFormat.horizontalAlignment"))
+
+    # filtro rápido: lista em A1:D1 e datas do período em E1 / F1
+    req.append({"setDataValidation": {"range": _faixa(sheet_id, 0, 1, 0, COLUNAS_FILTRO_RAPIDO), "rule": {
+        "condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": o} for o in OPCOES_FILTRO_RAPIDO]},
+        "strict": True, "showCustomUi": True}}})
+    for coluna, rotulo in ((COLUNA_PERIODO_DE, "de"), (COLUNA_PERIODO_ATE, "até")):
+        req.append({"setDataValidation": {"range": _faixa(sheet_id, 0, 1, coluna, coluna + 1), "rule": {
+            "condition": {"type": "DATE_IS_VALID"}, "strict": True,
+            "inputMessage": "Período do filtro Pagos no período (dd/mm/aaaa)"}}})
+        req.append(_formato(_faixa(sheet_id, 0, 1, coluna, coluna + 1),
+                            {"numberFormat": {"type": "DATE", "pattern": f'"{rotulo} "dd/mm/yyyy'}},
+                            "userEnteredFormat.numberFormat"))
+    req.append({"updateDimensionProperties": {
+        "range": {"sheetId": sheet_id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 30}, "fields": "pixelSize"}})
 
     req.append({"addBanding": {"bandedRange": {
         "range": _faixa(sheet_id, LINHA_CABECALHO - 1, total_linhas, 0, n_col),
@@ -913,6 +942,12 @@ def requests_formatacao_controle(sheet_id: int, total_linhas: int, regras_condic
             f"(coluna {_letra('Local de entrega (nº)')}) na aba {ABA_LOCAIS}. "
             "Para corrigir ou cadastrar um cliente final, edite lá."}]}],
         "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": idx[COLUNA_CLIENTE_FINAL]}}})
+    req.append({"updateCells": {
+        "rows": [{"values": [{"note":
+            "Filtro rápido: escolha uma opção e a lista é filtrada na hora (vale pra todo mundo com a "
+            "planilha aberta). Para Pagos no período, informe as datas nas duas células ao lado. "
+            "Volte para Todas as NFs ao terminar."}]}],
+        "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0}}})
     req.append({"updateCells": {
         "rows": [{"values": [{"note": "Opções vêm da aba Listas. Para incluir uma nova, acrescente lá."}]}],
         "fields": "note", "start": {"sheetId": sheet_id, "rowIndex": 1, "columnIndex": idx["Status entrega"]}}})

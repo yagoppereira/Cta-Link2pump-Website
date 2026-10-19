@@ -188,7 +188,7 @@ function onOpen() {
     .addItem('Agendar atualização diária', 'agendarAtualizacaoDiaria')
     .addItem('Remover agendamento', 'removerAgendamento')
     .addSeparator()
-    .addItem('Criar botão de filtros na aba', 'criarBotaoFiltros')
+    .addItem('Criar filtro rápido na linha 1', 'criarFiltroRapido')
     .addToUi();
 }
 
@@ -310,7 +310,10 @@ function gravarControle_(aba, tabela, agora) {
     aba.getRange(PRIMEIRA_LINHA_DADOS, nDw + 2, linhas.length, COLUNAS_MANUAIS.length)
       .setValues(linhas.map(l => l.slice(nDw + 1)));
   }
-  aba.getRange(1, 1).setValue(
+  // o título fica em A1 ou, com o filtro rápido montado (FiltrosVibra.gs), em G1
+  const linha1 = aba.getRange(1, 1, 1, aba.getLastColumn()).getDisplayValues()[0];
+  const colunaTitulo = Math.max(linha1.findIndex(v => String(v).startsWith('Do CIGAM')), 0) + 1;
+  aba.getRange(1, colunaTitulo).setValue(
     `Do CIGAM (extrator, atualizado em ${Utilities.formatDate(agora, fusoDaPlanilha_(), 'dd/MM/yyyy HH:mm')})`);
 }
 

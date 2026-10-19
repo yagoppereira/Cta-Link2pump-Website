@@ -1,17 +1,20 @@
 /**
- * Painel de filtros da aba "Controle NFs Vibra" (mesmo projeto do
- * ControleVibra.gs: as constantes ABA_CONTROLE, STATUS_* etc. vêm de lá).
+ * Filtros da aba "Controle NFs Vibra" (mesmo projeto do ControleVibra.gs: as
+ * constantes ABA_CONTROLE, STATUS_* etc. vêm de lá).
  *
- * - Menu Controle Vibra > Filtros abre o painel lateral, que fica aberto
- *   enquanto se navega pela planilha.
- * - Menu Controle Vibra > Criar botão de filtros põe na linha 1 da aba um
- *   botão "Filtrar NFs" que abre o mesmo painel.
+ * - Filtro rápido na linha 1, que é congelada e fica sempre à vista: lista em
+ *   A1:D1 e as datas do período em E1 / F1. Escolher uma opção filtra na hora
+ *   (onEdit, funciona também no app do celular).
+ * - Menu Controle Vibra > Filtros abre o painel lateral com os mesmos filtros
+ *   e o resumo (quantidade de NFs, valor e saldo em aberto).
+ * - Menu Controle Vibra > Criar filtro rápido na linha 1 monta a linha 1 na
+ *   planilha (o extrator em Python também monta, ao reformatar a aba).
  *
  * Cada filtro é uma lista de condições (coluna + regra) que vira duas
  * coisas: a fórmula do filtro da planilha e a mesma regra em JavaScript, que
- * conta as NFs e soma os valores pro resumo do painel. A fórmula só usa
- * comparações, + e * (nenhuma função com mais de um argumento), então não
- * depende do separador ";" ou "," da localidade da planilha.
+ * conta as NFs e soma os valores pro resumo. A fórmula só usa comparações,
+ * + e * (nenhuma função com mais de um argumento), então não depende do
+ * separador ";" ou "," da localidade da planilha.
  *
  * O filtro é o filtro comum da aba: vale pra todo mundo que está com a
  * planilha aberta.
@@ -22,6 +25,7 @@ const ENTREGA_CONCLUIDA = ['NF assinada recebida', 'Não se aplica'];
 
 const FILTROS_VIBRA = {
   pendentes_pagamento: {
+    rotulo: 'Pendentes de pagamento',
     titulo: 'Pendentes de pagamento (entregue ou não se aplica)',
     condicoes: () => [
       { coluna: 'Status financeiro', em: [STATUS_EM_ABERTO, STATUS_PAGO_PARCIAL] },
@@ -29,6 +33,7 @@ const FILTROS_VIBRA = {
     ],
   },
   pendentes_vencidos: {
+    rotulo: 'Pendentes vencidos',
     titulo: 'Pendentes de pagamento e vencidos',
     condicoes: () => [
       { coluna: 'Status financeiro', em: [STATUS_EM_ABERTO, STATUS_PAGO_PARCIAL] },
@@ -37,6 +42,7 @@ const FILTROS_VIBRA = {
     ],
   },
   aguardando_emissao: {
+    rotulo: 'Aguardando a Emissão',
     titulo: 'Em aberto aguardando a Emissão (entrega não confirmada)',
     condicoes: () => [
       { coluna: 'Status financeiro', em: STATUS_ABERTOS },
@@ -44,10 +50,12 @@ const FILTROS_VIBRA = {
     ],
   },
   pagos: {
+    rotulo: 'Pagos',
     titulo: 'Pagos',
     condicoes: () => [{ coluna: 'Status financeiro', em: [STATUS_PAGO] }],
   },
   pagos_periodo: {
+    rotulo: 'Pagos no período',
     titulo: 'Pagos no período',
     periodo: true,
     condicoes: (de, ate) => [
@@ -56,6 +64,7 @@ const FILTROS_VIBRA = {
     ],
   },
   encerradas_sem_pagamento: {
+    rotulo: 'Canceladas / devolvidas',
     titulo: 'Canceladas, devolvidas, abatidas e perdas',
     condicoes: () => [
       { coluna: 'Status financeiro', em: [STATUS_CANCELADA, STATUS_DEVOLVIDA, STATUS_ABATIDA, STATUS_PERDA] },
@@ -63,58 +72,148 @@ const FILTROS_VIBRA = {
   },
 };
 
+// filtro rápido da linha 1 (mesmo layout de controle_vibra.py; colunas a partir de 1)
+const OPCAO_TODAS = 'Todas as NFs';
+const OPCOES_FILTRO_RAPIDO = [OPCAO_TODAS].concat(Object.keys(FILTROS_VIBRA).map(k => FILTROS_VIBRA[k].rotulo));
+const COLUNAS_FILTRO_RAPIDO = 4;  // A a D, mescladas
+const COLUNA_PERIODO_DE = 5;      // E
+const COLUNA_PERIODO_ATE = 6;     // F
+const COLUNA_TITULO = 7;          // G: "Do CIGAM (...)" vai de G até o cliente final
+const VERDE_PLANILHA = '#356854';
+
 
 // ============================================================================
-// Painel e botão
+// Filtro rápido da linha 1
+// ============================================================================
+/** Gatilho simples: roda pra quem editar a planilha, sem autorização. Só
+ * reage à lista e às datas do filtro rápido. */
+function onEdit(e) {
+  if (!e || !e.range) return;
+  const aba = e.range.getSheet();
+  if (aba.getName() !== ABA_CONTROLE || e.range.getRow() !== 1 || e.range.getColumn() > COLUNA_PERIODO_ATE) return;
+  try {
+    aba.getParent().toast(textoResumo(aplicarFiltroRapido_(aba)), 'Filtro', 8);
+  } catch (erro) {
+    aba.getParent().toast(erro.message, 'Filtro', 8);
+  }
+}
+
+function aplicarFiltroRapido_(aba) {
+  const opcao = opcaoDoRotulo(texto_(aba.getRange(1, 1).getValue()));
+  if (!opcao) return filtrar_(aba, null);
+  let de = '', ate = '';
+  if (FILTROS_VIBRA[opcao].periodo) {
+    const fuso = fusoDaPlanilha_();
+    const celulaDe = aba.getRange(1, COLUNA_PERIODO_DE);
+    const celulaAte = aba.getRange(1, COLUNA_PERIODO_ATE);
+    const iso = valor => (valor && typeof valor.getFullYear === 'function'
+      ? Utilities.formatDate(valor, fuso, 'yyyy-MM-dd') : '');
+    de = iso(celulaDe.getValue());
+    ate = iso(celulaAte.getValue());
+    if (!de || !ate) {  // sem datas: mês atual até hoje
+      ate = Utilities.formatDate(new Date(), fuso, 'yyyy-MM-dd');
+      de = ate.slice(0, 8) + '01';
+      celulaDe.setValue(dataBr_(de));
+      celulaAte.setValue(dataBr_(ate));
+    }
+    validarPeriodo_(de, ate);
+  }
+  return filtrar_(aba, opcao, de, ate);
+}
+
+/** Monta a linha 1: lista do filtro em A1:D1, datas do período em E1 / F1 e
+ * o título "Do CIGAM (...)" de G até o cliente final. Tira também o botão de
+ * imagem da versão anterior. */
+function criarFiltroRapido() {
+  const aba = abaControle_();
+  aba.getImages().filter(i => i.getScript() === 'abrirFiltros').forEach(i => i.remove());
+  const ultima = COLUNAS_DW.length + 1;  // coluna do cliente final
+  const titulo = aba.getRange(1, 1, 1, ultima).getDisplayValues()[0].find(v => v.startsWith('Do CIGAM'))
+    || 'Do CIGAM (extrator)';
+  aba.getRange(1, 1, 1, ultima).breakApart().clearContent().clearDataValidations().clearNote();
+  aba.setRowHeight(1, 30);
+
+  aba.getRange(1, 1, 1, COLUNAS_FILTRO_RAPIDO).merge().setValue(OPCAO_TODAS)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(OPCOES_FILTRO_RAPIDO, true)
+      .setAllowInvalid(false).build())
+    .setBackground('#ffffff').setFontColor(VERDE_PLANILHA).setFontWeight('bold').setHorizontalAlignment('center')
+    .setNote('Filtro rápido: escolha uma opção e a lista é filtrada na hora (vale pra todo mundo com a '
+      + 'planilha aberta). Para Pagos no período, informe as datas nas duas células ao lado. '
+      + 'Volte para Todas as NFs ao terminar.');
+  [[COLUNA_PERIODO_DE, 'de'], [COLUNA_PERIODO_ATE, 'até']].forEach(([coluna, rotulo]) => {
+    aba.getRange(1, coluna)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false)
+        .setHelpText('Período do filtro Pagos no período (dd/mm/aaaa)').build())
+      .setNumberFormat(`"${rotulo} "dd/mm/yyyy`)
+      .setBackground('#ffffff').setFontColor(VERDE_PLANILHA).setFontWeight('bold').setHorizontalAlignment('center');
+  });
+  aba.getRange(1, COLUNA_TITULO, 1, ultima - COLUNA_TITULO + 1).merge().setValue(titulo)
+    .setBackground(VERDE_PLANILHA).setFontColor('#ffffff').setFontWeight('bold').setHorizontalAlignment('center');
+  limparCriterios_(filtroDaAba_(aba));
+  SpreadsheetApp.getActive().toast('Filtro rápido criado na linha 1 (célula A1).', 'Controle Vibra', 8);
+}
+
+function filtroRapidoMontado_(aba) {
+  return aba.getRange(1, 1).getDataValidation() !== null;
+}
+
+
+// ============================================================================
+// Painel lateral
 // ============================================================================
 function abrirFiltros() {
   const html = HtmlService.createHtmlOutput(HTML_PAINEL_FILTROS).setTitle('Filtros NFs Vibra');
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-/** Põe o botão "Filtrar NFs" no canto da linha 1 (que fica congelada, então
- * o botão não some ao rolar a lista). Rodar de novo troca o botão antigo. */
-function criarBotaoFiltros() {
-  const aba = abaControle_();
-  aba.getImages().filter(i => i.getScript() === 'abrirFiltros').forEach(i => i.remove());
-  aba.setRowHeight(1, 36);
-  const imagem = Utilities.newBlob(Utilities.base64Decode(BOTAO_FILTROS_PNG), 'image/png', 'filtrar.png');
-  aba.insertImage(imagem, 1, 1, 4, 2).setWidth(140).setHeight(32).assignScript('abrirFiltros');
-  SpreadsheetApp.getActive().toast('Botão "Filtrar NFs" criado na linha 1.', 'Controle Vibra', 6);
-}
-
-
-// ============================================================================
-// Chamadas do painel
-// ============================================================================
 /** Aplica o filtro escolhido no painel e devolve o resumo das NFs que ficaram
- * visíveis. `de` e `ate` vêm do painel como "aaaa-mm-dd". */
+ * visíveis. `de` e `ate` vêm do painel como "aaaa-mm-dd". A lista da linha 1
+ * passa a mostrar o filtro escolhido. */
 function aplicarFiltroVibra(opcao, de, ate) {
   const filtro = FILTROS_VIBRA[opcao];
   if (!filtro) throw new Error(`Filtro desconhecido: ${opcao}`);
-  if (filtro.periodo && (!de || !ate)) throw new Error('Informe o início e o fim do período.');
-  if (filtro.periodo && de > ate) throw new Error('O início do período é depois do fim.');
-  const condicoes = filtro.condicoes(de, ate);
-
+  if (filtro.periodo) validarPeriodo_(de, ate);
   const aba = abaControle_();
-  const filtroAba = filtroDaAba_(aba);
-  const linhaCabecalho = filtroAba.getRange().getRow();
-  const { colunas, linhas } = lerTabela_(aba, linhaCabecalho);
-
-  limparCriterios_(filtroAba);
-  const formula = formulaFiltro(condicoes, colunas, linhaCabecalho + 1);
-  filtroAba.setColumnFilterCriteria(1, SpreadsheetApp.newFilterCriteria().whenFormulaSatisfied(formula).build());
-
-  const titulo = filtro.periodo ? `${filtro.titulo}: ${dataBr_(de)} a ${dataBr_(ate)}` : filtro.titulo;
-  return Object.assign({ titulo: titulo }, resumirFiltro(condicoes, colunas, linhas));
+  if (filtroRapidoMontado_(aba)) {
+    aba.getRange(1, 1).setValue(filtro.rotulo);
+    if (filtro.periodo) {
+      aba.getRange(1, COLUNA_PERIODO_DE).setValue(dataBr_(de));
+      aba.getRange(1, COLUNA_PERIODO_ATE).setValue(dataBr_(ate));
+    }
+  }
+  return filtrar_(aba, opcao, de, ate);
 }
 
 function limparFiltroVibra() {
   const aba = abaControle_();
+  if (filtroRapidoMontado_(aba)) aba.getRange(1, 1).setValue(OPCAO_TODAS);
+  return filtrar_(aba, null);
+}
+
+
+// ============================================================================
+// Aplicação do filtro na aba
+// ============================================================================
+/** Troca o critério do filtro da aba pelo da opção (null = sem filtro) e
+ * devolve {titulo, nfs, valor, saldo} das NFs que ficaram visíveis. */
+function filtrar_(aba, opcao, de, ate) {
   const filtroAba = filtroDaAba_(aba);
+  const linhaCabecalho = filtroAba.getRange().getRow();
+  const { colunas, linhas } = lerTabela_(aba, linhaCabecalho);
   limparCriterios_(filtroAba);
-  const { colunas, linhas } = lerTabela_(aba, filtroAba.getRange().getRow());
-  return Object.assign({ titulo: 'Todas as NFs' }, resumirFiltro([], colunas, linhas));
+  if (!opcao) return Object.assign({ titulo: OPCAO_TODAS }, resumirFiltro([], colunas, linhas));
+
+  const filtro = FILTROS_VIBRA[opcao];
+  const condicoes = filtro.condicoes(de, ate);
+  const formula = formulaFiltro(condicoes, colunas, linhaCabecalho + 1);
+  filtroAba.setColumnFilterCriteria(1, SpreadsheetApp.newFilterCriteria().whenFormulaSatisfied(formula).build());
+  const titulo = filtro.periodo ? `${filtro.titulo}: ${dataBr_(de)} a ${dataBr_(ate)}` : filtro.titulo;
+  return Object.assign({ titulo: titulo }, resumirFiltro(condicoes, colunas, linhas));
+}
+
+function validarPeriodo_(de, ate) {
+  if (!de || !ate) throw new Error('Informe o início e o fim do período.');
+  if (de > ate) throw new Error('O início do período é depois do fim.');
 }
 
 function abaControle_() {
@@ -171,6 +270,22 @@ function serialCelula_(valor) {
     return Date.UTC(valor.getFullYear(), valor.getMonth(), valor.getDate()) / 86400000 + 25569;
   }
   return null;
+}
+
+/** Opção do FILTROS_VIBRA pelo rótulo da lista da linha 1; null = todas. */
+function opcaoDoRotulo(rotulo) {
+  return Object.keys(FILTROS_VIBRA).find(k => FILTROS_VIBRA[k].rotulo === rotulo) || null;
+}
+
+function moedaBr_(valor) {
+  const [inteiro, centavos] = Math.abs(valor).toFixed(2).split('.');
+  return `${valor < 0 ? '-' : ''}R$ ${inteiro.replace(/\B(?=(\d{3})+(?!\d))/g, '.')},${centavos}`;
+}
+
+/** Texto do aviso que aparece depois do filtro rápido. */
+function textoResumo(resumo) {
+  return `${resumo.titulo}: ${resumo.nfs} NF(s) · valor ${moedaBr_(resumo.valor)}`
+    + (resumo.saldo ? ` · saldo em aberto ${moedaBr_(resumo.saldo)}` : '');
 }
 
 function dataBr_(iso) {
@@ -234,7 +349,7 @@ function resumirFiltro(condicoes, colunas, linhas) {
 
 
 // ============================================================================
-// HTML do painel e imagem do botão
+// HTML do painel
 // ============================================================================
 const HTML_PAINEL_FILTROS = `<!DOCTYPE html>
 <html>
@@ -331,7 +446,3 @@ const HTML_PAINEL_FILTROS = `<!DOCTYPE html>
 </script>
 </body>
 </html>`;
-
-// botão "Filtrar NFs" (PNG 280x64, exibido em 140x32): amarelo com borda branca pra
-// destacar da faixa verde da linha 1, onde fica
-const BOTAO_FILTROS_PNG = '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';

@@ -11,7 +11,8 @@ vm.createContext(contexto);
 const codigo = ['ControleVibra.gs', 'FiltrosVibra.gs']
   .map(nome => fs.readFileSync(__dirname + '/../apps_script/' + nome, 'utf8')).join('\n');
 vm.runInContext(codigo + '\nthis.__api = {montarTabela, linhasParaPlanilha, locaisSemCadastro, lerLocaisEntrega, '
-  + 'SQL_NOTAS_VIBRA, FILTROS_VIBRA, formulaFiltro, resumirFiltro};', contexto);
+  + 'SQL_NOTAS_VIBRA, FILTROS_VIBRA, formulaFiltro, resumirFiltro, OPCOES_FILTRO_RAPIDO, opcaoDoRotulo, '
+  + 'textoResumo};', contexto);
 const api = contexto.__api;
 
 const entrada = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -31,7 +32,12 @@ if (entrada.filtros) {
     saida[opcao] = { formula: api.formulaFiltro(condicoes, colunas, 3),
                      resumo: api.resumirFiltro(condicoes, colunas, valores) };
   });
-  process.stdout.write(JSON.stringify(saida));
+  process.stdout.write(JSON.stringify({
+    filtros: saida,
+    opcoes: Array.from(api.OPCOES_FILTRO_RAPIDO),
+    opcao_por_rotulo: Object.fromEntries(api.OPCOES_FILTRO_RAPIDO.map(r => [r, api.opcaoDoRotulo(r)])),
+    aviso: api.textoResumo({ titulo: 'Pagos', nfs: 3, valor: 1234567.8, saldo: 0 }),
+  }));
 } else if (entrada.somente_sql) {
   process.stdout.write(JSON.stringify({ sql: api.SQL_NOTAS_VIBRA }));
 } else {

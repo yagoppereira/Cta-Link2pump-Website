@@ -2,7 +2,7 @@
 
 `ControleVibra.gs` atualiza a aba "Controle NFs Vibra" da planilha
 PENDENCIAS VIBRA direto do DW, com o login de quem executa. `FiltrosVibra.gs`
-é o painel de filtros (botão "Filtrar NFs"). Guia de uso para o time:
+são os filtros (filtro rápido na linha 1 e painel lateral). Guia de uso para o time:
 [GUIA-DO-TIME.md](GUIA-DO-TIME.md). Não precisa de
 service account: basta a pessoa conseguir rodar consultas no projeto
 `hip-bonito-453017-m2` e ler as tabelas `bronze.cigam__empresas`,
@@ -22,12 +22,10 @@ service account: basta a pessoa conseguir rodar consultas no projeto
 4. Salve, escolha a função `atualizarControleVibra` e clique em **Executar**.
    Na primeira vez o Google pede autorização (planilha e BigQuery).
 5. Recarregue a planilha: aparece o menu **Controle Vibra**.
-6. **Controle Vibra > Criar botão de filtros na aba** põe o botão "Filtrar
-   NFs" na linha 1 da aba de controle (rodar de novo troca o botão). Se o
-   item não aparece no menu, o `ControleVibra.gs` colado é anterior aos
-   filtros: cole o atual e recarregue. Também dá pra rodar a função
-   `criarBotaoFiltros` direto no editor. Para mover o botão sem acionar o
-   script, clique nele com o botão direito (isso só seleciona) e arraste.
+6. **Controle Vibra > Criar filtro rápido na linha 1** monta a lista de
+   filtros em A1 e as datas do período em E1 / F1 (o extrator em Python
+   também monta ao reformatar a aba). Se o item não aparece no menu, o
+   `ControleVibra.gs` colado é anterior aos filtros: cole o atual e recarregue.
 
 ## Usar
 
@@ -43,11 +41,15 @@ service account: basta a pessoa conseguir rodar consultas no projeto
   login de quem agendou. Se essa pessoa perder o acesso ao DW, o agendamento
   para de funcionar; outra pessoa com acesso agenda de novo.
 - **Controle Vibra > Remover agendamento**.
-- **Controle Vibra > Filtros** ou o botão **Filtrar NFs**: abre o painel
-  lateral de filtros. O filtro é o filtro comum da aba, igual pra todo mundo
-  que está com a planilha aberta; **Mostrar todas as NFs** tira o filtro. O
-  botão (imagem com script) só funciona no navegador do computador; no
-  celular, use o filtro da própria planilha.
+- **Filtro rápido (célula A1)**: escolher uma opção na lista filtra a aba na
+  hora, pelo gatilho `onEdit` (funciona também no app do celular). Para
+  "Pagos no período", as datas ficam em E1 e F1; sem datas, usa o mês atual.
+  O filtro é o filtro comum da aba, igual pra todo mundo que está com a
+  planilha aberta; **Todas as NFs** tira o filtro.
+- **Controle Vibra > Filtros**: painel lateral com os mesmos filtros, atalhos
+  de período e o resumo (NFs, valor e saldo).
+- O botão de imagem da versão anterior foi abandonado: imagem sobre a linha
+  congelada não aparecia. **Criar filtro rápido na linha 1** apaga esse botão.
 
 O script só grava valores: a formatação, as listas suspensas e as fórmulas das
 colunas O, T e U (linha 2) já estão na planilha. Para refazer a formatação do

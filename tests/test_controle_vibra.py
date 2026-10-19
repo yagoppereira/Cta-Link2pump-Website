@@ -214,7 +214,8 @@ def test_valores_da_aba_tem_texto_protegido_e_formulas_no_cabecalho():
     tabela = cv.mesclar_manuais(cv.montar_controle(pd.DataFrame([nf_dw(textos="OC: 4503762321")])), {})
     valores = cv.valores_aba_controle(tabela, datetime(2026, 10, 19, 9, 30))
     assert all(len(linha) == len(cv.COLUNAS) for linha in valores)
-    assert valores[0][0] == "Do CIGAM (extrator, atualizado em 19/10/2026 09:30)"
+    assert valores[0][0] == "Todas as NFs"  # filtro rápido
+    assert valores[0][cv.COLUNA_TITULO] == "Do CIGAM (extrator, atualizado em 19/10/2026 09:30)"
     assert valores[1][:14] == cv.COLUNAS_DW
     assert valores[1][-2].startswith('={"Dias em atraso"') and valores[1][-1].startswith('={"Próxima ação"')
     dados = valores[2]

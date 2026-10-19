@@ -88,28 +88,30 @@ A aba **Locais de entrega** traduz o número para o cliente, por filial: o local
 
 ## Filtros
 
-Clique no botão verde **Filtrar NFs** no topo da aba (ou menu **Controle Vibra
-> Filtros**). Abre um painel à direita, que fica aberto enquanto você navega:
+**Filtro rápido:** a célula **A1** (canto superior esquerdo, fundo branco,
+escrito "Todas as NFs") é uma lista. Escolha uma opção e a aba é filtrada na
+hora; um aviso no canto da tela mostra quantas NFs ficaram e o valor. A linha
+1 fica sempre à vista, mesmo rolando a lista, e funciona também no celular.
 
-| Filtro | Mostra |
+| Opção | Mostra |
 |---|---|
+| Todas as NFs | Tira o filtro |
 | Pendentes de pagamento | Em aberto ou pago parcial, com entrega concluída (NF assinada recebida) ou "Não se aplica": o que já pode ser cobrado |
-| Pendentes de pagamento vencidos | Os de cima com vencimento já passado |
-| Pagos | Todas as NFs com status Pago |
-| Pagos no período | Pagas entre duas datas (pela data de pagamento, coluna L). Tem atalhos: este mês, mês passado, últimos 30 dias, este ano |
+| Pendentes vencidos | Os de cima com vencimento já passado |
 | Aguardando a Emissão | Em aberto com entrega ainda não confirmada (a validar, aguardando, problema ou em branco) |
-| Canceladas, devolvidas e abatidas | Inclui baixas por perda |
-| Mostrar todas as NFs | Tira o filtro |
+| Pagos | Todas as NFs com status Pago |
+| Pagos no período | Pagas entre as datas de **E1** ("de") e **F1** ("até"), pela data de pagamento (coluna L). Sem datas, usa o mês atual. Mudou a data, o filtro se refaz |
+| Canceladas / devolvidas | Canceladas, devolvidas, abatidas e baixas por perda |
 
-O painel mostra quantas NFs ficaram, o valor total e o saldo em aberto.
+**Painel:** o menu **Controle Vibra > Filtros** abre um painel à direita com
+os mesmos filtros, atalhos de período (este mês, mês passado, últimos 30 dias,
+este ano) e o resumo de quantidade, valor e saldo em aberto.
 
 Cuidados:
 - O filtro vale **para todo mundo** que está com a planilha aberta. Ao
-  terminar, clique em **Mostrar todas as NFs**.
-- Na primeira vez que alguém clica no botão, o Google pede autorização para o
-  script. É só aceitar.
-- O botão só funciona no navegador do computador. No celular, use o filtro
-  normal da planilha (ícone de funil no cabeçalho).
+  terminar, volte a lista de A1 para **Todas as NFs**.
+- Na primeira vez que alguém abre o painel pelo menu, o Google pede
+  autorização para o script. É só aceitar (o filtro rápido de A1 não pede).
 
 ## Rotina sugerida
 
