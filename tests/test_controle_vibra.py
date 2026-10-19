@@ -463,3 +463,11 @@ def test_locais_sem_cadastro_listam_as_nfs():
         ["'34.274.233/0001-02", 11, "", "", "Preencher: visto na NF 24579"],
         ["'34.274.233/0001-02", 12, "", "", "Preencher: visto nas NFs 26049, 26133"],
     ]
+
+
+def test_local_de_entrega_pula_caracteres_que_o_cigam_nao_usa():
+    # o CIGAM numera os locais com caracteres a partir do "!" pulando ' * ? \
+    # (a "," da NF 26049 é o local 10, Reiter, e não 12). ASCII() também
+    # quebraria a consulta com caractere fora da tabela ASCII.
+    assert "UNNEST([39, 42, 63, 92])" in cv.SQL_NOTAS_VIBRA
+    assert "ASCII(" not in cv.SQL_NOTAS_VIBRA

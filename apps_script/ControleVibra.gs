@@ -74,12 +74,18 @@ notas AS (
   SELECT n.nf, n.serie, n.cliente, n.dataEmissao, n.status, n.especieNota,
          NULLIF(TRIM(n.dataCancelamento), '') AS dataCancelamento,
          -- "Local de Entrega" da aba Transporte da NF: o CIGAM guarda o nº
-         -- como um caractere (! = 1, " = 2, # = 3...), código ASCII menos 32.
+         -- como um caractere em sequência a partir do "!" (! = 1, " = 2,
+         -- # = 3...), pulando ' * ? e \\ (não aparecem em NF nenhuma). Então
+         -- "(" = 7, ")" = 8, "+" = 9, "," = 10. Conferido com a lista de
+         -- endereços da Vibra RJ: a Reiter (cadastrada em 01/10/2026) é a 10ª
+         -- e só aparece nas NFs de outubro, com ",".
          -- O nº aponta pra lista de endereços de entrega do cliente (a
          -- filial da Vibra), que não está no DW: o nome do cliente final
          -- vem da aba "Locais de entrega" da planilha.
          IF(TRIM(IFNULL(n.ordemEnderecoEntrega, '')) = '', NULL,
-            ASCII(n.ordemEnderecoEntrega) - 32) AS localEntrega,
+            UNICODE(n.ordemEnderecoEntrega) - 32
+            - (SELECT COUNT(*) FROM UNNEST([39, 42, 63, 92]) AS pulado
+               WHERE pulado < UNICODE(n.ordemEnderecoEntrega))) AS localEntrega,
          SAFE_CAST(n.totalNF AS NUMERIC) AS totalNF, n.itensNf_json
   FROM \`${PROJECT_ID}.bronze.cigam__notas_fiscais\` n
   WHERE n.dataEmissao >= @piso AND n.cliente IN (SELECT codigo FROM vibra)
