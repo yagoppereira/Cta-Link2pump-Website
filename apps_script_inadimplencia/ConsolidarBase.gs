@@ -1,4 +1,39 @@
 // ==========================================
+// CONTROLES MANUAIS PARALELOS
+// ==========================================
+const CONFIG_ATRIBUICAO = {
+  // Vendedores que SÓ recebem clientes por Inserção Manual (ex.: parcerias).
+  // As vendas deles na Base_Comercial e as praças deles na Base_Cidades são
+  // ignoradas, e o cliente segue para a próxima regra (normalmente a praça,
+  // ou seja, o vendedor regional).
+  vendedoresSomenteManual: ["LEANDRO SOARES"],
+
+  // Valores aceitos na coluna "vendedor" da Insercoes_Manuais para mandar o
+  // cliente ao vendedor REGIONAL (praça Cidade/UF), ignorando o histórico comercial.
+  marcadoresRegional: ["REGIONAL", "GESTAO REGIONAL", "VENDEDOR REGIONAL", "PRACA"],
+
+  // GRANDES CONTAS: o pagante dos aparelhos instalados nos clientes destes vendedores
+  // (aba Base_Aparelhos, sincronizada do DW) também passa para eles, se pelo menos
+  // `limiteGrandesContas` dos aparelhos que esse pagante paga estiverem nesses clientes.
+  // Inserção manual, inserção REGIONAL e carteira de parcerias SEMPRE prevalecem.
+  vendedoresGrandesContas: ["MARLON SILVA"],
+  limiteGrandesContas: 0.5,
+
+  // Grafias diferentes da mesma cidade entre o CIGAM e a lista de praças
+  // ("CIDADE_UF" do CIGAM → "CIDADE_UF" da Base_Cidades, já sem acento e em maiúsculas)
+  apelidosCidade: {
+    "MOJI MIRIM_SP": "MOGI MIRIM_SP",
+    "MOJI DAS CRUZES_SP": "MOGI DAS CRUZES_SP",
+    "MOJI GUACU_SP": "MOGI GUACU_SP"
+  }
+};
+
+function normalizarMarcador_(t) {
+  return String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\u00A0/g, " ")
+    .toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+// ==========================================
 // 1. FUNÇÃO PRINCIPAL DE CONSOLIDAÇÃO
 // ==========================================
 function consolidarBaseInteligente() {
@@ -57,7 +92,10 @@ function consolidarBaseInteligente() {
       let chaveCidade = cidadeLimpa + "_" + ufCidade;
       let chaveSemEspacos = cidadeLimpa.replace(/\s+/g, '') + "_" + ufCidade;
 
-      if (chaveCidade && vendedorCidade) {
+      // Vendedor só-manual (parcerias) não responde por praça
+      const ignorarPraca = CONFIG_ATRIBUICAO.vendedoresSomenteManual
+        .some(v => normalizarMarcador_(v) === normalizarMarcador_(vendedorCidade));
+      if (chaveCidade && vendedorCidade && !ignorarPraca) {
         dictCidadeUf[chaveCidade] = vendedorCidade;
         dictCidadeUf[chaveSemEspacos] = vendedorCidade;
       }
@@ -103,6 +141,12 @@ function consolidarBaseInteligente() {
   if (idxVendedorComercial === -1) idxVendedorComercial = 1;
   if (idxEmpresaComercial === -1) idxEmpresaComercial = 2;
 
+  const somenteManual = new Set(CONFIG_ATRIBUICAO.vendedoresSomenteManual.map(v => normalizarMarcador_(v)));
+  const ehSomenteManual = (v) => somenteManual.has(normalizarMarcador_(v));
+  const ehRegional = (v) => CONFIG_ATRIBUICAO.marcadoresRegional.indexOf(normalizarMarcador_(v)) !== -1;
+  const raizesParceria = new Set();   // raízes que só tinham venda de vendedor só-manual (auditoria)
+  const nomesParceria = new Set();
+
   const dictManualExato = {};
   const dictManualRaiz = {};
   const dictCnpjRaiz = {};
@@ -139,6 +183,13 @@ function consolidarBaseInteligente() {
     }
 
     let nomeLimpo = limparNomeEmpresa(removerSufixoCidade(nomeBruto));
+
+    // Vendas de vendedor só-manual (parcerias) não definem dono: a gestão é do regional
+    if (ehSomenteManual(vendedor)) {
+      if (cnpjRaiz) raizesParceria.add(cnpjRaiz);
+      if (nomeLimpo) nomesParceria.add(nomeLimpo);
+      continue;
+    }
 
     if (cnpjRaiz && !dictCnpjRaiz[cnpjRaiz]) {
       dictCnpjRaiz[cnpjRaiz] = vendedor;
@@ -181,7 +232,8 @@ function consolidarBaseInteligente() {
     let municipioLimpo = limparNomeCidade(municipioOriginal);
 
     let chaveCidade = municipioLimpo + "_" + ufOriginal;
-    let chaveCidadeSemEspacos = municipioLimpo.replace(/\s+/g, '') + "_" + ufOriginal;
+    if (CONFIG_ATRIBUICAO.apelidosCidade[chaveCidade]) chaveCidade = CONFIG_ATRIBUICAO.apelidosCidade[chaveCidade];
+    let chaveCidadeSemEspacos = chaveCidade.replace(/\s+/g, '');
 
     let vendedorAtribuido = "NÃO MAPEADO";
     let regraUsada = "Nenhuma";
@@ -190,14 +242,23 @@ function consolidarBaseInteligente() {
 
     const eAtivo = (v) => dictVendedoresAtivos[v] === true;
 
-    // 1. REGRA MANUAL
-    if (dictManualExato[cnpjPuro]) {
-      vendedorAtribuido = dictManualExato[cnpjPuro];
-      regraUsada = "1. Inserção Manual (Exata)";
+    let candCidade = dictCidadeUf[chaveCidade] || dictCidadeUf[chaveCidadeSemEspacos];
+    const manual = dictManualExato[cnpjPuro] ? { vendedor: dictManualExato[cnpjPuro], tipo: "Exata" }
+                 : (cnpjRaiz && dictManualRaiz[cnpjRaiz]) ? { vendedor: dictManualRaiz[cnpjRaiz], tipo: "Raiz" } : null;
+
+    // 1a. INSERÇÃO MANUAL "REGIONAL": força o vendedor da praça (Cidade/UF)
+    if (manual && ehRegional(manual.vendedor)) {
+      if (candCidade && eAtivo(candCidade)) {
+        vendedorAtribuido = candCidade;
+        regraUsada = "4. Praça (Regional por inserção)";
+      } else {
+        console.warn(`Inserção REGIONAL sem vendedor de praça ativo: ${nomeOriginal} (${municipioOriginal}/${ufOriginal})`);
+      }
     }
-    else if (cnpjRaiz && dictManualRaiz[cnpjRaiz]) {
-      vendedorAtribuido = dictManualRaiz[cnpjRaiz];
-      regraUsada = "1. Inserção Manual (Raiz)";
+    // 1. REGRA MANUAL
+    else if (manual) {
+      vendedorAtribuido = manual.vendedor;
+      regraUsada = "1. Inserção Manual (" + manual.tipo + ")";
     }
     // 2. COMERCIAL CNPJ RAIZ
     else if (cnpjRaiz && dictCnpjRaiz[cnpjRaiz]) {
@@ -240,12 +301,18 @@ function consolidarBaseInteligente() {
     }
 
     // 4. RESGATE POR PRAÇA / CIDADE + UF (O Coração da Inteligência Espacial)
-    let candCidade = dictCidadeUf[chaveCidade] || dictCidadeUf[chaveCidadeSemEspacos];
-    if (vendedorAtribuido === "NÃO MAPEADO" && candCidade) {
+    const regionalForcado = manual && ehRegional(manual.vendedor);
+    if (vendedorAtribuido === "NÃO MAPEADO" && candCidade && !regionalForcado) {
       if (eAtivo(candCidade)) {
         vendedorAtribuido = candCidade;
         regraUsada = "4. Atribuição por Praça (Cidade/UF)";
       }
+    }
+
+    // Auditoria: cliente que só tinha venda de parceria e foi para outra regra
+    if (!manual && regraUsada !== "Nenhuma" && !regraUsada.startsWith("2.") &&
+        ((cnpjRaiz && raizesParceria.has(cnpjRaiz)) || (nomeLimpo && nomesParceria.has(nomeLimpo)))) {
+      regraUsada += " · parceria";
     }
 
     // 5. RETENÇÃO DE SEGURANÇA INATIVA
@@ -286,6 +353,13 @@ function consolidarBaseInteligente() {
     resultadoFinal.push([cnpjOriginal, vendedorAtribuido, nomeOriginal, ufOriginal, municipioOriginal, regraUsada]);
   }
 
+  // 6. GRANDES CONTAS: pagante dos aparelhos instalados nos clientes do vendedor
+  try {
+    aplicarGrandesContas_(ss, resultadoFinal, contadorRegras, dictVendedoresAtivos, ehSomenteManual);
+  } catch (e) {
+    console.warn("Regra de grandes contas não aplicada: " + e.message);
+  }
+
   console.log("=== CONTAGEM POR REGRA ===");
   console.log(JSON.stringify(contadorRegras, null, 2));
 
@@ -305,6 +379,69 @@ function consolidarBaseInteligente() {
   }
 
   alertaSeguro("🚀 Consolidação Concluída", "A aba 'Base_Clientes' foi gerada com sucesso! Todos os resgates por Cidade/UF ativos foram aplicados.");
+}
+
+// ==========================================
+// GRANDES CONTAS (2ª passada sobre a Base_Clientes já montada)
+// ==========================================
+function aplicarGrandesContas_(ss, resultado, contador, dictVendedoresAtivos, ehSomenteManual) {
+  const vendedoresGc = CONFIG_ATRIBUICAO.vendedoresGrandesContas.map(normalizarMarcador_);
+  if (!vendedoresGc.length) return;
+  const aba = ss.getSheetByName("Base_Aparelhos");
+  if (!aba || aba.getLastRow() < 2) { console.warn("Base_Aparelhos vazia: regra de grandes contas não aplicada."); return; }
+
+  const dados = aba.getDataRange().getValues();
+  const cab = dados[0].map(c => normalizarMarcador_(c).replace(/_/g, " "));
+  const iLoc = cab.indexOf("CNPJ LOCAL"), iPag = cab.indexOf("CNPJ PAGANTE"),
+        iNomePag = cab.indexOf("NOME PAGANTE"), iEq = cab.indexOf("EQUIPAMENTOS");
+  if ([iLoc, iPag, iEq].indexOf(-1) !== -1) { console.warn("Base_Aparelhos sem as colunas esperadas."); return; }
+
+  const doc = v => String(v == null ? "" : v).replace(/\D/g, "").padStart(14, "0");
+  const linhaDoDoc = {};
+  for (let i = 1; i < resultado.length; i++) linhaDoDoc[doc(resultado[i][0])] = i;
+  const vendedorDo = d => linhaDoDoc[d] !== undefined ? normalizarMarcador_(resultado[linhaDoDoc[d]][1]) : null;
+
+  const totalPago = {}, emGrandeConta = {}, nomePagante = {};
+  for (let i = 1; i < dados.length; i++) {
+    const loc = doc(dados[i][iLoc]), pag = doc(dados[i][iPag]), eq = Number(dados[i][iEq]) || 0;
+    if (!eq || pag === "00000000000000") continue;
+    totalPago[pag] = (totalPago[pag] || 0) + eq;
+    const vLoc = vendedorDo(loc);
+    if (loc !== pag && vLoc && vendedoresGc.indexOf(vLoc) !== -1) {
+      emGrandeConta[pag] = emGrandeConta[pag] || {};
+      emGrandeConta[pag][vLoc] = (emGrandeConta[pag][vLoc] || 0) + eq;
+      if (iNomePag !== -1) nomePagante[pag] = dados[i][iNomePag];
+    }
+  }
+
+  const REGRA = "6. Grande conta (pagante de aparelho)";
+  let movidos = 0, acrescentados = 0;
+  Object.keys(emGrandeConta).forEach(pag => {
+    const [vendedor, eq] = Object.entries(emGrandeConta[pag]).sort((a, b) => b[1] - a[1])[0];
+    const participacao = eq / (totalPago[pag] || eq);
+    if (participacao < CONFIG_ATRIBUICAO.limiteGrandesContas) return;
+    if (dictVendedoresAtivos[vendedor] !== true) return;              // grande conta inativa: não move
+    const i = linhaDoDoc[pag];
+    if (i === undefined) {                                             // pagante fora das divisões de cliente
+      resultado.push([pag, vendedor, String(nomePagante[pag] || ""), "", "", REGRA]);
+      contador[REGRA] = (contador[REGRA] || 0) + 1;
+      acrescentados++;
+      return;
+    }
+    const linha = resultado[i];
+    const regraAtual = String(linha[5]), vendedorAtual = normalizarMarcador_(linha[1]);
+    if (vendedoresGc.indexOf(vendedorAtual) !== -1) return;           // já é da grande conta
+    if (regraAtual.startsWith("1.")) return;                           // inserção manual vence
+    if (regraAtual.indexOf("Regional por inserção") !== -1) return;    // inserção REGIONAL vence
+    if (ehSomenteManual(vendedorAtual)) return;                        // carteira de parcerias vence
+    contador[regraAtual] = (contador[regraAtual] || 1) - 1;
+    if (!contador[regraAtual]) delete contador[regraAtual];
+    linha[1] = vendedor;
+    linha[5] = REGRA;
+    contador[REGRA] = (contador[REGRA] || 0) + 1;
+    movidos++;
+  });
+  console.log(`Grandes contas: ${movidos} pagantes movidos, ${acrescentados} acrescentados.`);
 }
 
 // ==========================================

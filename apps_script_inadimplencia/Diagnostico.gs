@@ -15,7 +15,7 @@ function diagnosticarSistema() {
   const testar = (area, item, fn) => {
     try { fn(); } catch (e) { erro(area, item, e.message); }
   };
-  const normalizar = t => String(t || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().trim();
+  const normalizar = t => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().trim();
 
   // ---------------------------------------------------------------- 1. ABAS
   const abasObrigatorias = ["Relatório", "Dados_Looker", "Insercoes_Manuais", "Base_CIGAM",
@@ -30,12 +30,15 @@ function diagnosticarSistema() {
   // ------------------------------------------------- 2. SCRIPTS E VERSÕES
   // Cada função precisa existir E conter o trecho que identifica a versão atual
   const versoes = [
-    ["distribuirInadimplenciaPorVendedor", "resumirLeitura", "Distribuição de Inadimplência.gs"],
-    ["consolidarBaseInteligente", "registrarConsolidacaoNoRelatorio_", "Cruzamento de Bases/Atribuição Manual.gs"],
+    ["distribuirInadimplenciaPorVendedor", "lerFiltroOrigem_", "Distribuição de Inadimplência.gs"],
+    ["consolidarBaseInteligente", "aplicarGrandesContas_", "Cruzamento de Bases/Atribuição Manual.gs"],
+    ["aplicarGrandesContas_", "vendedoresGrandesContas", "Cruzamento de Bases/Atribuição Manual.gs"],
     ["atualizarBaseCigamDoDW", "registrarSaude_", "Cruzamento de Bases/Sincronizar Bases.gs"],
     ["atualizarBaseCidades", "registrarSaude_", "Cruzamento de Bases/Sincronizar Bases.gs"],
-    ["atualizarBasesEConsolidar", "consolidarBaseInteligente", "Cruzamento de Bases/Sincronizar Bases.gs"],
+    ["atualizarBaseAparelhosDoDW", "registrarSaude_", "Cruzamento de Bases/Sincronizar Bases.gs"],
+    ["atualizarBasesEConsolidar", "atualizarBaseAparelhosDoDW", "Cruzamento de Bases/Sincronizar Bases.gs"],
     ["registrarSaude_", "ROTULOS_SAUDE", "Relatório.gs"],
+    ["registrarConsolidacaoNoRelatorio_", "6. Grande conta", "Relatório.gs"],
     ["onOpen", "atualizarBasesEConsolidar", "Menu Automações.gs"],
     ["sincronizarEValidarVendedores", "", "Validação URL/Vendedor.gs"],
     ["gerarPlanilhasVendedoresFaltantes", "", "Criação de Planilhas.gs"],
@@ -123,6 +126,11 @@ function diagnosticarSistema() {
   };
   avaliarFrescor("Base_CIGAM (DW)", lerCarimbo("Base_CIGAM", "J1"));
   avaliarFrescor("Base_Cidades", lerCarimbo("Base_Cidades", "F1"));
+  if (!ss.getSheetByName("Base_Aparelhos")) {
+    alerta("Frescor", "Base_Aparelhos (DW)", "aba ainda não existe — é criada pelo item 1 do menu (Atualizar Bases)");
+  } else {
+    avaliarFrescor("Base_Aparelhos (DW)", lerCarimbo("Base_Aparelhos", "I1"));
+  }
   avaliarFrescor("Última distribuição (Relatório B6)", lerCarimbo("Relatório", "B6"));
   testar("Frescor", "Histórico diário", () => {
     const aba = ss.getSheetByName(CONFIG_DISTRIB.abaHistoricoResumo);
@@ -161,17 +169,19 @@ function diagnosticarSistema() {
     // Base_Clientes: regras e vendedores
     const clientes = ss.getSheetByName("Base_Clientes").getDataRange().getValues().slice(1);
     const regras = {};
-    let naoMapeados = 0;
+    const naoMapeados = [];
     const vendClientesFora = new Set();
     clientes.forEach(l => {
       const regra = String(l[5]).split("(")[0].trim() || "(vazio)";
       regras[regra] = (regras[regra] || 0) + 1;
       const v = String(l[1]).trim().toUpperCase();
-      if (v === "NÃO MAPEADO") naoMapeados++;
+      if (v === "NÃO MAPEADO") naoMapeados.push(String(l[2] || l[0]).trim());
       else if (v && !todos.has(v)) vendClientesFora.add(v);
     });
     ok("Consistência", "Base_Clientes por regra", Object.keys(regras).sort().map(k => k + ": " + regras[k]).join(" · "));
-    (naoMapeados ? alerta : ok)("Consistência", "Clientes NÃO MAPEADO", naoMapeados + " de " + clientes.length);
+    (naoMapeados.length ? alerta : ok)("Consistência", "Clientes NÃO MAPEADO", naoMapeados.length + " de " + clientes.length +
+      (naoMapeados.length ? " · " + naoMapeados.slice(0, 5).join("; ") + (naoMapeados.length > 5 ? "…" : "") +
+        " — resolva com Insercoes_Manuais (vendedor ou REGIONAL)" : ""));
     if (vendClientesFora.size) alerta("Consistência", "Vendedores na Base_Clientes fora da Lista_Vendedores",
       [...vendClientesFora].join(", ") + " — rode 'Validar Planilhas' para incluí-los");
 
@@ -194,6 +204,7 @@ function diagnosticarSistema() {
       ["Saúde: Base_CIGAM", "B" + RELATORIO.saude.cigam],
       ["Saúde: Base_Cidades", "B" + RELATORIO.saude.cidades],
       ["Saúde: Base_Clientes", "B" + RELATORIO.saude.clientes],
+      ["Saúde: Base_Aparelhos", "B" + RELATORIO.saude.aparelhos],
       ["Consolidação por cliente", "B" + RELATORIO.consolidacao.primeiraLinha],
       ["Desempenho por vendedor", "A" + RELATORIO.vendedores.primeiraLinha]
     ];

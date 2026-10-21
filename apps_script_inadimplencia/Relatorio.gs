@@ -11,8 +11,8 @@
 
 const RELATORIO = {
   aba: "Relatório",
-  saude: { titulo: 23, arquivo: 24, conferencia: 25, cigam: 26, cidades: 27, clientes: 28 },
-  consolidacao: { titulo: 30, primeiraLinha: 31 },               // 31..38
+  saude: { titulo: 23, arquivo: 24, conferencia: 25, cigam: 26, cidades: 27, clientes: 28, aparelhos: 29 },
+  consolidacao: { titulo: 30, primeiraLinha: 31 },               // 31..39
   semDono: { titulo: 40, cabecalho: 41, primeiraLinha: 42, max: 10 },
   vendedores: { titulo: 53, cabecalho: 54, primeiraLinha: 55, max: 100 }
 };
@@ -22,7 +22,8 @@ const ROTULOS_SAUDE = {
   conferencia: "Conferência do arquivo:",
   cigam: "Base_CIGAM (DW):",
   cidades: "Base_Cidades:",
-  clientes: "Base_Clientes (consolidação):"
+  clientes: "Base_Clientes (consolidação):",
+  aparelhos: "Base_Aparelhos (DW):"
 };
 
 function abaRelatorio_() {
@@ -81,10 +82,11 @@ function registrarConsolidacaoNoRelatorio_(contadorRegras, totalClientes) {
     ["3. Comercial — razão social parcial", somar(k => k.startsWith("3.") && k.includes("Parcial"))],
     ["4. Praça (Cidade/UF)", somar(k => k.startsWith("4."))],
     ["5. Retido (vendedor inativo)", somar(k => k.startsWith("5."))],
+    ["6. Grande conta (pagante de aparelho)", somar(k => k.startsWith("6."))],
     ["Não mapeado", somar(k => k === "Nenhuma")]
   ];
-  const comVendedor = linhas.slice(0, 5).reduce((acc, l) => acc + l[1], 0);
-  linhas.push(["Cobertura (regras 1 a 4)", comVendedor]);
+  const comVendedor = [0, 1, 2, 3, 4, 6].reduce((acc, i) => acc + linhas[i][1], 0);
+  linhas.push(["Cobertura (regras 1 a 4 e 6)", comVendedor]);
 
   const pct = n => totalClientes ? n / totalClientes : 0;
   const tabela = linhas.map(l => [l[0], l[1], pct(l[1])]);

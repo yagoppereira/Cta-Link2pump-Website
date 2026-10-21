@@ -149,13 +149,18 @@ function distribuirInadimplenciaPorVendedor() {
   };
 
   // Resumo de uma leitura: títulos válidos, soma da coluna SALDO e o total
-  // de referência que o arquivo traz na linha de cabeçalho (ex.: K1 "R$ 2.423.866,60")
-  const resumirLeitura = (dados) => {
+  // de referência que o arquivo traz na linha de cabeçalho (ex.: K1 "R$ 2.423.866,60").
+  // O K1 da origem é =SUBTOTAL(9;F:F): soma só as linhas VISÍVEIS no filtro da aba
+  // (hoje o filtro de CONTA DESCRICAO esconde Licenciamentos, Aluguel, etc.). Por isso
+  // a leitura também calcula a "soma visível", reproduzindo o filtro, para conferir
+  // o K1 com a mesma base. getValues() continua trazendo todas as linhas.
+  const resumirLeitura = (dados, filtro) => {
     const m = mapearOrigem(dados);
-    let titulos = 0, soma = 0;
+    let titulos = 0, soma = 0, somaVisivel = 0;
     for (let i = m.linhaCabecalho + 1; i < dados.length; i++) {
       let saldo = converterSaldoParaNumero(dados[i][m.idxSaldo]);
       soma += saldo;
+      if (filtro && linhaVisivelNoFiltro_(filtro, dados[i], i + 1)) somaVisivel += saldo;
       let cnpj = String(dados[i][m.idxCnpj] || "").replace(/\D/g, '');
       let nome = String(dados[i][m.idxEmpresa] || "").toUpperCase();
       if (cnpj && saldo > 0 && !nome.includes("TOTAL")) titulos++;
@@ -169,7 +174,10 @@ function distribuirInadimplenciaPorVendedor() {
         break;
       }
     }
-    return { titulos: titulos, soma: soma, referencia: referencia };
+    return {
+      titulos: titulos, soma: soma, referencia: referencia,
+      somaVisivel: (filtro && filtro.reproduzivel) ? somaVisivel : null
+    };
   };
 
   const dadosClientes = abaClientes ? abaClientes.getDataRange().getValues() : [];
@@ -324,10 +332,13 @@ function distribuirInadimplenciaPorVendedor() {
     let statusConferencia = "";
 
     for (let tentativa = 1; tentativa <= CONFIG_DISTRIB.tentativasLeitura; tentativa++) {
+      let filtroOrigem = lerFiltroOrigem_(abaOrigem);
       let leitura = abaOrigem.getDataRange().getValues();
-      let r = resumirLeitura(leitura);
+      let r = resumirLeitura(leitura, filtroOrigem);
 
-      let totalOk = r.referencia !== null && Math.abs(r.soma - r.referencia) <= CONFIG_DISTRIB.toleranciaTotalReais;
+      // O K1 pode estar somando tudo (sem filtro) ou só o que o filtro mostra
+      const bate = (x) => x !== null && r.referencia !== null && Math.abs(x - r.referencia) <= CONFIG_DISTRIB.toleranciaTotalReais;
+      let totalOk = bate(r.soma) || bate(r.somaVisivel);
       let quedaOk = !titulosAnteriores || r.titulos >= titulosAnteriores * (1 - CONFIG_DISTRIB.quedaMaximaTitulos);
       let estavel = resumoAnterior && resumoAnterior.titulos === r.titulos && Math.abs(resumoAnterior.soma - r.soma) < 0.01;
 
@@ -341,7 +352,7 @@ function distribuirInadimplenciaPorVendedor() {
         statusConferencia = r.referencia === null ? "⚠️ Sem total de referência" : "⚠️ Soma difere do total do arquivo";
         break;
       }
-      console.warn(`Leitura ${tentativa}: ${r.titulos} títulos, soma ${formatarReais_(r.soma)}, referência ${r.referencia === null ? "-" : formatarReais_(r.referencia)}. Aguardando nova leitura...`);
+      console.warn(`Leitura ${tentativa}: ${r.titulos} títulos, soma ${formatarReais_(r.soma)}, visível no filtro ${r.somaVisivel === null ? "-" : formatarReais_(r.somaVisivel)}, referência ${r.referencia === null ? "-" : formatarReais_(r.referencia)}. Aguardando nova leitura...`);
       resumoAnterior = r;
       if (tentativa < CONFIG_DISTRIB.tentativasLeitura) Utilities.sleep(CONFIG_DISTRIB.esperaEntreLeiturasMs);
     }
@@ -353,9 +364,12 @@ function distribuirInadimplenciaPorVendedor() {
       throw new Error("Arquivo de origem não passou na conferência (pode estar sendo atualizado). Nada foi alterado.");
     }
 
-    registrarSaude_("conferencia", statusConferencia,
-      `lido ${formatarReais_(resumo.soma)}` + (resumo.referencia !== null ? ` · arquivo ${formatarReais_(resumo.referencia)}` : "") +
-      ` · ${resumo.titulos} títulos`);
+    let detalheConferencia = `lido ${formatarReais_(resumo.soma)}`;
+    if (resumo.somaVisivel !== null && Math.abs(resumo.somaVisivel - resumo.soma) >= 0.01) {
+      detalheConferencia += ` · visível no filtro da origem ${formatarReais_(resumo.somaVisivel)}`;
+    }
+    if (resumo.referencia !== null) detalheConferencia += ` · arquivo ${formatarReais_(resumo.referencia)}`;
+    registrarSaude_("conferencia", statusConferencia, detalheConferencia + ` · ${resumo.titulos} títulos`);
 
     const mapaOrigem = mapearOrigem(dadosMaster);
     let linhaCabecalhoIdx = mapaOrigem.linhaCabecalho;
@@ -417,9 +431,10 @@ function distribuirInadimplenciaPorVendedor() {
     let logAcertoCnpjRaiz = 0;
     let logAcertoRazaoSocial = 0;
     let logAcertoPraca = 0;
+    let logAcertoGrandeConta = 0;
 
     // Mesmos indicadores, em R$
-    const valor = { total: 0, distribuido: 0, retido: 0, orfao: 0, exato: 0, raiz: 0, razao: 0, praca: 0 };
+    const valor = { total: 0, distribuido: 0, retido: 0, orfao: 0, exato: 0, raiz: 0, razao: 0, praca: 0, grandeConta: 0 };
     // Desempenho por vendedor e clientes sem dono
     const porVendedor = {};
     const semDono = {};
@@ -483,18 +498,23 @@ function distribuirInadimplenciaPorVendedor() {
         porVendedor[vendedorFinal].clientes.add(cnpjMasterLimpo);
         porVendedor[vendedorFinal].saldo += saldo;
 
-        if (regraUtilizada.includes("Manual") || regraUtilizada.includes("Exata") || regraUtilizada.includes("Exato")) {
+        // Classifica pelo NÚMERO da regra (o texto "Razão Social Exata" caía no balde "Exato/Manual")
+        const numeroRegra = String(regraUtilizada).trim().charAt(0);
+        if (numeroRegra === "1") {
           logAcertoCnpjExato++;
           valor.exato += saldo;
-        } else if (regraUtilizada.includes("Raiz")) {
+        } else if (numeroRegra === "2") {
           logAcertoCnpjRaiz++;
           valor.raiz += saldo;
-        } else if (regraUtilizada.includes("Razão Social") || regraUtilizada.includes("Parcial")) {
+        } else if (numeroRegra === "3") {
           logAcertoRazaoSocial++;
           valor.razao += saldo;
-        } else if (regraUtilizada.includes("Praça") || regraUtilizada.includes("Cidade")) {
+        } else if (numeroRegra === "4") {
           logAcertoPraca++;
           valor.praca += saldo;
+        } else if (numeroRegra === "6") {
+          logAcertoGrandeConta++;
+          valor.grandeConta += saldo;
         }
       } else {
         if (statusLooker === "Retido (Vendedor Inativo)") {
@@ -562,6 +582,13 @@ function distribuirInadimplenciaPorVendedor() {
           let numColunas = novosDados[0].length;
           
           abaDadosDestino.clear();
+          // Fatura e CNPJ como TEXTO: sem isso o Sheets lê "8932/1" como data (ano 8932)
+          novosDados[0].forEach((titulo, c) => {
+            const t = normalizarTexto(titulo);
+            if (t.includes("FATURA") || t.includes("TITULO") || t.includes("CNPJ") || t.includes("CPF")) {
+              abaDadosDestino.getRange(1, c + 1, numLinhas, 1).setNumberFormat("@");
+            }
+          });
           abaDadosDestino.getRange(1, 1, numLinhas, numColunas).setValues(novosDados);
           statusPlanilhaVendedor[vendedor] = "✅ Atualizada";
         } else {
@@ -588,13 +615,14 @@ function distribuirInadimplenciaPorVendedor() {
     abaRelatorio.getRange("B19").setValue(logAcertoCnpjRaiz);
     abaRelatorio.getRange("B20").setValue(logAcertoRazaoSocial);
     abaRelatorio.getRange("B21").setValue(logAcertoPraca);
+    abaRelatorio.getRange("A22:B22").setValues([["Acertos por Grande Conta (aparelho):", logAcertoGrandeConta]]);
 
     // Coluna C: os mesmos indicadores em R$
     abaRelatorio.getRange("C8").setValue("Valor (R$)").setFontWeight("bold");
     abaRelatorio.getRange("C9").setValue(valor.total);
     abaRelatorio.getRange("C13:C15").setValues([[valor.distribuido], [valor.retido], [valor.orfao]]);
-    abaRelatorio.getRange("C18:C21").setValues([[valor.exato], [valor.raiz], [valor.razao], [valor.praca]]);
-    abaRelatorio.getRangeList(["C9", "C13:C15", "C18:C21"]).setNumberFormat("R$ #,##0.00");
+    abaRelatorio.getRange("C18:C22").setValues([[valor.exato], [valor.raiz], [valor.razao], [valor.praca], [valor.grandeConta]]);
+    abaRelatorio.getRangeList(["C9", "C13:C15", "C18:C22"]).setNumberFormat("R$ #,##0.00");
 
     // Top 10 clientes sem dono (órfãos + retidos), por saldo
     const linhasSemDono = Object.keys(semDono)
@@ -754,4 +782,45 @@ function gravarDiaNoHistorico_(ss, nomeAba, cabecalho, linhas, chaveDia) {
   const inicio = aba.getLastRow() + 1;
   aba.getRange(inicio, 1, linhas.length, cabecalho.length).setValues(linhas);
   aba.getRange(inicio, 1, linhas.length, 1).setNumberFormat("dd/mm/yyyy");
+}
+
+// =========================================================================
+// FILTRO DA ABA DE ORIGEM (só leitura — o script nunca altera o filtro)
+// -------------------------------------------------------------------------
+// Captura os valores ocultos por coluna para reproduzir o que o SUBTOTAL do K1
+// enxerga. Se alguma coluna usar condição (ex.: "texto contém"), o filtro não é
+// reproduzível e a soma visível fica como desconhecida (reproduzivel = false).
+// =========================================================================
+function lerFiltroOrigem_(aba) {
+  try {
+    const filtro = aba.getFilter();
+    if (!filtro) return null;
+    const faixa = filtro.getRange();
+    const colunas = [];
+    let reproduzivel = true;
+    for (let c = faixa.getColumn(); c <= faixa.getLastColumn(); c++) {
+      const crit = filtro.getColumnFilterCriteria(c);
+      if (!crit) continue;
+      if (crit.getCriteriaType() !== null || (crit.getVisibleValues() || []).length) reproduzivel = false;
+      const ocultos = crit.getHiddenValues() || [];
+      if (ocultos.length) colunas.push({ idx: c - 1, ocultos: new Set(ocultos.map(v => String(v).trim())) });
+    }
+    return {
+      linhaInicio: faixa.getRow() + 1,          // a 1ª linha da faixa é o cabeçalho
+      linhaFim: faixa.getLastRow(),
+      colunas: colunas,
+      reproduzivel: reproduzivel
+    };
+  } catch (e) {
+    console.warn("Não foi possível ler o filtro da origem: " + e.message);
+    return null;
+  }
+}
+
+function linhaVisivelNoFiltro_(filtro, linha, numeroLinha) {
+  if (numeroLinha < filtro.linhaInicio || numeroLinha > filtro.linhaFim) return true;
+  for (const col of filtro.colunas) {
+    if (col.ocultos.has(String(linha[col.idx] === undefined ? "" : linha[col.idx]).trim())) return false;
+  }
+  return true;
 }

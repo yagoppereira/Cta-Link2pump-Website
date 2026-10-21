@@ -99,6 +99,49 @@ function executarQueryBigQuery(sql) {
 }
 
 // ==========================================
+// 1b. BASE_APARELHOS ← DW (local → pagante → nº de equipamentos)
+// ==========================================
+// Usada pela regra de grandes contas na consolidação. "Equipamentos" conta
+// equipamento_id distinto (um equipamento pode ter mais de uma bomba/canal).
+function atualizarBaseAparelhosDoDW() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const aba = ss.getSheetByName("Base_Aparelhos") || ss.insertSheet("Base_Aparelhos");
+  const p = CONFIG_SYNC.bqProjeto;
+  const sql = `
+    WITH emp AS (
+      SELECT SAFE_CAST(codigo AS INT64) cod, codigo, TRIM(nomeCompleto) nome,
+             LPAD(REGEXP_REPLACE(cnpjCpf, r'\\D', ''), 14, '0') doc
+      FROM \`${p}.bronze.cigam__empresas\`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY codigo ORDER BY inserted_at DESC) = 1
+    )
+    SELECT l.codigo, l.doc, l.nome, pg.codigo, pg.doc, pg.nome,
+           COUNT(DISTINCT CONCAT(b.base, '-', CAST(b.equipamento_id AS STRING))) equipamentos
+    FROM \`${p}.gold.bombas_alocadas\` b
+    JOIN emp l  ON l.cod  = SAFE_CAST(b.cliente_cigam_local AS INT64)
+    JOIN emp pg ON pg.cod = SAFE_CAST(b.cliente_cigam_pagante AS INT64)
+    GROUP BY 1, 2, 3, 4, 5, 6
+    ORDER BY 5, 2
+  `;
+  const linhas = executarQueryBigQuery(sql);
+  if (linhas.length === 0) {
+    registrarSaude_("aparelhos", "❌ Falhou", "DW não retornou aparelhos; base anterior mantida (" + agoraFormatado_() + ")");
+    throw new Error("DW não retornou aparelhos. Base_Aparelhos NÃO foi alterada.");
+  }
+  const cabecalho = ["codigo_local", "cnpj_local", "nome_local", "codigo_pagante", "cnpj_pagante", "nome_pagante", "equipamentos"];
+  const tabela = [cabecalho].concat(linhas.map(l => l.map((v, j) => v === null ? "" : (j === 6 ? Number(v) : v))));
+  if (aba.getFilter()) aba.getFilter().remove();
+  aba.clearContents();
+  [1, 2, 4, 5].forEach(c => aba.getRange(1, c, tabela.length, 1).setNumberFormat("@"));
+  aba.getRange(1, 1, tabela.length, cabecalho.length).setValues(tabela);
+  aba.getRange(1, 1, 1, cabecalho.length).setFontWeight("bold");
+  const carimbo = Utilities.formatDate(new Date(), "GMT-3", "dd/MM/yyyy HH:mm");
+  aba.getRange(1, cabecalho.length + 2).setValue("Atualizado do DW em: " + carimbo);
+  registrarSaude_("aparelhos", linhas.length + " pares local→pagante", "atualizado do DW em " + carimbo);
+  console.log(`Base_Aparelhos atualizada do DW: ${linhas.length} pares.`);
+  return linhas.length;
+}
+
+// ==========================================
 // 2. BASE_CIDADES ← "Cidades por Vendedor"
 // ==========================================
 function atualizarBaseCidades() {
@@ -147,6 +190,11 @@ function atualizarBaseCidades() {
 function atualizarBasesEConsolidar() {
   const qtdClientes = atualizarBaseCigamDoDW();
   const qtdCidades = atualizarBaseCidades();
+  try {
+    atualizarBaseAparelhosDoDW();
+  } catch (e) {
+    console.warn("Base_Aparelhos não atualizada (a consolidação usa a versão anterior): " + e.message);
+  }
   SpreadsheetApp.flush();
   console.log(`Bases prontas (${qtdClientes} clientes, ${qtdCidades} cidades). Consolidando...`);
   if (typeof consolidarBaseInteligente !== "function") {
