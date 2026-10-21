@@ -12,6 +12,11 @@ const CONFIG_ATRIBUICAO = {
   // cliente ao vendedor REGIONAL (praça Cidade/UF), ignorando o histórico comercial.
   marcadoresRegional: ["REGIONAL", "GESTAO REGIONAL", "VENDEDOR REGIONAL", "PRACA"],
 
+  // Valores aceitos na coluna "vendedor" da Insercoes_Manuais para só DESPRENDER o
+  // cliente da regra de grandes contas: ele segue a cascata normal (comercial, praça...)
+  // e não é puxado como pagante de aparelho.
+  marcadoresSemGrandeConta: ["SEM GRANDE CONTA", "SEM GRANDES CONTAS", "EXCLUIR GRANDE CONTA", "NAO GRANDE CONTA"],
+
   // GRANDES CONTAS: o pagante dos aparelhos instalados nos clientes destes vendedores
   // (aba Base_Aparelhos, sincronizada do DW) também passa para eles, se pelo menos
   // `limiteGrandesContas` dos aparelhos que esse pagante paga estiverem nesses clientes.
@@ -144,6 +149,8 @@ function consolidarBaseInteligente() {
   const somenteManual = new Set(CONFIG_ATRIBUICAO.vendedoresSomenteManual.map(v => normalizarMarcador_(v)));
   const ehSomenteManual = (v) => somenteManual.has(normalizarMarcador_(v));
   const ehRegional = (v) => CONFIG_ATRIBUICAO.marcadoresRegional.indexOf(normalizarMarcador_(v)) !== -1;
+  const ehSemGrandeConta = (v) => CONFIG_ATRIBUICAO.marcadoresSemGrandeConta.indexOf(normalizarMarcador_(v)) !== -1;
+  const semGcExato = new Set(), semGcRaiz = new Set();   // exclusões manuais da regra 6
   const raizesParceria = new Set();   // raízes que só tinham venda de vendedor só-manual (auditoria)
   const nomesParceria = new Set();
 
@@ -156,6 +163,13 @@ function consolidarBaseInteligente() {
   for (let i = 1; i < dadosManuais.length; i++) {
     let cnpjPuro = limparParaChavePura(dadosManuais[i][0]);
     let vendedor = String(dadosManuais[i][1]).replace(/\u00A0/g, ' ').trim().toUpperCase();
+    if (cnpjPuro && vendedor && ehSemGrandeConta(vendedor)) {
+      // Não é atribuição: o cliente segue a cascata, só fica fora da regra de grandes contas
+      const doc14 = cnpjPuro.padStart(14, '0');
+      semGcExato.add(doc14);
+      if (cnpjPuro.length > 11) semGcRaiz.add(doc14.substring(0, 8));   // grupo só para CNPJ
+      continue;
+    }
     if (cnpjPuro && vendedor) {
       dictManualExato[cnpjPuro] = vendedor;
       if (cnpjPuro.length >= 8) {
@@ -355,7 +369,8 @@ function consolidarBaseInteligente() {
 
   // 6. GRANDES CONTAS: pagante dos aparelhos instalados nos clientes do vendedor
   try {
-    aplicarGrandesContas_(ss, resultadoFinal, contadorRegras, dictVendedoresAtivos, ehSomenteManual);
+    const excluidoDeGrandeConta = (doc14) => semGcExato.has(doc14) || semGcRaiz.has(doc14.substring(0, 8));
+    aplicarGrandesContas_(ss, resultadoFinal, contadorRegras, dictVendedoresAtivos, ehSomenteManual, excluidoDeGrandeConta);
   } catch (e) {
     console.warn("Regra de grandes contas não aplicada: " + e.message);
   }
@@ -384,7 +399,8 @@ function consolidarBaseInteligente() {
 // ==========================================
 // GRANDES CONTAS (2ª passada sobre a Base_Clientes já montada)
 // ==========================================
-function aplicarGrandesContas_(ss, resultado, contador, dictVendedoresAtivos, ehSomenteManual) {
+function aplicarGrandesContas_(ss, resultado, contador, dictVendedoresAtivos, ehSomenteManual, excluidoDeGrandeConta) {
+  excluidoDeGrandeConta = excluidoDeGrandeConta || (() => false);
   const vendedoresGc = CONFIG_ATRIBUICAO.vendedoresGrandesContas.map(normalizarMarcador_);
   if (!vendedoresGc.length) return;
   const aba = ss.getSheetByName("Base_Aparelhos");
@@ -415,13 +431,24 @@ function aplicarGrandesContas_(ss, resultado, contador, dictVendedoresAtivos, eh
   }
 
   const REGRA = "6. Grande conta (pagante de aparelho)";
-  let movidos = 0, acrescentados = 0;
+  let movidos = 0, acrescentados = 0, bloqueados = 0;
   Object.keys(emGrandeConta).forEach(pag => {
     const [vendedor, eq] = Object.entries(emGrandeConta[pag]).sort((a, b) => b[1] - a[1])[0];
     const participacao = eq / (totalPago[pag] || eq);
     if (participacao < CONFIG_ATRIBUICAO.limiteGrandesContas) return;
     if (dictVendedoresAtivos[vendedor] !== true) return;              // grande conta inativa: não move
     const i = linhaDoDoc[pag];
+    if (excluidoDeGrandeConta(pag)) {                                  // exclusão manual (SEM GRANDE CONTA)
+      if (i !== undefined && vendedoresGc.indexOf(normalizarMarcador_(resultado[i][1])) === -1) {
+        const regra = String(resultado[i][5]);
+        contador[regra] = (contador[regra] || 1) - 1;
+        if (!contador[regra]) delete contador[regra];
+        resultado[i][5] = regra + " · sem grande conta";
+        contador[resultado[i][5]] = (contador[resultado[i][5]] || 0) + 1;
+      }
+      bloqueados++;
+      return;
+    }
     if (i === undefined) {                                             // pagante fora das divisões de cliente
       resultado.push([pag, vendedor, String(nomePagante[pag] || ""), "", "", REGRA]);
       contador[REGRA] = (contador[REGRA] || 0) + 1;
@@ -441,7 +468,7 @@ function aplicarGrandesContas_(ss, resultado, contador, dictVendedoresAtivos, eh
     contador[REGRA] = (contador[REGRA] || 0) + 1;
     movidos++;
   });
-  console.log(`Grandes contas: ${movidos} pagantes movidos, ${acrescentados} acrescentados.`);
+  console.log(`Grandes contas: ${movidos} pagantes movidos, ${acrescentados} acrescentados, ${bloqueados} bloqueados por SEM GRANDE CONTA.`);
 }
 
 // ==========================================
