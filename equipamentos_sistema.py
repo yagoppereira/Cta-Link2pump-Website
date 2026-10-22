@@ -170,7 +170,7 @@ def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str
         # o grão do fato inclui o posto: bomba que mudou de posto do mesmo
         # cliente no dia soma as duas linhas
         uso = _query(_client, f"""
-        SELECT CAST(bomba_id AS STRING) AS bomba_id, data, CAST(serial AS STRING) AS serial,
+        SELECT CAST(bomba_id AS STRING) AS bomba_id, data, CAST(serial_equipamento AS STRING) AS serial,
                SUM(litros) AS litros, SUM(qtd_abastecimentos) AS qtd_abastecimentos
         FROM {t_uso}
         WHERE base = @base AND posto_id IN UNNEST(@postos)
