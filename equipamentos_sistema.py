@@ -35,7 +35,7 @@ import unicodedata
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from google.api_core.exceptions import Forbidden, NotFound
+from google.api_core.exceptions import BadRequest, Forbidden, NotFound
 from google.cloud import bigquery
 
 # bases do sistema CTA com histórico de uso no DW. O Link2Pump (l2p) está no
@@ -48,6 +48,10 @@ BASES_SISTEMA = {"cta": "CTA", "ipc": "Ipiranga Connect"}
 TABELA_USO = "silver.abastecimento_bomba_serial_dia"
 TABELA_CADASTRO = "silver.cadastro_bombas"
 TABELAS_LIDAS = [TABELA_USO, TABELA_CADASTRO]
+# alocação CIGAM (quem paga cada bomba HOJE): as mesmas tabelas que a aba
+# Cliente já lê. Sem acesso, a linha do tempo só perde a cor por pagante.
+TABELA_ALOCACAO = "gold.bombas_alocadas"
+TABELA_EMPRESAS_CIGAM = "bronze.cigam__empresas"
 
 # Paleta categórica (passo escuro), validada contra o fundo do gráfico
 # (#26263A): CVD adjacente ΔE >= 8.4, visão normal >= 19.3. O verde (slot 6)
@@ -64,6 +68,12 @@ COR_GRADE = "#3A3A52"
 COR_SERIAL_ATUAL = "#3987e5"
 COR_SERIAL_ANTERIOR = "#8A95A8"
 COR_SEM_SERIAL = "#5B6275"
+COR_SEM_ALOCACAO = "#C9CED8"
+# pagante com conta própria no sistema: contorno + ⚠. O vermelho do contorno
+# não entra na paleta dos pagantes (slot 7 fica de fora) pra não confundir
+COR_ALERTA = "#FF4B4B"
+CORES_PAGANTES = CORES_BOMBAS[:6]
+COR_OUTROS_PAGANTES = CORES_BOMBAS[6]
 
 # timeline: mais de N dias sem abastecer quebra o período de uso
 DIAS_SEM_USO_QUEBRA_PERIODO = 30
@@ -75,8 +85,8 @@ GRANULARIDADES = {"Dia": "D", "Semana": "W", "Mês": "M"}
 
 
 def _tabela(project_id: str, nome: str) -> str:
-    # nome vem sempre de TABELAS_LIDAS (nunca do usuário) — seguro no f-string
-    assert nome in TABELAS_LIDAS
+    # nome vem sempre das constantes acima (nunca do usuário) — seguro no f-string
+    assert nome in TABELAS_LIDAS + [TABELA_ALOCACAO, TABELA_EMPRESAS_CIGAM]
     return f"`{project_id}.{nome}`"
 
 
@@ -205,6 +215,108 @@ def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str
     return cadastro, uso
 
 
+@st.cache_data(ttl=1800, show_spinner="Buscando a alocação CIGAM das bombas (direto do BigQuery)...")
+def carregar_alocacao_cigam(_client, project_id: str, base: str, cliente_id: str, bombas: tuple) -> pd.DataFrame:
+    """
+    Quem paga cada bomba HOJE (gold.bombas_alocadas, estado atual — não
+    serve pra atribuir período passado), com nome/CNPJ do CIGAM, e se o
+    pagante tem CONTA PRÓPRIA no sistema: outro cliente_id da mesma base cujo
+    CNPJ tem a mesma raiz (8 dígitos) do pagante. Pagante assim, com raiz
+    diferente da do próprio cliente, é sinal de bomba de outra operação no
+    parque do cliente (ex.: Petrovera pagando 2 bombas nos postos da Força
+    Ambiental, 22/10/2026). Não sinaliza:
+      - pagante sem conta própria (ex.: União Norte, que só existe no
+        CIGAM) — é o caso comum de empresa do grupo pagando;
+      - conta de TRR interno (Removidos, testes): no Connect, uma conta
+        removida com a raiz da Ipiranga marcaria as 255 bombas que a
+        Ipiranga paga;
+      - cliente sem CNPJ no sistema (vem vazio em boa parte do CTA): sem a
+        raiz dele não dá pra dizer se o pagante é do grupo (Construtora Luiz
+        Costa pagando as próprias 78 bombas sairia marcada por causa de uma
+        conta "Desativado").
+    Medido em 22/10/2026: 42 bombas de 15 clientes no CTA, quase todas pagas
+    por distribuidora com conta própria (Combustran, Petrovera, Comercial
+    Cordeiro, São Leopoldo TRR); nenhuma no Connect.
+    """
+    t_cad = _tabela(project_id, TABELA_CADASTRO)
+    sql = f"""
+    WITH aloc AS (
+      SELECT
+        CAST(a.bomba_id AS STRING) AS bomba_id,
+        CAST(a.cliente_cigam_pagante AS STRING) AS pagante_codigo,
+        p.nomeCompleto AS pagante_nome,
+        REGEXP_REPLACE(CAST(p.cnpjCpf AS STRING), r'\\D', '') AS pagante_cnpj,
+        CAST(a.cliente_cigam_local AS STRING) AS local_codigo,
+        l.nomeCompleto AS local_nome
+      FROM {_tabela(project_id, TABELA_ALOCACAO)} a
+      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} p
+        ON CAST(a.cliente_cigam_pagante AS STRING) = CAST(p.codigo AS STRING)
+      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} l
+        ON CAST(a.cliente_cigam_local AS STRING) = CAST(l.codigo AS STRING)
+      WHERE a.base = @base AND CAST(a.bomba_id AS STRING) IN UNNEST(@bombas)
+    ),
+    contas AS (
+      SELECT cliente_id, ANY_VALUE(cliente_nome) AS conta_nome,
+             SUBSTR(REGEXP_REPLACE(ANY_VALUE(cliente_cnpj), r'\\D', ''), 1, 8) AS raiz
+      FROM {t_cad}
+      WHERE base = @base AND LENGTH(REGEXP_REPLACE(cliente_cnpj, r'\\D', '')) = 14
+        AND NOT IFNULL(trr_sistema_interno, FALSE)
+      GROUP BY cliente_id
+    ),
+    outras AS (
+      SELECT a.bomba_id,
+             STRING_AGG(FORMAT('%s (id %s)', c.conta_nome, c.cliente_id), ', ' ORDER BY c.cliente_id LIMIT 3)
+               AS pagante_outras_contas
+      FROM aloc a
+      JOIN contas c ON c.raiz = SUBSTR(a.pagante_cnpj, 1, 8)
+      WHERE LENGTH(a.pagante_cnpj) = 14 AND c.raiz != '00000000' AND c.cliente_id != @cliente_id
+      GROUP BY a.bomba_id
+    )
+    SELECT
+      aloc.*,
+      o.pagante_outras_contas,
+      (SELECT ANY_VALUE(raiz) FROM contas WHERE cliente_id = @cliente_id) AS cliente_raiz
+    FROM aloc
+    LEFT JOIN outras o USING (bomba_id)
+    """
+    return _query(_client, sql, [
+        bigquery.ScalarQueryParameter("base", "STRING", base),
+        bigquery.ScalarQueryParameter("cliente_id", "STRING", str(cliente_id)),
+        bigquery.ArrayQueryParameter("bombas", "STRING", list(bombas)),
+    ])
+
+
+def anexar_alocacao(resumo: pd.DataFrame, alocacao: pd.DataFrame) -> pd.DataFrame:
+    """Põe no resumo de bombas o pagante de hoje e o alerta de pagante de
+    outra conta. Só vale para bomba instalada HOJE no cliente: a alocação é
+    estado atual, e bomba retirada ou em outro cliente não tem o que mostrar."""
+    resumo = resumo.drop(columns=[c for c in ("pagante_codigo", "pagante_nome", "pagante_outras_contas",
+                                              "pagante_fora_do_grupo", "pagante_rotulo") if c in resumo])
+    ativa = resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])
+    if alocacao is None or alocacao.empty:
+        resumo["pagante_codigo"] = None
+        resumo["pagante_nome"] = None
+        resumo["pagante_outras_contas"] = None
+        resumo["pagante_fora_do_grupo"] = False
+    else:
+        aloc = alocacao.drop_duplicates("bomba_id").copy()
+        raiz_pagante = aloc["pagante_cnpj"].fillna("").astype(str).str[:8]
+        cliente_raiz = aloc["cliente_raiz"].fillna("").astype(str)
+        aloc["pagante_fora_do_grupo"] = (aloc["pagante_outras_contas"].notna() & (cliente_raiz.str.len() == 8)
+                                         & (raiz_pagante != cliente_raiz))
+        resumo = resumo.merge(aloc[["bomba_id", "pagante_codigo", "pagante_nome", "pagante_outras_contas",
+                                    "pagante_fora_do_grupo"]], on="bomba_id", how="left")
+        resumo.loc[~ativa.to_numpy(), ["pagante_codigo", "pagante_nome", "pagante_outras_contas"]] = None
+        resumo["pagante_fora_do_grupo"] = (resumo["pagante_fora_do_grupo"].fillna(False).astype(bool)
+                                           & ativa.to_numpy())
+    resumo["pagante_rotulo"] = [
+        (f"{str(n or 'Sem nome no CIGAM').strip()} (CIGAM {c})" if isinstance(c, str) and c else
+         ("Sem alocação CIGAM" if a else None))
+        for c, n, a in zip(resumo["pagante_codigo"], resumo["pagante_nome"], ativa.to_numpy())
+    ]
+    return resumo
+
+
 def gerar_dados_demo():
     """Diretório + parque fictícios no MESMO formato das consultas, pra
     testar a aba sem credenciais. Cobre: equipamento duplo (2 bombas no
@@ -282,6 +394,23 @@ def gerar_dados_demo():
                                "litros": round(float(l), 3), "qtd_abastecimentos": int(max(1, l // 120))})
     uso = pd.DataFrame(linhas)
     return diretorio, (cadastro, uso)
+
+
+def gerar_alocacao_demo() -> pd.DataFrame:
+    """Alocação CIGAM fictícia, no formato de carregar_alocacao_cigam: o
+    próprio cliente paga a maior parte, uma empresa do grupo sem conta no
+    sistema paga o comboio 01, e uma distribuidora com conta própria paga o
+    comboio 02 (o caso que a aba sinaliza)."""
+    proprio = ("000101", "TRANSPORTE DEMO LTDA", "12345678000100", None)
+    return pd.DataFrame([
+        {"bomba_id": b, "pagante_codigo": c, "pagante_nome": n, "pagante_cnpj": j, "pagante_outras_contas": o,
+         "local_codigo": "000101", "local_nome": "TRANSPORTE DEMO LTDA", "cliente_raiz": "12345678"}
+        for b, (c, n, j, o) in {
+            "5001": proprio, "5002": proprio, "5006": proprio,
+            "5003": ("000202", "LOGÍSTICA DEMO S.A.", "22333444000155", None),
+            "5005": ("000303", "DISTRIBUIDORA DEMO DE PETRÓLEO LTDA", "55666777000188", "Distribuidora Demo (id 900303)"),
+        }.items()
+    ])
 
 
 # --- 2. Busca --------------------------------------------------------------
@@ -555,40 +684,162 @@ def plotar_volume(uso_b, trocas, resumo, selecionadas, cores, granularidade, ano
     return fig
 
 
+SITUACOES_ATIVAS = ("Instalada", "Bomba inativa no cadastro")
+GRUPO_OUTRO_CLIENTE = "Hoje em outro cliente"
+GRUPO_FORA_CADASTRO = "Fora do cadastro atual"
+
+
+def _truncar(texto, limite: int) -> str:
+    texto = "" if texto is None or (isinstance(texto, float) and pd.isna(texto)) else str(texto).strip()
+    return texto if len(texto) <= limite else texto[: limite - 1].rstrip() + "…"
+
+
+def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame:
+    """Uma linha por bomba da timeline, na ordem de exibição: agrupada pelo
+    POSTO atual, postos com bomba instalada hoje primeiro (mais volume no
+    topo), postos só com bomba retirada depois, e por fim as bombas que hoje
+    estão em outro cliente ou fora do cadastro. Dentro do posto, instalada
+    hoje primeiro e depois pela data do primeiro uso."""
+    info = resumo.set_index("bomba_id")
+    linhas = []
+    for bomba, g in periodos.groupby("bomba_id"):
+        situacao = info.at[bomba, "situacao"] if bomba in info.index else GRUPO_FORA_CADASTRO
+        if situacao == GRUPO_OUTRO_CLIENTE:
+            grupo = GRUPO_OUTRO_CLIENTE
+        elif situacao == GRUPO_FORA_CADASTRO:
+            grupo = GRUPO_FORA_CADASTRO
+        else:
+            grupo = str(info.at[bomba, "posto_nome"] or "").strip() or "Posto sem nome"
+        linhas.append({"bomba_id": bomba, "grupo": grupo, "ativa": situacao in SITUACOES_ATIVAS,
+                       "inicio": g["inicio"].min(), "litros": g["litros"].sum()})
+    df = pd.DataFrame(linhas)
+    if df.empty:
+        return df
+    por_grupo = df.groupby("grupo").agg(tem_ativa=("ativa", "any"), litros_grupo=("litros", "sum"))
+    por_grupo["fim_da_fila"] = por_grupo.index.map({GRUPO_OUTRO_CLIENTE: 1, GRUPO_FORA_CADASTRO: 2}).fillna(0)
+    df = df.join(por_grupo, on="grupo")
+    return df.sort_values(["fim_da_fila", "tem_ativa", "litros_grupo", "grupo", "ativa", "inicio"],
+                          ascending=[True, False, False, True, False, True]).reset_index(drop=True)
+
+
+def alertas_de_pagante(resumo: pd.DataFrame) -> list:
+    """Uma frase por pagante com conta própria no sistema, com as bombas que
+    ele paga no parque do cliente — a versão em texto do contorno vermelho."""
+    if "pagante_fora_do_grupo" not in resumo:
+        return []
+    fora = resumo[resumo["pagante_fora_do_grupo"].fillna(False).astype(bool)]
+    linhas = []
+    for pagante, g in fora.groupby("pagante_rotulo"):
+        bombas = ", ".join(sorted(g["rotulo"]))
+        linhas.append(
+            f"**{len(g)} bomba(s) pagas por {pagante}**, fora do grupo deste cliente pela raiz do CNPJ e "
+            f"com conta própria no sistema: {g['pagante_outras_contas'].iloc[0]}. "
+            f"Pode ser bomba de outra operação: {bombas}.")
+    return linhas
+
+
+def cores_pagantes(resumo: pd.DataFrame) -> dict:
+    """Cor por pagante de hoje, na ordem de nº de bombas instaladas (o
+    pagante principal fica com a 1ª cor). Passou de 6 pagantes, o resto
+    divide a 7ª cor; bomba instalada sem alocação tem cor própria."""
+    ativos = resumo[resumo["situacao"].isin(SITUACOES_ATIVAS)]
+    contagem = ativos["pagante_rotulo"].dropna().value_counts()
+    pagantes = [p for p in contagem.index if p != "Sem alocação CIGAM"]
+    cores = {p: (CORES_PAGANTES[i] if i < len(CORES_PAGANTES) else COR_OUTROS_PAGANTES)
+             for i, p in enumerate(pagantes)}
+    cores["Sem alocação CIGAM"] = COR_SEM_ALOCACAO
+    return cores
+
+
 def plotar_periodos(periodos, trocas, resumo, ano):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
-    quebrado em pausas longas."""
-    ordem = (periodos.groupby("bomba_id")["inicio"].min().sort_values().index.tolist())
-    rotulos = resumo.set_index("bomba_id")["rotulo"].to_dict()
-    # (cor, hachura) — os dois cinzas ficam próximos, a hachura do "sem
-    # serial" é a segunda pista pra não depender só da cor
-    estilo_categoria = {
-        "Serial instalado hoje": (COR_SERIAL_ATUAL, ""),
-        "Serial anterior": (COR_SERIAL_ANTERIOR, ""),
-        "Sem serial no abastecimento": (COR_SEM_SERIAL, "/"),
-    }
+    quebrado em pausas longas, agrupada por posto. O trecho do serial
+    instalado HOJE tem a cor do pagante de hoje (alocação CIGAM); pagante
+    com conta própria no sistema ganha contorno vermelho e ⚠ no nome."""
+    ordem = ordem_timeline(periodos, resumo)
+    info = resumo.set_index("bomba_id")
+    tem_alocacao = "pagante_rotulo" in resumo
+    alerta = info["pagante_fora_do_grupo"].to_dict() if tem_alocacao else {}
+    # o nome da bomba repete o do cliente em boa parte da base — corta o
+    # nome, nunca o "(#id)", que é o que torna o rótulo único
+    rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(n, 40))
+               for b, n in info["bomba_nome"].items()}
+    grupos = dict(zip(ordem["bomba_id"], ordem["grupo"].map(lambda g: _truncar(g, 30))))
+
+    def eixo_y(bombas):
+        return [[grupos.get(b, GRUPO_FORA_CADASTRO) for b in bombas], [rotulos.get(b, b) for b in bombas]]
+
+    # trecho de 1 dia some na escala de anos — largura mínima só no desenho
+    # (o hover mostra as datas reais)
+    if ano is not None:
+        janela_ms = 365 * 86_400_000
+    else:
+        janela_ms = max((periodos["fim"].max() - periodos["inicio"].min()).total_seconds() * 1000, 86_400_000)
+    largura_min = janela_ms * 0.004
+
     fig = go.Figure()
-    for categoria, (cor, hachura) in estilo_categoria.items():
-        p = periodos[periodos["categoria"] == categoria]
-        if p.empty:
-            continue
-        textos = [
-            f"<b>{rotulos.get(b, b)}</b><br>Serial {s or '—'} · {categoria}<br>{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
+    # 1º trace invisível com TODAS as bombas na ordem certa: no eixo de 2
+    # níveis (posto, bomba) a ordem das categorias é a da primeira aparição
+    fig.add_trace(go.Scatter(x=[periodos["inicio"].min()] * len(ordem), y=eixo_y(ordem["bomba_id"]),
+                             mode="markers", marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
+
+    def _hover(p, extra):
+        return [
+            f"<b>{rotulos.get(b, b)}</b><br>Serial {s or '—'} · {extra(b)}<br>{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
             + f"{d} dia(s) com abastecimento · {l:,.0f} L".replace(",", ".")
             for b, s, i, f, d, l in zip(p["bomba_id"], p["serial"], p["inicio"], p["fim_real"], p["dias"], p["litros"])
         ]
+
+    def _barras(p, nome, cor, hachura="", contorno=None, legenda=True, extra=None):
+        largura = ((p["fim"] - p["inicio"]).dt.total_seconds() * 1000).clip(lower=largura_min)
         fig.add_trace(go.Bar(
-            y=[rotulos.get(b, b) for b in p["bomba_id"]],
-            base=p["inicio"], x=(p["fim"] - p["inicio"]).dt.total_seconds() * 1000,
-            orientation="h", name=categoria,
-            marker=dict(color=cor, line=dict(width=0),
+            y=eixo_y(p["bomba_id"]), base=p["inicio"], x=largura, orientation="h", name=nome,
+            legendgroup=nome, showlegend=legenda,
+            marker=dict(color=cor, line=dict(width=3 if contorno else 0, color=contorno or cor),
                         pattern=dict(shape=hachura, fgcolor=COR_FUNDO_GRAFICO, size=6, solidity=0.25)),
-            hovertext=textos, hoverinfo="text", width=0.6,
+            hovertext=_hover(p, extra or (lambda b: nome)), hoverinfo="text", width=0.62,
         ))
+
+    atuais = periodos[periodos["categoria"] == "Serial instalado hoje"]
+    if tem_alocacao and not atuais.empty:
+        cores = cores_pagantes(resumo)
+        pagante_de = info["pagante_rotulo"].to_dict()
+
+        def _extra(b):
+            txt = f"pago hoje por {pagante_de.get(b) or 'Sem alocação CIGAM'}"
+            if alerta.get(b):
+                txt += f"<br>⚠ pagante tem conta própria no sistema: {info.at[b, 'pagante_outras_contas']}"
+            return txt
+
+        for pagante, cor in cores.items():
+            p = atuais[atuais["bomba_id"].map(lambda b: (pagante_de.get(b) or "Sem alocação CIGAM") == pagante)]
+            if p.empty:
+                continue
+            fora = p["bomba_id"].map(lambda b: bool(alerta.get(b)))
+            nome = _truncar(pagante, 60)
+            if (~fora).any():
+                _barras(p[~fora], nome, cor, hachura="." if pagante == "Sem alocação CIGAM" else "", extra=_extra)
+            if fora.any():
+                _barras(p[fora], nome, cor, contorno=COR_ALERTA, legenda=not (~fora).any(), extra=_extra)
+        if any(alerta.get(b) for b in atuais["bomba_id"]):
+            # entrada de legenda só pro contorno
+            fig.add_trace(go.Scatter(x=[None], y=[[None], [None]], mode="markers",
+                                     name="⚠ Pagante com conta própria no sistema", hoverinfo="skip",
+                                     marker=dict(symbol="square", size=12, color=COR_FUNDO_GRAFICO,
+                                                 line=dict(width=3, color=COR_ALERTA))))
+    elif not atuais.empty:
+        _barras(atuais, "Serial instalado hoje", COR_SERIAL_ATUAL)
+
+    for categoria, cor, hachura in [("Serial anterior", COR_SERIAL_ANTERIOR, ""),
+                                    ("Sem serial no abastecimento", COR_SEM_SERIAL, "/")]:
+        p = periodos[periodos["categoria"] == categoria]
+        if not p.empty:
+            _barras(p, categoria, cor, hachura=hachura)
+
     t = trocas[trocas["bomba_id"].isin(periodos["bomba_id"])]
     if not t.empty:
         fig.add_trace(go.Scatter(
-            x=t["data"], y=[rotulos.get(b, b) for b in t["bomba_id"]], mode="markers",
+            x=t["data"], y=eixo_y(t["bomba_id"]), mode="markers",
             name="Troca de serial",
             marker=dict(symbol="star", size=14, color=COR_FUNDO_GRAFICO, line=dict(width=2, color=COR_TEXTO_GRAFICO)),
             hovertext=[f"<b>Troca de serial</b><br>{rotulos.get(b, b)}<br>{d:%d/%m/%Y}<br>{a} → <b>{n}</b>"
@@ -596,14 +847,14 @@ def plotar_periodos(periodos, trocas, resumo, ano):
             hoverinfo="text",
         ))
 
-    _layout_base(fig, 130 + 30 * len(ordem))
+    _layout_base(fig, 150 + 30 * len(ordem))
     fig.update_layout(
         barmode="overlay", hovermode="closest",
         margin=dict(l=10, r=30, t=10, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
         xaxis=dict(type="date"),
-        yaxis=dict(categoryorder="array", categoryarray=[rotulos.get(b, b) for b in reversed(ordem)],
-                   automargin=True, showgrid=False),
+        yaxis=dict(autorange="reversed", automargin=True, showgrid=False, showdividers=True,
+                   dividercolor=COR_GRADE, dividerwidth=1),
     )
     if ano is not None:
         fig.update_xaxes(range=[f"{ano}-01-01", f"{ano}-12-31"])
@@ -694,6 +945,23 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     resumo = montar_resumo_bombas(cadastro, uso, por_serial, trocas, cliente_id)
     litros_sem_bomba = float(uso.loc[uso["bomba_id"].isna(), "litros"].sum())
 
+    # alocação CIGAM de hoje: sem acesso ou sem dado, a aba segue sem a cor
+    # por pagante em vez de quebrar
+    aviso_alocacao = None
+    ativas = resumo.loc[resumo["situacao"].isin(SITUACOES_ATIVAS), "bomba_id"].dropna()
+    if modo_demo:
+        alocacao = gerar_alocacao_demo()
+    elif ativas.empty:
+        alocacao = None
+    else:
+        try:
+            alocacao = carregar_alocacao_cigam(client_bq, project_id, base, cliente_id, tuple(sorted(ativas)))
+        except (Forbidden, NotFound, BadRequest) as e:
+            alocacao = None
+            aviso_alocacao = ("Sem a alocação CIGAM (quem paga cada bomba): " +
+                              str(getattr(e, "message", e))[:300])
+    resumo = anexar_alocacao(resumo, alocacao) if alocacao is not None else resumo
+
     # --- filtros (uma linha, valem pra tudo abaixo) ---
     anos = sorted(uso_b["data"].dt.year.unique().tolist()) if not uso_b.empty else []
     col_p, col_g, col_b = st.columns([1.2, 1.4, 4])
@@ -749,8 +1017,15 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     if not periodos.empty:
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
-        st.markdown(f"**Períodos de uso por bomba** · um segmento por serial; pausas de mais de "
-                    f"{DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer quebram o segmento")
+        st.markdown(f"**Períodos de uso por bomba**, agrupados por posto · um segmento por serial; pausas de "
+                    f"mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer quebram o segmento")
+        if "pagante_rotulo" in resumo:
+            st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
+                       "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
+            for linha in alertas_de_pagante(resumo):
+                st.warning(linha, icon="⚠️")
+        elif aviso_alocacao:
+            st.caption(aviso_alocacao)
         qtd_bombas_timeline = periodos["bomba_id"].nunique()
         if qtd_bombas_timeline > LIMITE_TIMELINE_COMPLETA and not st.toggle(
                 f"Mostrar as {qtd_bombas_timeline} bombas (por padrão, só as selecionadas no gráfico acima)",
@@ -765,12 +1040,19 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
         "canal": "Canal", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
+        "pagante_rotulo": "Pagante hoje (CIGAM)",
         "primeiro_abastecimento": "Primeiro abastecimento", "ultimo_abastecimento": "Último abastecimento",
         "dias_com_uso": "Dias com uso", "litros_total": "Volume total (L)",
         "media_por_dia_de_uso": "Média por dia de uso (L)", "trocas_serial": "Trocas de serial",
         "historico_seriais": "Seriais (período de uso)",
     }
+    if "pagante_rotulo" not in resumo:
+        del colunas["pagante_rotulo"]
     tabela = resumo[list(colunas)].rename(columns=colunas)
+    if "Pagante hoje (CIGAM)" in tabela:
+        tabela["Pagante hoje (CIGAM)"] = [
+            ("⚠ " if fora else "") + (p if isinstance(p, str) else "—")
+            for p, fora in zip(tabela["Pagante hoje (CIGAM)"], resumo["pagante_fora_do_grupo"])]
     tabela["Serial atual"] = tabela["Serial atual"].fillna("—")
     tabela["Volume total (L)"] = tabela["Volume total (L)"].round(0)
     st.dataframe(
