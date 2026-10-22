@@ -3,7 +3,7 @@
 #
 # Diferente das abas Cliente/Grupo (que partem do código CIGAM, ótica de
 # faturamento), aqui a busca é pelo cliente_id do sistema operacional
-# (sistema_<base>__cliente_table) — é ele o dono do posto/tanque/bomba e
+# (o cliente_id de silver.cadastro_bombas) — é ele o dono do posto/tanque/bomba e
 # dos abastecimentos. Mostra, a partir do DW:
 #   - todas as bombas que o cliente tem ou já teve abastecendo nos postos
 #     dele, e TODOS os seriais (equipamentos) que passaram por cada uma;
@@ -13,14 +13,20 @@
 #   - cada equipamento (serial): em quais bombas esteve, quando e quanto
 #     abasteceu.
 #
-# O serial vem do PRÓPRIO abastecimento (coluna `serial` de
-# sistema_<base>__abastecimento_table_internal, carregada com histórico
-# desde 2020, ~93–99% dos abastecimentos com bomba) — é o mesmo "Número
-# Serial da automação" do relatório "Auditoria de abastecimentos" do
-# sistema. Conferido contra esse relatório (16 bombas, jan–mar/2026): os
-# seriais batem, e as trocas caem nas datas de atualização do cadastro.
-# O cadastro (bomba_table/equipamento_table) continua sendo só o estado
-# ATUAL — é dele que sai o "serial instalado hoje".
+# Lê só da SILVER do DW, duas tabelas mantidas no dbt-cta:
+#   - silver.abastecimento_bomba_serial_dia: litros e nº de abastecimentos por
+#     base × dia × posto × bomba × SERIAL, já com a limpeza canônica de
+#     silver.abastecimentos_validos. O serial é o gravado em cada abastecimento
+#     (histórico desde 2020) — o mesmo "Número Serial da automação" do
+#     relatório "Auditoria de abastecimentos" do sistema. Conferido contra
+#     esse relatório (16 bombas, jan–mar/2026): os seriais batem, e as trocas
+#     caem nas datas de atualização do cadastro.
+#   - silver.cadastro_bombas: estado ATUAL de cada bomba (posto, cliente,
+#     equipamento) — é dele que sai o "serial instalado hoje" e o diretório
+#     de clientes da busca.
+# Antes a aba lia o bronze (sistema_<base>__*), incluindo a tabela de
+# abastecimento, a mais pesada do DW; o fato diário existe para isso não
+# acontecer (pedido do responsável pelo DW, 21/10/2026).
 # ============================================================================
 
 import concurrent.futures
@@ -29,11 +35,19 @@ import unicodedata
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from google.api_core.exceptions import Forbidden
+from google.api_core.exceptions import Forbidden, NotFound
 from google.cloud import bigquery
 
-# bases do sistema CTA no bronze (sufixo das tabelas sistema_<base>__*)
-BASES_SISTEMA = {"cta": "CTA", "ipc": "Ipiranga Connect", "l2p": "Link2Pump"}
+# bases do sistema CTA com histórico de uso no DW. O Link2Pump (l2p) está no
+# cadastro, mas não no fato diário (que segue silver.abastecimentos_validos,
+# só cta + ipc) — buscar um cliente de lá mostraria bombas sem nenhum uso.
+BASES_SISTEMA = {"cta": "CTA", "ipc": "Ipiranga Connect"}
+
+# tabelas que a aba lê — é a lista que a service account do app precisa
+# enxergar (roles/bigquery.dataViewer em nível de tabela)
+TABELA_USO = "silver.abastecimento_bomba_serial_dia"
+TABELA_CADASTRO = "silver.cadastro_bombas"
+TABELAS_LIDAS = [TABELA_USO, TABELA_CADASTRO]
 
 # Paleta categórica (passo escuro), validada contra o fundo do gráfico
 # (#26263A): CVD adjacente ΔE >= 8.4, visão normal >= 19.3. O verde (slot 6)
@@ -59,17 +73,11 @@ LIMITE_TIMELINE_COMPLETA = 25
 
 GRANULARIDADES = {"Dia": "D", "Semana": "W", "Mês": "M"}
 
-# tabelas do bronze que a aba lê, por base — é a lista que a service account
-# do app precisa enxergar (roles/bigquery.dataViewer), diferente das
-# cigam__* que as outras abas usam
-TABELAS_SISTEMA = ["cliente", "trr", "posto", "tanque", "bomba", "equipamento", "comboio_tanque", "abastecimento"]
 
-
-def _tabela(project_id: str, base: str, nome: str) -> str:
-    # base vem sempre de BASES_SISTEMA (nunca do usuário) — seguro no f-string
-    assert base in BASES_SISTEMA
-    sufixo = "abastecimento_table_internal" if nome == "abastecimento" else f"{nome}_table"
-    return f"`{project_id}.bronze.sistema_{base}__{sufixo}`"
+def _tabela(project_id: str, nome: str) -> str:
+    # nome vem sempre de TABELAS_LIDAS (nunca do usuário) — seguro no f-string
+    assert nome in TABELAS_LIDAS
+    return f"`{project_id}.{nome}`"
 
 
 def _normalizar_texto(texto) -> str:
@@ -78,67 +86,52 @@ def _normalizar_texto(texto) -> str:
 
 # --- 1. Dados (BigQuery) ---------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Carregando clientes do sistema (direto do BigQuery)...")
-def _carregar_clientes_base(_client, project_id: str, base: str) -> pd.DataFrame:
-    t = lambda nome: _tabela(project_id, base, nome)  # noqa: E731
+def carregar_clientes_sistema(_client, project_id: str) -> pd.DataFrame:
+    """Diretório de clientes do sistema, com a contagem de bombas cadastradas
+    hoje nos postos de cada um — só pra resolver a busca. Sai do cadastro de
+    bombas, então cliente sem nenhuma bomba cadastrada não aparece (e não
+    teria abastecimento por bomba pra mostrar)."""
     sql = f"""
     SELECT
-      '{base}' AS base,
-      CAST(c.cliente_id AS STRING) AS cliente_id,
-      c.nome AS cliente_nome,
-      REGEXP_REPLACE(IFNULL(CAST(c.cnpj AS STRING), ''), r'\\D', '') AS cnpj,
-      c.ativo AS cliente_ativo,
-      tr.nome AS trr_nome,
-      IFNULL(tr.sistema_interno, FALSE) AS trr_interno,
-      IFNULL(bb.qtd_bombas, 0) AS qtd_bombas,
-      IFNULL(bb.qtd_bombas_com_equipamento, 0) AS qtd_bombas_com_equipamento
-    FROM {t('cliente')} c
-    LEFT JOIN {t('trr')} tr ON tr.trr_id = c.trr_id
-    LEFT JOIN (
-      SELECT p.cliente_id, COUNT(*) AS qtd_bombas,
-             COUNTIF(b.equipamento_id IS NOT NULL) AS qtd_bombas_com_equipamento
-      FROM {t('posto')} p
-      JOIN {t('tanque')} tq ON tq.posto_id = p.posto_id
-      JOIN {t('bomba')} b ON b.tanque_id = tq.tanque_id
-      GROUP BY p.cliente_id
-    ) bb ON bb.cliente_id = c.cliente_id
+      base,
+      cliente_id,
+      ANY_VALUE(cliente_nome) AS cliente_nome,
+      REGEXP_REPLACE(IFNULL(ANY_VALUE(cliente_cnpj), ''), r'\\D', '') AS cnpj,
+      ANY_VALUE(trr_nome) AS trr_nome,
+      LOGICAL_OR(IFNULL(trr_sistema_interno, FALSE)) AS trr_interno,
+      COUNT(*) AS qtd_bombas,
+      COUNTIF(equipamento_id IS NOT NULL) AS qtd_bombas_com_equipamento
+    FROM {_tabela(project_id, TABELA_CADASTRO)}
+    WHERE base IN UNNEST(@bases) AND cliente_id IS NOT NULL
+    GROUP BY base, cliente_id
     """
-    df = _client.query(sql).to_dataframe(create_bqstorage_client=False)
+    df = _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
     df["_nome_norm"] = df["cliente_nome"].map(_normalizar_texto)
     return df
 
 
-def carregar_clientes_sistema(client, project_id: str):
-    """Diretório de clientes das bases do sistema, com contagem de bombas
-    cadastradas nos postos de cada um — só pra resolver a busca. Retorna
-    (diretorio, {base: erro}) — base sem permissão de leitura fica de fora
-    em vez de derrubar a aba."""
-    partes, sem_acesso = [], {}
-    for base in BASES_SISTEMA:
-        try:
-            partes.append(_carregar_clientes_base(client, project_id, base))
-        except Forbidden as e:
-            sem_acesso[base] = e
-    diretorio = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(
-        columns=["base", "cliente_id", "cliente_nome", "cnpj", "qtd_bombas", "_nome_norm"])
-    return diretorio, sem_acesso
-
-
-def _mostrar_falta_de_permissao(project_id: str, bases: list, erro: Exception):
-    """Erro 403 do BigQuery: a service account do app não lê as tabelas do
-    sistema. Lista exatamente o que precisa ser liberado."""
-    tabelas = "\n".join(f"- {_tabela(project_id, base, nome)}" for base in bases for nome in TABELAS_SISTEMA)
-    nomes_bases = ", ".join(BASES_SISTEMA[b] for b in bases)
+def _mostrar_falta_de_permissao(project_id: str, erro: Exception):
+    """Erro 403 do BigQuery: a service account do app não lê as tabelas da
+    aba. Lista exatamente o que precisa ser liberado."""
     st.error(
-        f"**Sem permissão de leitura nas tabelas do sistema ({nomes_bases}).** A service account "
-        "do app lê as tabelas `cigam__*` do dataset `bronze`, mas não as `sistema_*` que esta aba usa. "
-        "Quem administra o GCP precisa conceder **BigQuery Data Viewer** "
-        "(`roles/bigquery.dataViewer`) à service account do app nas tabelas abaixo "
-        "(ou no dataset `bronze` inteiro):",
+        "**Sem permissão de leitura nas tabelas desta aba.** Quem administra o GCP precisa conceder "
+        "**BigQuery Data Viewer** (`roles/bigquery.dataViewer`) à service account do app nas tabelas abaixo "
+        "(só nelas — a aba não lê o bronze):",
         icon="🔒",
     )
-    st.markdown(tabelas)
-    # sem expander aqui: a função também é chamada dentro de um (busca
-    # parcial), e o Streamlit não aceita expander aninhado
+    st.markdown("\n".join(f"- {_tabela(project_id, nome)}" for nome in TABELAS_LIDAS))
+    st.caption("Erro do BigQuery: " + str(getattr(erro, "message", erro))[:600])
+
+
+def _mostrar_tabela_inexistente(erro: Exception):
+    """Erro 404: a tabela ainda não foi construída no DW (modelo novo antes
+    do primeiro `dbt build` de produção)."""
+    st.warning(
+        "**As tabelas desta aba ainda não existem no DW.** O modelo "
+        f"`{TABELA_USO}` é criado pelo `dbt build` de produção do dbt-cta; "
+        "a aba passa a funcionar depois da primeira execução.",
+        icon="⏳",
+    )
     st.caption("Erro do BigQuery: " + str(getattr(erro, "message", erro))[:600])
 
 
@@ -152,61 +145,60 @@ def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str
     """
     Retorna (cadastro, uso) de um cliente do sistema:
       - uso: litros e nº de abastecimentos por bomba × dia × SERIAL, em
-        TODOS os postos do cliente (inclusive de bomba que hoje está em
-        outro cliente ou sem equipamento). Mesma limpeza canônica de
-        silver.abastecimentos_validos (removido=false, completo, volume>0,
-        data entre 2020-01-01 e hoje). bomba_id e serial nulos são mantidos
-        pra soma de litros fechar com a origem.
+        todos os postos do cliente (inclusive de bomba que hoje está em
+        outro cliente ou sem equipamento), do fato diário da silver — que
+        já aplica a limpeza canônica de silver.abastecimentos_validos.
+        bomba_id e serial nulos vêm mantidos, pra soma de litros fechar
+        com a origem.
       - cadastro: estado ATUAL de cada bomba (do cliente hoje + as que
         apareceram nos abastecimentos), com o serial instalado hoje.
-    A tabela de abastecimento é particionada por data e clusterizada por
-    posto_id — filtrar pelos postos do cliente é o que mantém a consulta
-    barata (o maior cliente da base cta custa centavos).
+    O fato é clusterizado por base, posto_id, bomba_id — filtrar pelos
+    postos do cliente é o que mantém a consulta barata.
     """
-    t = lambda nome: _tabela(project_id, base, nome)  # noqa: E731
-    p_cliente = bigquery.ScalarQueryParameter("cliente_id", "INT64", int(cliente_id))
+    t_cadastro, t_uso = _tabela(project_id, TABELA_CADASTRO), _tabela(project_id, TABELA_USO)
+    p_base = bigquery.ScalarQueryParameter("base", "STRING", base)
+    p_cliente = bigquery.ScalarQueryParameter("cliente_id", "STRING", str(cliente_id))
 
-    postos = _query(_client, f"SELECT posto_id FROM {t('posto')} WHERE cliente_id = @cliente_id", [p_cliente])
+    # postos do cliente hoje — pelo cadastro de bombas, então posto sem
+    # nenhuma bomba cadastrada hoje fica de fora (e o uso dele também)
+    postos = _query(_client, f"""
+    SELECT DISTINCT posto_id FROM {t_cadastro} WHERE base = @base AND cliente_id = @cliente_id
+    """, [p_base, p_cliente])
     ids_postos = [int(p) for p in postos["posto_id"].dropna()]
 
     if ids_postos:
+        # o grão do fato inclui o posto: bomba que mudou de posto do mesmo
+        # cliente no dia soma as duas linhas
         uso = _query(_client, f"""
         SELECT CAST(bomba_id AS STRING) AS bomba_id, data, CAST(serial AS STRING) AS serial,
-               SUM(volume) AS litros, COUNT(*) AS qtd_abastecimentos
-        FROM {t('abastecimento')}
-        WHERE posto_id IN UNNEST(@postos)
-          AND data BETWEEN DATE '2020-01-01' AND CURRENT_DATE()
-          AND removido = FALSE AND completo = TRUE AND volume > 0
+               SUM(litros) AS litros, SUM(qtd_abastecimentos) AS qtd_abastecimentos
+        FROM {t_uso}
+        WHERE base = @base AND posto_id IN UNNEST(@postos)
         GROUP BY 1, 2, 3
-        """, [bigquery.ArrayQueryParameter("postos", "INT64", ids_postos)])
+        """, [p_base, bigquery.ArrayQueryParameter("postos", "INT64", ids_postos)])
     else:
         uso = pd.DataFrame(columns=["bomba_id", "data", "serial", "litros", "qtd_abastecimentos"])
 
-    ids_bombas = [int(b) for b in uso["bomba_id"].dropna().unique()]
-    sql_cadastro = f"""
+    ids_bombas = [str(b) for b in uso["bomba_id"].dropna().unique()]
+    cadastro = _query(_client, f"""
     SELECT
-      CAST(b.bomba_id AS STRING) AS bomba_id,
-      b.nome AS bomba_nome,
-      b.canal,
-      b.ativo AS bomba_ativa,
-      b.dt_last_update AS bomba_atualizada_em,
-      CAST(b.equipamento_id AS STRING) AS equipamento_id,
-      CAST(e.equipamento AS STRING) AS serial_equipamento,
-      e.descricao AS equipamento_descricao,
-      t.nome AS tanque_nome,
-      EXISTS (SELECT 1 FROM {t('comboio_tanque')} ct WHERE ct.tanque_id = t.tanque_id) AS tanque_movel,
-      p.nome AS posto_nome,
-      p.cidade AS posto_cidade,
-      p.uf AS posto_uf,
-      CAST(p.cliente_id AS STRING) AS cliente_id_atual
-    FROM {t('bomba')} b
-    LEFT JOIN {t('tanque')} t ON t.tanque_id = b.tanque_id
-    LEFT JOIN {t('posto')} p ON p.posto_id = t.posto_id
-    LEFT JOIN {t('equipamento')} e ON e.equipamento_id = b.equipamento_id
-    WHERE p.cliente_id = @cliente_id OR b.bomba_id IN UNNEST(@bombas)
-    """
-    cadastro = _query(_client, sql_cadastro, [
-        p_cliente, bigquery.ArrayQueryParameter("bombas", "INT64", ids_bombas)])
+      bomba_id,
+      bomba_nome,
+      canal,
+      bomba_ativa,
+      bomba_ultima_atualizacao AS bomba_atualizada_em,
+      equipamento_id,
+      CAST(serial_equipamento AS STRING) AS serial_equipamento,
+      equipamento_descricao,
+      tanque_nome,
+      tanque_mobile AS tanque_movel,
+      posto_nome,
+      posto_cidade,
+      posto_uf,
+      cliente_id AS cliente_id_atual
+    FROM {t_cadastro}
+    WHERE base = @base AND (cliente_id = @cliente_id OR bomba_id IN UNNEST(@bombas))
+    """, [p_base, p_cliente, bigquery.ArrayQueryParameter("bombas", "STRING", ids_bombas)])
 
     uso["data"] = pd.to_datetime(uso["data"])
     uso["litros"] = pd.to_numeric(uso["litros"], errors="coerce").astype(float)
@@ -222,9 +214,9 @@ def gerar_dados_demo():
 
     diretorio = pd.DataFrame([
         {"base": "cta", "cliente_id": "900101", "cliente_nome": "TRANSPORTE DEMO LTDA", "cnpj": "12345678000100",
-         "cliente_ativo": True, "trr_nome": "TRR DEMO", "trr_interno": False, "qtd_bombas": 6, "qtd_bombas_com_equipamento": 5},
-        {"base": "l2p", "cliente_id": "900102", "cliente_nome": "MINERAÇÃO DEMO S.A.", "cnpj": "98765432000155",
-         "cliente_ativo": True, "trr_nome": "TRR DEMO", "trr_interno": False, "qtd_bombas": 0, "qtd_bombas_com_equipamento": 0},
+         "trr_nome": "TRR DEMO", "trr_interno": False, "qtd_bombas": 6, "qtd_bombas_com_equipamento": 5},
+        {"base": "ipc", "cliente_id": "900102", "cliente_nome": "MINERAÇÃO DEMO S.A.", "cnpj": "98765432000155",
+         "trr_nome": "TRR DEMO", "trr_interno": False, "qtd_bombas": 1, "qtd_bombas_com_equipamento": 0},
     ])
     diretorio["_nome_norm"] = diretorio["cliente_nome"].map(_normalizar_texto)
 
@@ -646,16 +638,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     if modo_demo:
         diretorio, parque_demo = gerar_dados_demo()
     else:
-        diretorio, sem_acesso = carregar_clientes_sistema(client_bq, project_id)
-        if len(sem_acesso) == len(BASES_SISTEMA):
-            _mostrar_falta_de_permissao(project_id, list(sem_acesso), next(iter(sem_acesso.values())))
+        try:
+            diretorio = carregar_clientes_sistema(client_bq, project_id)
+        except Forbidden as e:
+            _mostrar_falta_de_permissao(project_id, e)
             return
-        if sem_acesso:
-            st.warning("Busca feita só nas bases " + ", ".join(
-                BASES_SISTEMA[b] for b in BASES_SISTEMA if b not in sem_acesso)
-                + " — sem permissão de leitura em " + ", ".join(BASES_SISTEMA[b] for b in sem_acesso) + ".")
-            with st.expander("O que liberar pra incluir as outras bases"):
-                _mostrar_falta_de_permissao(project_id, list(sem_acesso), next(iter(sem_acesso.values())))
 
     candidatos = buscar_clientes_sistema(diretorio, termo)
     if candidatos.empty:
@@ -684,7 +671,10 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         try:
             cadastro, uso = carregar_parque_cliente(client_bq, project_id, base, cliente_id)
         except Forbidden as e:
-            _mostrar_falta_de_permissao(project_id, [base], e)
+            _mostrar_falta_de_permissao(project_id, e)
+            return
+        except NotFound as e:
+            _mostrar_tabela_inexistente(e)
             return
 
     st.subheader(escolhido["cliente_nome"], anchor=False)
@@ -810,16 +800,17 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         )
 
     if litros_sem_bomba > 0:
-        st.caption(f"Além das bombas acima, {_fmt_litros(litros_sem_bomba)} foram abastecidos nos postos do "
-                   "cliente sem bomba identificada (integração externa / lançamento manual) — entram no "
-                   "volume total da origem, mas não em nenhuma bomba.")
+        st.caption(f"Além das bombas acima, {_fmt_litros(litros_sem_bomba)} foram abastecidos sem bomba "
+                   "identificada (integração externa / lançamento manual) nos postos do cliente que têm bomba "
+                   "cadastrada. Posto sem nenhuma bomba cadastrada não entra nesta conta.")
 
     with st.expander("Como ler e até onde o dado vai"):
         sem_serial = float(uso_b.loc[uso_b["serial"].isna(), "litros"].sum()) if "serial" in uso_b else 0.0
         st.markdown(f"""
-- **Fonte:** abastecimentos do sistema ({BASES_SISTEMA.get(base, base)}) nos postos **atuais** do cliente, com a
-  mesma limpeza de `silver.abastecimentos_validos` (não removido, completo, volume > 0, de 2020 até hoje).
-  Bomba que abasteceu num posto que hoje não é mais do cliente não aparece.
+- **Fonte:** `{TABELA_USO}` (DW), abastecimentos do sistema ({BASES_SISTEMA.get(base, base)}) somados por
+  dia, bomba e serial, com a limpeza de `silver.abastecimentos_validos` (não removido, completo, volume > 0, de
+  2020 até hoje), nos postos **atuais** do cliente que têm bomba cadastrada. Bomba que abasteceu num posto que
+  hoje não é mais do cliente não aparece. O fato é atualizado pela carga diária do DW. Link2Pump não está no fato.
 - **Serial:** é o gravado em **cada abastecimento** (o "Número Serial da automação" do relatório de
   abastecimentos do sistema). "Serial instalado hoje" vem do cadastro atual da bomba.
 - **★ Troca de serial:** primeiro dia em que um serial novo abasteceu na bomba. Um serial que volta pra uma
