@@ -409,24 +409,19 @@ LITROS_MIN_PASSAGEM = 50.0
 # Trecho que só encosta no anterior é transferência: Queimados → Belford Roxo
 # Novo (serial 16994) trocou no mesmo dia, 24/04/2025
 DIAS_MIN_SOBREPOSICAO_CANAIS = 7
-TIPO_DENTRO = "Mudou de bomba no cliente"
-TIPO_ENTROU = "Veio de outro cliente"
-TIPO_SAIU = "Foi para outro cliente"
+TIPO_DENTRO = "Entre bombas do cliente"
+TIPO_ENTROU = "Entrou de outro cliente"
+TIPO_SAIU = "Saiu para outro cliente"
 
 
-def _rotulo_local(linha, base_cliente: str) -> str:
-    nome = linha.get("bomba_nome")
-    nome = nome if isinstance(nome, str) and nome.strip() else "bomba fora do cadastro"
-    cliente = linha.get("cliente_nome")
-    cliente = cliente if isinstance(cliente, str) and cliente.strip() else "cliente desconhecido"
-    base = "" if linha["base"] == base_cliente else f" · base {BASES_SISTEMA.get(linha['base'], linha['base'])}"
-    return f"{_truncar(nome, 40)} (#{linha['bomba_id']}) · {_truncar(cliente, 30)}{base}"
-
-
-def _pagante_curto(codigo, nome) -> str:
-    if not isinstance(codigo, str) or not codigo:
-        return "sem alocação hoje"
-    return f"{_truncar(nome or 'sem nome no CIGAM', 28)} (CIGAM {codigo})"
+def _rotulo_local(linha, base_cliente: str, cliente_id: str) -> str:
+    """Bomba do próprio cliente: só a bomba. Fora dele: bomba · cliente
+    (a base vai em coluna própria)."""
+    nome = _truncar(linha.get("bomba_nome"), 40) or "bomba fora do cadastro"
+    if linha["base"] == base_cliente and str(linha.get("cliente_id")) == str(cliente_id):
+        return f"{nome} (#{linha['bomba_id']})"
+    cliente = _truncar(linha.get("cliente_nome"), 30) or "cliente desconhecido"
+    return f"{nome} (#{linha['bomba_id']}) · {cliente}"
 
 
 def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -> tuple:
@@ -437,14 +432,12 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
         mesmo equipamento contam como um só);
       - transferência = a passagem de uma instalação para a seguinte.
     Devolve (eventos, percursos): `eventos` só com as transferências que
-    entram, saem ou circulam DENTRO do cliente, com o tipo, os dias parado
-    entre a saída e a reinstalação, o pagante de hoje de cada ponta e os
-    alertas; `percursos` com o caminho completo de cada serial em texto.
-    O pagante é o da alocação de HOJE das duas bombas — a alocação não guarda
-    histórico, então "pagante diferente" quer dizer que hoje as duas bombas
-    estão com pagantes diferentes, não que a cobrança mudou naquela data.
+    entram, saem ou circulam DENTRO do cliente — o PERÍODO da mudança
+    (último abastecimento na origem → primeiro no destino), o tipo, as duas
+    pontas e a base de cada uma; `percursos` com o caminho completo de cada
+    serial em texto.
     """
-    colunas = ["serial", "data", "tipo", "de", "para", "dias_parado", "pagante_de", "pagante_para", "alertas"]
+    colunas = ["serial", "data", "saida", "periodo", "tipo", "de", "base_de", "para", "base_para", "entre_bases"]
     if percurso is None or percurso.empty:
         return pd.DataFrame(columns=colunas), {}
     p = percurso[percurso["litros"] >= LITROS_MIN_PASSAGEM].copy()
@@ -481,33 +474,30 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
             a, b = instalacoes[i - 1], instalacoes[i]
             if not (do_cliente[i - 1] or do_cliente[i]):
                 continue
-            # ponta "principal" de cada instalação: a bomba que mais abasteceu
-            la = max(a["linhas"], key=lambda r: r["litros"])
+            # ponta "principal" do destino (a bomba que mais abasteceu) — é
+            # nela que a estrela de troca da linha do tempo mostra a origem
             lb = max(b["linhas"], key=lambda r: r["litros"])
             tipo = TIPO_DENTRO if do_cliente[i - 1] and do_cliente[i] else (TIPO_ENTROU if do_cliente[i] else TIPO_SAIU)
-            alertas = []
-            if a["chave"][0] != b["chave"][0]:
-                alertas.append(f"entre bases ({BASES_SISTEMA.get(a['chave'][0], a['chave'][0])} → "
-                               f"{BASES_SISTEMA.get(b['chave'][0], b['chave'][0])})")
-            if tipo != TIPO_DENTRO:
-                alertas.append("entre clientes")
-            pag_a, pag_b = la.get("pagante_codigo"), lb.get("pagante_codigo")
-            if isinstance(pag_a, str) and pag_a and isinstance(pag_b, str) and pag_b and pag_a != pag_b:
-                alertas.append("pagante diferente hoje")
             dias_parado = (b["inicio"] - a["fim"]).days
             if dias_parado < 0:
                 # o serial abasteceu nos dois lugares no mesmo período (ex.:
-                # 1 dia em Belford Roxo 1 no meio do uso em Nova Iguaçu)
-                alertas.append("uso simultâneo nos dois lugares")
-                dias_parado = None
+                # 1 dia em Belford Roxo 1 no meio do uso em Nova Iguaçu): a
+                # "saída" vem depois da chegada, então mostra só a chegada
+                periodo = (f"{b['inicio']:%d/%m/%Y} (uso simultâneo — seguiu abastecendo na origem "
+                           f"até {a['fim']:%d/%m/%Y})")
+            else:
+                parado = "no mesmo dia" if dias_parado == 0 else \
+                    f"{dias_parado} {'dia' if dias_parado == 1 else 'dias'} parado"
+                periodo = f"{a['fim']:%d/%m/%Y} → {b['inicio']:%d/%m/%Y} ({parado})"
             eventos.append({
-                "serial": serial, "data": b["inicio"], "tipo": tipo,
-                "de": " + ".join(_rotulo_local(r, base) for r in a["linhas"]),
-                "para": " + ".join(_rotulo_local(r, base) for r in b["linhas"]),
-                "dias_parado": dias_parado,
-                "pagante_de": _pagante_curto(pag_a, la.get("pagante_nome")),
-                "pagante_para": _pagante_curto(pag_b, lb.get("pagante_nome")),
-                "alertas": ", ".join(alertas),
+                "serial": serial, "data": b["inicio"], "saida": a["fim"],
+                "periodo": periodo,
+                "tipo": tipo,
+                "de": " + ".join(_rotulo_local(r, base, cliente_id) for r in a["linhas"]),
+                "base_de": BASES_SISTEMA.get(a["chave"][0], a["chave"][0]),
+                "para": " + ".join(_rotulo_local(r, base, cliente_id) for r in b["linhas"]),
+                "base_para": BASES_SISTEMA.get(b["chave"][0], b["chave"][0]),
+                "entre_bases": a["chave"][0] != b["chave"][0],
                 "_bomba_destino": lb["bomba_id"],
             })
     ev = pd.DataFrame(eventos)
@@ -517,10 +507,9 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
 
 
 def renderizar_transferencias(transferencias: pd.DataFrame, aviso: str = None):
-    """Seção de transferências: quando um serial sai de uma bomba e é
-    reinstalado noutra — no cliente, vindo de outro cliente, indo pra outro
-    cliente ou entre bases. É o rastro das transferências que o processo não
-    documenta (troca de pagante sem registro, equipamento reaproveitado)."""
+    """Seção de transferências: QUANDO cada serial saiu de uma bomba e voltou a
+    abastecer noutra — no cliente, vindo de outro cliente ou indo pra outro —
+    e em que base. É o rastro das transferências que o processo não documenta."""
     st.markdown("**Transferências de equipamento** · quando um serial sai de uma bomba e volta a abastecer em outra")
     if aviso:
         st.caption(aviso)
@@ -528,24 +517,24 @@ def renderizar_transferencias(transferencias: pd.DataFrame, aviso: str = None):
         st.caption("Nenhum serial deste cliente passou por outra bomba, cliente ou base.")
         return
     t = transferencias
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Dentro do cliente", int((t["tipo"] == TIPO_DENTRO).sum()))
-    c2.metric("Vieram de outro cliente", int((t["tipo"] == TIPO_ENTROU).sum()))
-    c3.metric("Foram para outro cliente", int((t["tipo"] == TIPO_SAIU).sum()))
-    c4.metric("Entre bases", int(t["alertas"].str.contains("entre bases").sum()))
-    c5.metric("Pagante diferente hoje", int(t["alertas"].str.contains("pagante diferente").sum()),
-              help="As duas bombas estão hoje com pagantes diferentes na alocação CIGAM. A alocação não guarda "
-                   "histórico: não dá pra dizer quem pagava na data da transferência.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Entre bombas do cliente", int((t["tipo"] == TIPO_DENTRO).sum()))
+    c2.metric("Entraram de outro cliente", int((t["tipo"] == TIPO_ENTROU).sum()))
+    c3.metric("Saíram para outro cliente", int((t["tipo"] == TIPO_SAIU).sum()))
+    c4.metric("Entre bases", int(t["entre_bases"].sum()))
+    # base numa coluna só, logo depois do movimento: "CTA" quando não muda,
+    # "CTA → Ipiranga Connect" quando muda (com a origem e o destino a tabela
+    # fica larga e a base de destino ia pra fora da tela)
+    bases = [o if o == d else f"{o} → {d}" for o, d in zip(t["base_de"], t["base_para"])]
     st.dataframe(
-        t[["data", "serial", "tipo", "alertas", "de", "para", "dias_parado", "pagante_de", "pagante_para"]].rename(columns={
-            "data": "Reinstalado em", "serial": "Serial", "tipo": "Tipo", "de": "Saiu de", "para": "Foi para",
-            "dias_parado": "Dias parado", "pagante_de": "Pagante hoje (origem)",
-            "pagante_para": "Pagante hoje (destino)", "alertas": "Sinais"}),
+        t.assign(bases=bases)[["periodo", "serial", "tipo", "bases", "de", "para"]].rename(columns={
+            "periodo": "Período da mudança (saída → reinstalação)", "serial": "Serial", "tipo": "Movimento",
+            "bases": "Base", "de": "Saiu de", "para": "Foi para"}),
         use_container_width=True, hide_index=True,
-        column_config={"Reinstalado em": st.column_config.DateColumn(format="DD/MM/YYYY")},
     )
-    st.caption("A data é o primeiro abastecimento do serial no destino; \"dias parado\" conta do último abastecimento "
-               "na origem até ele. Passagem de menos de 50 L num lugar é tratada como teste e fica de fora. "
+    st.caption("Saída = último abastecimento do serial na origem; reinstalação = primeiro abastecimento no destino. "
+               "Passagem de menos de 50 L num lugar é tratada como teste e fica de fora. O percurso completo de cada "
+               "serial, inclusive por outras bases antes de chegar ao cliente, está na tabela de equipamentos acima. "
                "Link2Pump não está no fato diário — passagem por lá não aparece.")
 
 
