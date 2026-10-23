@@ -1318,7 +1318,9 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
     fig.update_layout(
         barmode="overlay", hovermode="closest",
         margin=dict(l=10, r=30, t=10, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
+        # legenda só explica as cores; quem filtra é o "Mostrar na linha do tempo"
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0,
+                    itemclick=False, itemdoubleclick=False),
         xaxis=dict(type="date"),
         yaxis=dict(autorange="reversed", automargin=True, showgrid=False, showdividers=True,
                    dividercolor=COR_GRADE, dividerwidth=1),
@@ -1521,13 +1523,24 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
                 st.warning(linha, icon="⚠️")
         elif aviso_alocacao:
             st.caption(aviso_alocacao)
+        # filtro de grupo (pagante / retiradas): esconde as LINHAS das bombas.
+        # Clicar na legenda do Plotly só some com as barras e deixa a linha
+        # vazia no eixo, por isso o clique na legenda fica desligado
+        ordem_grupos = ordem_timeline(periodos, resumo)
+        grupos_disponiveis = list(dict.fromkeys(ordem_grupos["grupo"])) if not ordem_grupos.empty else []
+        if len(grupos_disponiveis) > 1:
+            grupos_vistos = st.pills(
+                "Mostrar na linha do tempo", grupos_disponiveis, selection_mode="multi",
+                default=grupos_disponiveis, key=f"eq_grupos_{base}_{cliente_id}_{periodo}")
+            bombas_vistas = set(ordem_grupos.loc[ordem_grupos["grupo"].isin(grupos_vistos or []), "bomba_id"])
+            periodos = periodos[periodos["bomba_id"].isin(bombas_vistas)]
         qtd_bombas_timeline = periodos["bomba_id"].nunique()
         if qtd_bombas_timeline > LIMITE_TIMELINE_COMPLETA and not st.toggle(
                 f"Mostrar as {qtd_bombas_timeline} bombas (por padrão, só as selecionadas no gráfico acima)",
                 key=f"eq_timeline_todas_{base}_{cliente_id}"):
             periodos = periodos[periodos["bomba_id"].isin(selecionadas)]
         if periodos.empty:
-            st.caption("Nenhuma bomba abasteceu no período.")
+            st.caption("Nenhuma bomba abasteceu no período ou nos grupos escolhidos.")
         else:
             st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens),
                             use_container_width=True)
