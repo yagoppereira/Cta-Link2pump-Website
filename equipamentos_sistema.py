@@ -30,6 +30,7 @@
 # ============================================================================
 
 import concurrent.futures
+import re
 import unicodedata
 
 import pandas as pd
@@ -94,6 +95,15 @@ def _normalizar_texto(texto) -> str:
     return unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode().upper().strip()
 
 
+def _norm_busca(texto) -> str:
+    """Nome pra comparar na busca: sem acento, maiúsculo, pontuação vira
+    espaço — "FORCA AMBIENTAL LTDA." (CIGAM) e "Força Ambiental" (sistema)
+    ficam comparáveis."""
+    if texto is None or (isinstance(texto, float) and pd.isna(texto)):
+        return ""
+    return re.sub(r"[^A-Z0-9]+", " ", _normalizar_texto(texto)).strip()
+
+
 # --- 1. Dados (BigQuery) ---------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Carregando clientes do sistema (direto do BigQuery)...")
 def carregar_clientes_sistema(_client, project_id: str) -> pd.DataFrame:
@@ -116,7 +126,63 @@ def carregar_clientes_sistema(_client, project_id: str) -> pd.DataFrame:
     GROUP BY base, cliente_id
     """
     df = _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
-    df["_nome_norm"] = df["cliente_nome"].map(_normalizar_texto)
+    df["_nome_norm"] = df["cliente_nome"].map(_norm_busca)
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner="Carregando a ponte CIGAM ↔ sistema (direto do BigQuery)...")
+def carregar_chaves_busca(_client, project_id: str) -> pd.DataFrame:
+    """
+    Tudo que leva a um cliente do sistema além do nome/id/CNPJ dele, uma
+    linha por (base, cliente_id, tipo, chave) — é a ponte que deixa o
+    financeiro buscar com o que ele tem na mão:
+      - 'cigam': empresa do CIGAM que PAGA ou é LOCAL de bomba do cliente hoje
+        (gold.bombas_alocadas), com código, nome, fantasia e CNPJ do CIGAM;
+      - 'cigam_cnpj': empresa do CIGAM com o MESMO CNPJ do cliente no
+        sistema — liga mesmo sem alocação;
+      - 'bomba' e 'serial': bombas cadastradas hoje no cliente e o serial
+        do equipamento instalado nelas.
+    """
+    t_cad = _tabela(project_id, TABELA_CADASTRO)
+    t_emp = _tabela(project_id, TABELA_EMPRESAS_CIGAM)
+    sql = f"""
+    WITH emp AS (
+      SELECT CAST(codigo AS STRING) AS codigo, ANY_VALUE(nomeCompleto) AS nome, ANY_VALUE(fantasia) AS fantasia,
+             ANY_VALUE(REGEXP_REPLACE(CAST(cnpjCpf AS STRING), r'\\D', '')) AS cnpj
+      FROM {t_emp} GROUP BY 1
+    ),
+    aloc AS (
+      SELECT a.base, CAST(a.cliente_id AS STRING) AS cliente_id, p.papel, p.codigo, COUNT(*) AS bombas
+      FROM {_tabela(project_id, TABELA_ALOCACAO)} a,
+        UNNEST([STRUCT('pagante' AS papel, CAST(a.cliente_cigam_pagante AS STRING) AS codigo),
+                STRUCT('local' AS papel, CAST(a.cliente_cigam_local AS STRING) AS codigo)]) p
+      WHERE a.base IN UNNEST(@bases) AND p.codigo IS NOT NULL
+      GROUP BY 1, 2, 3, 4
+    ),
+    cad AS (
+      SELECT base, cliente_id, bomba_id, CAST(serial_equipamento AS STRING) AS serial,
+             REGEXP_REPLACE(IFNULL(cliente_cnpj, ''), r'\\D', '') AS cnpj
+      FROM {t_cad}
+      WHERE base IN UNNEST(@bases) AND cliente_id IS NOT NULL
+    )
+    SELECT a.base, a.cliente_id, 'cigam' AS tipo, a.codigo AS chave, a.papel, a.bombas,
+           e.nome, e.fantasia, e.cnpj
+    FROM aloc a LEFT JOIN emp e USING (codigo)
+    UNION ALL
+    SELECT DISTINCT c.base, c.cliente_id, 'cigam_cnpj', e.codigo, 'mesmo CNPJ', CAST(NULL AS INT64), e.nome, e.fantasia, e.cnpj
+    FROM cad c JOIN emp e ON e.cnpj = c.cnpj
+    WHERE LENGTH(c.cnpj) = 14 AND c.cnpj NOT LIKE '00000000%'
+    UNION ALL
+    SELECT base, cliente_id, 'bomba', bomba_id, CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING) FROM cad
+    UNION ALL
+    SELECT DISTINCT base, cliente_id, 'serial', serial, CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING)
+    FROM cad WHERE serial IS NOT NULL
+    """
+    df = _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
+    df["_nome_norm"] = df["nome"].map(_norm_busca)
+    df["_fantasia_norm"] = df["fantasia"].map(_norm_busca)
+    df["_codigo_num"] = pd.to_numeric(df["chave"].where(df["tipo"].isin(["cigam", "cigam_cnpj"])),
+                                      errors="coerce").astype("Int64")
     return df
 
 
@@ -330,7 +396,7 @@ def gerar_dados_demo():
         {"base": "ipc", "cliente_id": "900102", "cliente_nome": "MINERAÇÃO DEMO S.A.", "cnpj": "98765432000155",
          "trr_nome": "TRR DEMO", "trr_interno": False, "qtd_bombas": 1, "qtd_bombas_com_equipamento": 0},
     ])
-    diretorio["_nome_norm"] = diretorio["cliente_nome"].map(_normalizar_texto)
+    diretorio["_nome_norm"] = diretorio["cliente_nome"].map(_norm_busca)
 
     base_bomba = {"bomba_ativa": True, "bomba_atualizada_em": pd.Timestamp("2025-03-11"), "posto_cidade": "Cidade Exemplo",
                   "posto_uf": "PR", "cliente_id_atual": "900101", "equipamento_descricao": None}
@@ -396,6 +462,25 @@ def gerar_dados_demo():
     return diretorio, (cadastro, uso)
 
 
+def gerar_chaves_demo() -> pd.DataFrame:
+    """Ponte CIGAM ↔ sistema fictícia, no formato de carregar_chaves_busca."""
+    linhas = [
+        ("cta", "900101", "cigam", "000101", "pagante", 3, "TRANSPORTE DEMO LTDA", "TRANSDEMO", "12345678000100"),
+        ("cta", "900101", "cigam", "000101", "local", 5, "TRANSPORTE DEMO LTDA", "TRANSDEMO", "12345678000100"),
+        ("cta", "900101", "cigam", "000202", "pagante", 1, "LOGÍSTICA DEMO S.A.", None, "22333444000155"),
+        ("cta", "900101", "cigam", "000303", "pagante", 1, "DISTRIBUIDORA DEMO DE PETRÓLEO LTDA", None, "55666777000188"),
+        ("ipc", "900102", "cigam_cnpj", "000404", "mesmo CNPJ", None, "MINERACAO DEMO S/A", None, "98765432000155"),
+    ]
+    linhas += [("cta", "900101", "bomba", b, None, None, None, None, None) for b in ["5001", "5002", "5003", "5004", "5005", "5006"]]
+    linhas += [("cta", "900101", "serial", s, None, None, None, None, None) for s in ["4410071", "4410188", "4410293", "4410297"]]
+    df = pd.DataFrame(linhas, columns=["base", "cliente_id", "tipo", "chave", "papel", "bombas", "nome", "fantasia", "cnpj"])
+    df["_nome_norm"] = df["nome"].map(_norm_busca)
+    df["_fantasia_norm"] = df["fantasia"].map(_norm_busca)
+    df["_codigo_num"] = pd.to_numeric(df["chave"].where(df["tipo"].isin(["cigam", "cigam_cnpj"])),
+                                      errors="coerce").astype("Int64")
+    return df
+
+
 def gerar_alocacao_demo() -> pd.DataFrame:
     """Alocação CIGAM fictícia, no formato de carregar_alocacao_cigam: o
     próprio cliente paga a maior parte, uma empresa do grupo sem conta no
@@ -414,21 +499,96 @@ def gerar_alocacao_demo() -> pd.DataFrame:
 
 
 # --- 2. Busca --------------------------------------------------------------
-def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str) -> pd.DataFrame:
-    """cliente_id exato, CNPJ/CPF (11 ou 14 dígitos) ou parte do nome (sem
-    acento/caixa). Devolve TODOS os candidatos — quem escolhe entre
-    homônimos é o usuário, nunca a busca."""
+def _casa_inicio_de_palavra(serie: pd.Series, termo_norm: str) -> pd.Series:
+    """O termo casa só no INÍCIO de uma palavra: "ORIZON" acha "ORIZON
+    SOROCABA", mas não "HORIZONTE" (mesma regra da busca de grupo)."""
+    return serie.str.contains(r"(?<![A-Z0-9])" + re.escape(termo_norm), regex=True, na=False)
+
+
+def _fmt_cigam(linha) -> str:
+    nome = linha["nome"] if isinstance(linha["nome"], str) and linha["nome"] else "sem nome no CIGAM"
+    return f"CIGAM {linha['chave']} {nome}"
+
+
+def _motivo_chave(linha) -> tuple:
+    """(prioridade, texto) do porquê de uma chave da ponte ter casado —
+    prioridade menor aparece primeiro na lista de candidatos."""
+    tipo = linha["tipo"]
+    if tipo == "bomba":
+        return 0, f"bomba #{linha['chave']}"
+    if tipo == "serial":
+        return 0, f"serial {linha['chave']} instalado aqui"
+    if tipo == "cigam_cnpj":
+        return 1, f"{_fmt_cigam(linha)} (mesmo CNPJ)"
+    papel = "paga" if linha["papel"] == "pagante" else "é local de"
+    return (2 if linha["papel"] == "pagante" else 3), f"{_fmt_cigam(linha)} {papel} {int(linha['bombas'])} bomba(s)"
+
+
+def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Acha o cliente do SISTEMA a partir do que o financeiro tiver na mão:
+      - nome no CIGAM ou no sistema (início de palavra, sem acento/caixa/pontuação);
+      - código CIGAM ("580" ou "000580") de quem paga ou é local das bombas;
+      - CNPJ/CPF completo do cliente no sistema ou da empresa no CIGAM, ou só
+        a raiz do CNPJ (8 dígitos);
+      - cliente_id do sistema, nº da bomba ou serial do equipamento.
+    Devolve TODOS os candidatos, com a coluna `_motivo` dizendo por que cada
+    um apareceu — quem escolhe entre eles é o usuário, nunca a busca. Um
+    número pode ser várias coisas ao mesmo tempo (id, bomba, serial,
+    código CIGAM): entram todas.
+    """
     termo = str(termo).strip()
     digitos = "".join(ch for ch in termo if ch.isdigit())
-    mascara = pd.Series(False, index=diretorio.index)
-    if digitos and digitos == termo.replace(".", "").replace("/", "").replace("-", ""):
-        mascara |= diretorio["cliente_id"] == digitos
+    so_numero = bool(digitos) and re.fullmatch(r"[\d.\-/\s]+", termo) is not None
+    termo_norm = _norm_busca(termo)
+    motivos = {}  # (base, cliente_id) -> [(prioridade, texto)]
+
+    def _marcar(df, prioridade, texto):
+        for base, cid, txt in zip(df["base"], df["cliente_id"], texto if not isinstance(texto, str) else [texto] * len(df)):
+            motivos.setdefault((base, cid), []).append((prioridade, txt))
+
+    if so_numero:
+        _marcar(diretorio[diretorio["cliente_id"] == digitos], 0, "cliente_id do sistema")
         if len(digitos) in (11, 14):
-            mascara |= diretorio["cnpj"] == digitos
-    termo_norm = _normalizar_texto(termo)
-    if termo_norm and not mascara.any():
-        mascara |= diretorio["_nome_norm"].str.contains(termo_norm, regex=False, na=False)
-    return diretorio[mascara].sort_values(["qtd_bombas", "cliente_nome"], ascending=[False, True])
+            _marcar(diretorio[diretorio["cnpj"] == digitos], 0, "CNPJ do cliente no sistema")
+        if len(digitos) == 8:
+            _marcar(diretorio[diretorio["cnpj"].str[:8] == digitos], 1, "raiz do CNPJ no sistema")
+    elif termo_norm:
+        _marcar(diretorio[_casa_inicio_de_palavra(diretorio["_nome_norm"], termo_norm)], 0, "nome no sistema")
+
+    if chaves is not None and not chaves.empty:
+        if so_numero:
+            casou = (chaves["tipo"].isin(["bomba", "serial"]) & (chaves["chave"] == digitos))
+            if len(digitos) <= 6:
+                casou |= chaves["_codigo_num"] == int(digitos)
+            if len(digitos) in (11, 14):
+                casou |= chaves["tipo"].isin(["cigam", "cigam_cnpj"]) & (chaves["cnpj"] == digitos)
+            if len(digitos) == 8:
+                casou |= chaves["tipo"].isin(["cigam", "cigam_cnpj"]) & (chaves["cnpj"].str[:8] == digitos)
+        elif termo_norm:
+            casou = chaves["tipo"].isin(["cigam", "cigam_cnpj"]) & (
+                _casa_inicio_de_palavra(chaves["_nome_norm"], termo_norm)
+                | _casa_inicio_de_palavra(chaves["_fantasia_norm"], termo_norm))
+        else:
+            casou = pd.Series(False, index=chaves.index)
+        achadas = chaves[casou.fillna(False)]
+        for (base, cid), g in achadas.groupby(["base", "cliente_id"]):
+            for _, linha in g.iterrows():
+                motivos.setdefault((base, cid), []).append(_motivo_chave(linha))
+
+    if not motivos:
+        return diretorio.iloc[0:0].assign(_motivo="", _prioridade=0)
+    chave = list(zip(diretorio["base"], diretorio["cliente_id"]))
+    achados = diretorio[[k in motivos for k in chave]].copy()
+    resumo_motivos = {}
+    for k, lista in motivos.items():
+        lista = sorted(set(lista))
+        textos = [t for _, t in lista]
+        resumo_motivos[k] = (lista[0][0], "; ".join(textos[:3]) + (f" (+{len(textos) - 3})" if len(textos) > 3 else ""))
+    pares = list(zip(achados["base"], achados["cliente_id"]))
+    achados["_prioridade"] = [resumo_motivos[k][0] for k in pares]
+    achados["_motivo"] = [resumo_motivos[k][1] for k in pares]
+    return achados.sort_values(["_prioridade", "qtd_bombas", "cliente_nome"], ascending=[True, False, True])
 
 
 def _rotulo_cliente(linha) -> str:
@@ -438,6 +598,8 @@ def _rotulo_cliente(linha) -> str:
     partes.append(f"{int(linha['qtd_bombas'])} bomba(s)")
     if linha.get("trr_interno"):
         partes.append("operação interna CTA")
+    if linha.get("_motivo"):
+        partes.append(f"achado por: {linha['_motivo']}")
     return " · ".join(partes)
 
 
@@ -694,32 +856,62 @@ def _truncar(texto, limite: int) -> str:
     return texto if len(texto) <= limite else texto[: limite - 1].rstrip() + "…"
 
 
+GRUPO_INSTALADAS = "Instaladas hoje"
+GRUPO_RETIRADAS = "Retiradas (sem equipamento hoje)"
+SEM_ALOCACAO = "Sem alocação CIGAM"
+
+
+def rotulo_pagante_curto(rotulo, limite: int = 34) -> str:
+    """"NOME LONGO LTDA. (CIGAM 003435)" → corta o NOME, nunca o código —
+    é o código que o financeiro procura."""
+    rotulo = str(rotulo or "")
+    if " (CIGAM " in rotulo and rotulo.endswith(")"):
+        nome, codigo = rotulo.rsplit(" (CIGAM ", 1)
+        return f"{_truncar(nome, limite)} (CIGAM {codigo}"
+    return _truncar(rotulo, limite + 14)
+
+
+def _sem_prefixo_do_cliente(nome, nome_cliente) -> str:
+    """Tira do nome da bomba o nome do cliente quando ele vem na frente
+    ("Força Ambiental - Saquarema/RJ" → "Saquarema/RJ"): repete em quase
+    toda linha e empurra o que diferencia as bombas pra fora do rótulo."""
+    nome = "" if nome is None or (isinstance(nome, float) and pd.isna(nome)) else str(nome).strip()
+    cliente = _normalizar_texto(nome_cliente)
+    if not cliente or not _normalizar_texto(nome).startswith(cliente):
+        return nome
+    # o nome normalizado tem o mesmo nº de caracteres do original na parte
+    # sem acento; recorta pelo tamanho e limpa o separador
+    resto = nome[len(str(nome_cliente).strip()):].lstrip(" -–—:/|").strip()
+    return resto or nome
+
+
 def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame:
-    """Uma linha por bomba da timeline, na ordem de exibição: agrupada pelo
-    POSTO atual, postos com bomba instalada hoje primeiro (mais volume no
-    topo), postos só com bomba retirada depois, e por fim as bombas que hoje
-    estão em outro cliente ou fora do cadastro. Dentro do posto, instalada
-    hoje primeiro e depois pela data do primeiro uso."""
+    """Uma linha por bomba da timeline, na ordem de exibição, agrupada pelo
+    PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
+    mesma ordem das cores), "sem alocação" por último entre as instaladas;
+    depois as bombas retiradas, as que hoje estão em outro cliente e as fora
+    do cadastro. Dentro do grupo, pela data do primeiro uso. Sem alocação
+    carregada, as instaladas ficam num grupo só."""
     info = resumo.set_index("bomba_id")
+    tem_alocacao = "pagante_rotulo" in resumo
+    ordem_pagantes = {p: i for i, p in enumerate(cores_pagantes(resumo))} if tem_alocacao else {}
     linhas = []
     for bomba, g in periodos.groupby("bomba_id"):
         situacao = info.at[bomba, "situacao"] if bomba in info.index else GRUPO_FORA_CADASTRO
-        if situacao == GRUPO_OUTRO_CLIENTE:
-            grupo = GRUPO_OUTRO_CLIENTE
-        elif situacao == GRUPO_FORA_CADASTRO:
-            grupo = GRUPO_FORA_CADASTRO
+        if situacao in SITUACOES_ATIVAS:
+            pagante = (info.at[bomba, "pagante_rotulo"] or SEM_ALOCACAO) if tem_alocacao else GRUPO_INSTALADAS
+            rank = ordem_pagantes.get(pagante, len(ordem_pagantes))
+            fora = bool(info.at[bomba, "pagante_fora_do_grupo"]) if tem_alocacao else False
+            grupo = ("⚠ " if fora else "") + (rotulo_pagante_curto(pagante) if tem_alocacao else pagante)
+        elif situacao in (GRUPO_OUTRO_CLIENTE, GRUPO_FORA_CADASTRO):
+            grupo, rank = situacao, 1000 + (situacao == GRUPO_FORA_CADASTRO)
         else:
-            grupo = str(info.at[bomba, "posto_nome"] or "").strip() or "Posto sem nome"
-        linhas.append({"bomba_id": bomba, "grupo": grupo, "ativa": situacao in SITUACOES_ATIVAS,
-                       "inicio": g["inicio"].min(), "litros": g["litros"].sum()})
+            grupo, rank = GRUPO_RETIRADAS, 999
+        linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank, "inicio": g["inicio"].min()})
     df = pd.DataFrame(linhas)
     if df.empty:
         return df
-    por_grupo = df.groupby("grupo").agg(tem_ativa=("ativa", "any"), litros_grupo=("litros", "sum"))
-    por_grupo["fim_da_fila"] = por_grupo.index.map({GRUPO_OUTRO_CLIENTE: 1, GRUPO_FORA_CADASTRO: 2}).fillna(0)
-    df = df.join(por_grupo, on="grupo")
-    return df.sort_values(["fim_da_fila", "tem_ativa", "litros_grupo", "grupo", "ativa", "inicio"],
-                          ascending=[True, False, False, True, False, True]).reset_index(drop=True)
+    return df.sort_values(["rank", "grupo", "inicio"]).reset_index(drop=True)
 
 
 def alertas_de_pagante(resumo: pd.DataFrame) -> list:
@@ -742,29 +934,37 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     """Cor por pagante de hoje, na ordem de nº de bombas instaladas (o
     pagante principal fica com a 1ª cor). Passou de 6 pagantes, o resto
     divide a 7ª cor; bomba instalada sem alocação tem cor própria."""
+    if "pagante_rotulo" not in resumo:
+        return {}
     ativos = resumo[resumo["situacao"].isin(SITUACOES_ATIVAS)]
     contagem = ativos["pagante_rotulo"].dropna().value_counts()
-    pagantes = [p for p in contagem.index if p != "Sem alocação CIGAM"]
+    sinalizados = set(ativos.loc[ativos["pagante_fora_do_grupo"].fillna(False).astype(bool), "pagante_rotulo"])
+    # pagantes do grupo primeiro e os sinalizados (⚠) por último; empate no nº
+    # de bombas vai por ordem alfabética, pra cor não trocar entre buscas
+    pagantes = sorted((p for p in contagem.index if p != SEM_ALOCACAO),
+                      key=lambda p: (p in sinalizados, -contagem[p], p))
     cores = {p: (CORES_PAGANTES[i] if i < len(CORES_PAGANTES) else COR_OUTROS_PAGANTES)
              for i, p in enumerate(pagantes)}
-    cores["Sem alocação CIGAM"] = COR_SEM_ALOCACAO
+    cores[SEM_ALOCACAO] = COR_SEM_ALOCACAO
     return cores
 
 
-def plotar_periodos(periodos, trocas, resumo, ano):
+def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
-    quebrado em pausas longas, agrupada por posto. O trecho do serial
-    instalado HOJE tem a cor do pagante de hoje (alocação CIGAM); pagante
-    com conta própria no sistema ganha contorno vermelho e ⚠ no nome."""
+    quebrado em pausas longas, agrupada pelo pagante de hoje (o posto vai no
+    hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
+    (alocação CIGAM); pagante com conta própria no sistema ganha contorno
+    vermelho e ⚠ no nome."""
     ordem = ordem_timeline(periodos, resumo)
     info = resumo.set_index("bomba_id")
     tem_alocacao = "pagante_rotulo" in resumo
     alerta = info["pagante_fora_do_grupo"].to_dict() if tem_alocacao else {}
-    # o nome da bomba repete o do cliente em boa parte da base — corta o
-    # nome, nunca o "(#id)", que é o que torna o rótulo único
-    rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(n, 40))
+    # o nome da bomba repete o do cliente em boa parte da base — tira esse
+    # prefixo e corta o nome, nunca o "(#id)", que é o que torna o rótulo único
+    rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
                for b, n in info["bomba_nome"].items()}
-    grupos = dict(zip(ordem["bomba_id"], ordem["grupo"].map(lambda g: _truncar(g, 30))))
+    postos = info["posto_nome"].to_dict()
+    grupos = dict(zip(ordem["bomba_id"], ordem["grupo"]))
 
     def eixo_y(bombas):
         return [[grupos.get(b, GRUPO_FORA_CADASTRO) for b in bombas], [rotulos.get(b, b) for b in bombas]]
@@ -775,17 +975,18 @@ def plotar_periodos(periodos, trocas, resumo, ano):
         janela_ms = 365 * 86_400_000
     else:
         janela_ms = max((periodos["fim"].max() - periodos["inicio"].min()).total_seconds() * 1000, 86_400_000)
-    largura_min = janela_ms * 0.004
+    largura_min = janela_ms * 0.008
 
     fig = go.Figure()
     # 1º trace invisível com TODAS as bombas na ordem certa: no eixo de 2
-    # níveis (posto, bomba) a ordem das categorias é a da primeira aparição
+    # níveis (pagante, bomba) a ordem das categorias é a da primeira aparição
     fig.add_trace(go.Scatter(x=[periodos["inicio"].min()] * len(ordem), y=eixo_y(ordem["bomba_id"]),
                              mode="markers", marker=dict(opacity=0), showlegend=False, hoverinfo="skip"))
 
     def _hover(p, extra):
         return [
-            f"<b>{rotulos.get(b, b)}</b><br>Serial {s or '—'} · {extra(b)}<br>{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
+            f"<b>{rotulos.get(b, b)}</b><br>Posto: {postos.get(b) or '—'}<br>Serial {s or '—'} · {extra(b)}<br>"
+            f"{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
             + f"{d} dia(s) com abastecimento · {l:,.0f} L".replace(",", ".")
             for b, s, i, f, d, l in zip(p["bomba_id"], p["serial"], p["inicio"], p["fim_real"], p["dias"], p["litros"])
         ]
@@ -816,7 +1017,7 @@ def plotar_periodos(periodos, trocas, resumo, ano):
             if p.empty:
                 continue
             fora = p["bomba_id"].map(lambda b: bool(alerta.get(b)))
-            nome = _truncar(pagante, 60)
+            nome = rotulo_pagante_curto(pagante, 40)
             if (~fora).any():
                 _barras(p[~fora], nome, cor, hachura="." if pagante == "Sem alocação CIGAM" else "", extra=_extra)
             if fora.any():
@@ -841,7 +1042,7 @@ def plotar_periodos(periodos, trocas, resumo, ano):
         fig.add_trace(go.Scatter(
             x=t["data"], y=eixo_y(t["bomba_id"]), mode="markers",
             name="Troca de serial",
-            marker=dict(symbol="star", size=14, color=COR_FUNDO_GRAFICO, line=dict(width=2, color=COR_TEXTO_GRAFICO)),
+            marker=dict(symbol="star", size=10, color=COR_FUNDO_GRAFICO, line=dict(width=1.5, color=COR_TEXTO_GRAFICO)),
             hovertext=[f"<b>Troca de serial</b><br>{rotulos.get(b, b)}<br>{d:%d/%m/%Y}<br>{a} → <b>{n}</b>"
                        for b, d, a, n in zip(t["bomba_id"], t["data"], t["serial_anterior"], t["serial_novo"])],
             hoverinfo="text",
@@ -868,15 +1069,16 @@ def _fmt_litros(v: float) -> str:
 
 def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     st.caption(
-        "Cliente do **sistema CTA** (não do CIGAM): digite o nome, o cliente_id do sistema "
-        "ou o CNPJ/CPF e clique em Buscar. Mostra todas as bombas que abasteceram nos postos "
-        "do cliente, todos os seriais (equipamentos) que passaram por elas, quando trocaram, "
-        "o período e o volume de uso."
+        "Busque com o que tiver em mãos: **nome ou código do CIGAM**, **CNPJ/CPF** (do CIGAM ou do sistema, "
+        "ou só a raiz de 8 dígitos), **nº da bomba**, **serial** ou o nome/cliente_id do sistema. A busca "
+        "traduz para o cliente do **sistema CTA** que opera as bombas e mostra todas as que abasteceram nos "
+        "postos dele, os seriais (equipamentos) que passaram por elas, quando trocaram, o período e o volume."
     )
     with st.form("busca_equipamentos_form"):
         col_busca, col_btn = st.columns([5, 1], vertical_alignment="bottom")
         with col_busca:
-            termo = st.text_input("Cliente do sistema", placeholder="Nome, cliente_id ou CNPJ/CPF")
+            termo = st.text_input("Cliente", placeholder="Ex.: FORCA AMBIENTAL LTDA · 002112 · 20.217.115/0001-40 · "
+                                                           "bomba 547952619 · serial 12632")
         with col_btn:
             clicou = st.form_submit_button("Buscar", use_container_width=True, type="primary")
     if clicou:
@@ -886,21 +1088,30 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     if not termo:
         return
 
+    chaves = None
     if modo_demo:
         diretorio, parque_demo = gerar_dados_demo()
+        chaves = gerar_chaves_demo()
     else:
         try:
             diretorio = carregar_clientes_sistema(client_bq, project_id)
         except Forbidden as e:
             _mostrar_falta_de_permissao(project_id, e)
             return
+        try:
+            chaves = carregar_chaves_busca(client_bq, project_id)
+        except (Forbidden, NotFound, BadRequest) as e:
+            st.caption("Busca só por nome, cliente_id e CNPJ do sistema — sem a ponte com o CIGAM, as bombas "
+                       "e os seriais: " + str(getattr(e, "message", e))[:300])
 
-    candidatos = buscar_clientes_sistema(diretorio, termo)
+    candidatos = buscar_clientes_sistema(diretorio, termo, chaves)
     if candidatos.empty:
-        st.error(f"Nenhum cliente do sistema encontrado para '{termo}'.")
+        st.error(f"Nenhum cliente do sistema encontrado para '{termo}'. A busca cobre os clientes com bomba "
+                 f"cadastrada no CTA e no Ipiranga Connect.")
         return
     if len(candidatos) == 1:
         escolhido = candidatos.iloc[0]
+        st.caption(f"Achado por: {escolhido['_motivo']}")
     else:
         opcoes = candidatos.head(200)
         idx = st.selectbox(
@@ -1017,7 +1228,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     if not periodos.empty:
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
-        st.markdown(f"**Períodos de uso por bomba**, agrupados por posto · um segmento por serial; pausas de "
+        st.markdown(f"**Períodos de uso por bomba**, agrupados por quem paga hoje · um segmento por serial; pausas de "
                     f"mais de {DIAS_SEM_USO_QUEBRA_PERIODO} dias sem abastecer quebram o segmento")
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
@@ -1034,7 +1245,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if periodos.empty:
             st.caption("Nenhuma bomba abasteceu no período.")
         else:
-            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano), use_container_width=True)
+            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"]), use_container_width=True)
 
     st.markdown("**Todas as bombas do cliente** (todo o período)")
     colunas = {
