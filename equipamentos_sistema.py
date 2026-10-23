@@ -73,6 +73,9 @@ COR_SEM_ALOCACAO = "#C9CED8"
 # pagante com conta própria no sistema: contorno + ⚠. O vermelho do contorno
 # não entra na paleta dos pagantes (slot 7 fica de fora) pra não confundir
 COR_ALERTA = "#FF4B4B"
+# seta de serial que mudou de bomba: clara e pontilhada, pra não competir
+# com as barras
+COR_MOVIMENTO = "rgba(241, 241, 241, 0.7)"
 CORES_PAGANTES = CORES_BOMBAS[:6]
 COR_OUTROS_PAGANTES = CORES_BOMBAS[6]
 
@@ -499,6 +502,10 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
                 "base_para": BASES_SISTEMA.get(b["chave"][0], b["chave"][0]),
                 "entre_bases": a["chave"][0] != b["chave"][0],
                 "_bomba_destino": lb["bomba_id"],
+                # pontas da seta da linha do tempo: a bomba que parou por
+                # último na origem e a que começou primeiro no destino
+                "_bomba_saida": max(a["linhas"], key=lambda r: r["fim"])["bomba_id"],
+                "_bomba_chegada": min(b["linhas"], key=lambda r: r["inicio"])["bomba_id"],
             })
     ev = pd.DataFrame(eventos)
     if ev.empty:
@@ -1200,7 +1207,7 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     return cores
 
 
-def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None):
+def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
     quebrado em pausas longas, agrupada pelo pagante de hoje (o posto vai no
     hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
@@ -1290,6 +1297,30 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         p = periodos[periodos["categoria"] == categoria]
         if not p.empty:
             _barras(p, categoria, cor, hachura=hachura)
+
+    # seta discreta ligando o fim do serial numa bomba ao começo dele na
+    # bomba seguinte — só quando as duas bombas estão na linha do tempo
+    # (transferência dentro do cliente; de/para outro cliente fica no hover
+    # da estrela e na tabela de transferências)
+    if movimentos is not None and not movimentos.empty:
+        visiveis = set(grupos)
+        m = movimentos[(movimentos["tipo"] == TIPO_DENTRO)
+                       & movimentos["_bomba_saida"].isin(visiveis) & movimentos["_bomba_chegada"].isin(visiveis)
+                       & (movimentos["_bomba_saida"] != movimentos["_bomba_chegada"])]
+        for i, (_, mv) in enumerate(m.iterrows()):
+            # uso simultâneo: a "saída" vem depois da chegada — a seta fica
+            # vertical, na data da chegada
+            x0 = min(mv["saida"], mv["data"])
+            texto = (f"<b>Serial {mv['serial']} mudou de bomba</b><br>{rotulos.get(mv['_bomba_saida'])} → "
+                     f"{rotulos.get(mv['_bomba_chegada'])}<br>{mv['periodo']}")
+            fig.add_trace(go.Scatter(
+                x=[x0, mv["data"]], y=eixo_y([mv["_bomba_saida"], mv["_bomba_chegada"]]),
+                mode="lines+markers", name="Serial mudou de bomba", legendgroup="movimento",
+                showlegend=i == 0, hovertext=[texto, texto], hoverinfo="text",
+                line=dict(color=COR_MOVIMENTO, width=1.3, dash="dot"),
+                marker=dict(symbol=["circle", "arrow"], size=[4, 11], angleref="previous",
+                            color=COR_MOVIMENTO, line=dict(width=0)),
+            ))
 
     t = trocas[trocas["bomba_id"].isin(periodos["bomba_id"])]
     if not t.empty:
@@ -1531,7 +1562,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if periodos.empty:
             st.caption("Nenhuma bomba abasteceu no período ou nos grupos escolhidos.")
         else:
-            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens),
+            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
+                                            transferencias),
                             use_container_width=True)
 
     st.markdown("**Todas as bombas do cliente** (todo o período)")
