@@ -141,7 +141,10 @@ def carregar_chaves_busca(_client, project_id: str) -> pd.DataFrame:
       - 'cigam_cnpj': empresa do CIGAM com o MESMO CNPJ do cliente no
         sistema — liga mesmo sem alocação;
       - 'bomba' e 'serial': bombas cadastradas hoje no cliente e o serial
-        do equipamento instalado nelas.
+        do equipamento instalado nelas;
+      - 'id_op': ID operacional da alocação (gold.bombas_alocadas.id_op_operacional)
+        — é o "ID" com que o financeiro e o controle de alocação identificam a
+        bomba nas planilhas ("ID 932169744 - São João da Barra").
     """
     t_cad = _tabela(project_id, TABELA_CADASTRO)
     t_emp = _tabela(project_id, TABELA_EMPRESAS_CIGAM)
@@ -172,6 +175,11 @@ def carregar_chaves_busca(_client, project_id: str) -> pd.DataFrame:
     SELECT DISTINCT c.base, c.cliente_id, 'cigam_cnpj', e.codigo, 'mesmo CNPJ', CAST(NULL AS INT64), e.nome, e.fantasia, e.cnpj
     FROM cad c JOIN emp e ON e.cnpj = c.cnpj
     WHERE LENGTH(c.cnpj) = 14 AND c.cnpj NOT LIKE '00000000%'
+    UNION ALL
+    SELECT DISTINCT a.base, CAST(a.cliente_id AS STRING), 'id_op', CAST(a.id_op_operacional AS STRING),
+           CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING)
+    FROM {_tabela(project_id, TABELA_ALOCACAO)} a
+    WHERE a.base IN UNNEST(@bases) AND a.id_op_operacional IS NOT NULL
     UNION ALL
     SELECT base, cliente_id, 'bomba', bomba_id, CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING) FROM cad
     UNION ALL
@@ -313,7 +321,8 @@ def carregar_alocacao_cigam(_client, project_id: str, base: str, cliente_id: str
         p.nomeCompleto AS pagante_nome,
         REGEXP_REPLACE(CAST(p.cnpjCpf AS STRING), r'\\D', '') AS pagante_cnpj,
         CAST(a.cliente_cigam_local AS STRING) AS local_codigo,
-        l.nomeCompleto AS local_nome
+        l.nomeCompleto AS local_nome,
+        CAST(a.id_op_operacional AS STRING) AS id_op
       FROM {_tabela(project_id, TABELA_ALOCACAO)} a
       LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} p
         ON CAST(a.cliente_cigam_pagante AS STRING) = CAST(p.codigo AS STRING)
@@ -352,27 +361,240 @@ def carregar_alocacao_cigam(_client, project_id: str, base: str, cliente_id: str
     ])
 
 
+@st.cache_data(ttl=1800, show_spinner="Buscando por onde cada serial já passou (direto do BigQuery)...")
+def carregar_percurso_seriais(_client, project_id: str, seriais: tuple, com_alocacao: bool = True) -> pd.DataFrame:
+    """
+    Por onde cada serial (equipamento) já passou, em QUALQUER bomba, cliente
+    ou base do fato diário (cta + ipc): uma linha por (base, bomba, serial)
+    com o primeiro e o último dia de uso e os litros. Junta o cadastro atual
+    da bomba (nome, posto, cliente) e, com `com_alocacao`, quem paga a bomba
+    HOJE e o ID operacional dela.
+    Lê o fato inteiro filtrando por serial (o cluster é por posto/bomba, não
+    por serial) — medido em 23/10/2026: menos de R$ 0,01 por busca.
+    """
+    t_cad = _tabela(project_id, TABELA_CADASTRO)
+    sql_aloc = f"""
+      LEFT JOIN {_tabela(project_id, TABELA_ALOCACAO)} a
+        ON a.base = p.base AND CAST(a.bomba_id AS STRING) = p.bomba_id
+      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} e
+        ON CAST(e.codigo AS STRING) = CAST(a.cliente_cigam_pagante AS STRING)""" if com_alocacao else ""
+    colunas_aloc = ("CAST(a.cliente_cigam_pagante AS STRING) AS pagante_codigo, e.nomeCompleto AS pagante_nome, "
+                    "CAST(a.id_op_operacional AS STRING) AS id_op" if com_alocacao else
+                    "CAST(NULL AS STRING) AS pagante_codigo, CAST(NULL AS STRING) AS pagante_nome, "
+                    "CAST(NULL AS STRING) AS id_op")
+    sql = f"""
+    WITH p AS (
+      SELECT base, CAST(bomba_id AS STRING) AS bomba_id, CAST(serial_equipamento AS STRING) AS serial,
+             MIN(data) AS inicio, MAX(data) AS fim, COUNT(*) AS dias, SUM(litros) AS litros
+      FROM {_tabela(project_id, TABELA_USO)}
+      WHERE serial_equipamento IN UNNEST(@seriais) AND bomba_id IS NOT NULL
+      GROUP BY 1, 2, 3
+    )
+    SELECT p.*, c.bomba_nome, c.posto_nome, c.cliente_id, c.cliente_nome, {colunas_aloc}
+    FROM p
+    LEFT JOIN {t_cad} c ON c.base = p.base AND c.bomba_id = p.bomba_id{sql_aloc}
+    """
+    df = _query(_client, sql, [bigquery.ArrayQueryParameter("seriais", "INT64", [int(s) for s in seriais])])
+    df["inicio"] = pd.to_datetime(df["inicio"])
+    df["fim"] = pd.to_datetime(df["fim"])
+    df["litros"] = pd.to_numeric(df["litros"], errors="coerce").astype(float)
+    return df
+
+
+# passagem de menos que isso num lugar é teste/configuração, não instalação
+# (ex.: 6 L num dia) — some do percurso pra não inventar transferência
+LITROS_MIN_PASSAGEM = 50.0
+# dois trechos do mesmo serial no mesmo cliente que se sobrepõem por pelo
+# menos isso são a MESMA instalação (canais 1 e 2 de um equipamento duplo).
+# Trecho que só encosta no anterior é transferência: Queimados → Belford Roxo
+# Novo (serial 16994) trocou no mesmo dia, 24/04/2025
+DIAS_MIN_SOBREPOSICAO_CANAIS = 7
+TIPO_DENTRO = "Mudou de bomba no cliente"
+TIPO_ENTROU = "Veio de outro cliente"
+TIPO_SAIU = "Foi para outro cliente"
+
+
+def _rotulo_local(linha, base_cliente: str) -> str:
+    nome = linha.get("bomba_nome")
+    nome = nome if isinstance(nome, str) and nome.strip() else "bomba fora do cadastro"
+    cliente = linha.get("cliente_nome")
+    cliente = cliente if isinstance(cliente, str) and cliente.strip() else "cliente desconhecido"
+    base = "" if linha["base"] == base_cliente else f" · base {BASES_SISTEMA.get(linha['base'], linha['base'])}"
+    return f"{_truncar(nome, 40)} (#{linha['bomba_id']}) · {_truncar(cliente, 30)}{base}"
+
+
+def _pagante_curto(codigo, nome) -> str:
+    if not isinstance(codigo, str) or not codigo:
+        return "sem alocação hoje"
+    return f"{_truncar(nome or 'sem nome no CIGAM', 28)} (CIGAM {codigo})"
+
+
+def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -> tuple:
+    """
+    Transforma o percurso dos seriais em INSTALAÇÕES e TRANSFERÊNCIAS:
+      - instalação = trechos do serial no mesmo (base, cliente) que se
+        sobrepõem por DIAS_MIN_SOBREPOSICAO_CANAIS dias ou mais (canais do
+        mesmo equipamento contam como um só);
+      - transferência = a passagem de uma instalação para a seguinte.
+    Devolve (eventos, percursos): `eventos` só com as transferências que
+    entram, saem ou circulam DENTRO do cliente, com o tipo, os dias parado
+    entre a saída e a reinstalação, o pagante de hoje de cada ponta e os
+    alertas; `percursos` com o caminho completo de cada serial em texto.
+    O pagante é o da alocação de HOJE das duas bombas — a alocação não guarda
+    histórico, então "pagante diferente" quer dizer que hoje as duas bombas
+    estão com pagantes diferentes, não que a cobrança mudou naquela data.
+    """
+    colunas = ["serial", "data", "tipo", "de", "para", "dias_parado", "pagante_de", "pagante_para", "alertas"]
+    if percurso is None or percurso.empty:
+        return pd.DataFrame(columns=colunas), {}
+    p = percurso[percurso["litros"] >= LITROS_MIN_PASSAGEM].copy()
+    p["cliente_id"] = p["cliente_id"].astype(object).where(p["cliente_id"].notna(), None)
+    eventos, percursos = [], {}
+    for serial, g in p.sort_values(["serial", "inicio"]).groupby("serial"):
+        instalacoes = []
+        for _, linha in g.iterrows():
+            chave = (linha["base"], linha["cliente_id"])
+            atual = instalacoes[-1] if instalacoes else None
+            sobreposicao = (min(linha["fim"], atual["fim"]) - max(linha["inicio"], atual["inicio"])).days \
+                if atual else -1
+            if atual and atual["chave"] == chave and sobreposicao >= DIAS_MIN_SOBREPOSICAO_CANAIS:
+                atual["linhas"].append(linha)
+                atual["fim"] = max(atual["fim"], linha["fim"])
+            else:
+                instalacoes.append({"chave": chave, "inicio": linha["inicio"], "fim": linha["fim"], "linhas": [linha]})
+        do_cliente = [inst["chave"] == (base, str(cliente_id)) for inst in instalacoes]
+        if not any(do_cliente):
+            continue
+        def _onde(inst, do_proprio):
+            # no próprio cliente o que importa é a BOMBA; fora dele, o cliente
+            if do_proprio:
+                return " + ".join(f"{_truncar(r.get('bomba_nome'), 30) or 'bomba'} (#{r['bomba_id']})"
+                                  for r in inst["linhas"])
+            outra_base = "" if inst["chave"][0] == base else \
+                f" [{BASES_SISTEMA.get(inst['chave'][0], inst['chave'][0])}]"
+            return f"{_truncar(inst['linhas'][0].get('cliente_nome'), 28) or 'cliente desconhecido'}{outra_base}"
+
+        percursos[serial] = " → ".join(
+            f"{_onde(inst, proprio)} ({inst['inicio']:%m/%y}–{inst['fim']:%m/%y})"
+            for inst, proprio in zip(instalacoes, do_cliente))
+        for i in range(1, len(instalacoes)):
+            a, b = instalacoes[i - 1], instalacoes[i]
+            if not (do_cliente[i - 1] or do_cliente[i]):
+                continue
+            # ponta "principal" de cada instalação: a bomba que mais abasteceu
+            la = max(a["linhas"], key=lambda r: r["litros"])
+            lb = max(b["linhas"], key=lambda r: r["litros"])
+            tipo = TIPO_DENTRO if do_cliente[i - 1] and do_cliente[i] else (TIPO_ENTROU if do_cliente[i] else TIPO_SAIU)
+            alertas = []
+            if a["chave"][0] != b["chave"][0]:
+                alertas.append(f"entre bases ({BASES_SISTEMA.get(a['chave'][0], a['chave'][0])} → "
+                               f"{BASES_SISTEMA.get(b['chave'][0], b['chave'][0])})")
+            if tipo != TIPO_DENTRO:
+                alertas.append("entre clientes")
+            pag_a, pag_b = la.get("pagante_codigo"), lb.get("pagante_codigo")
+            if isinstance(pag_a, str) and pag_a and isinstance(pag_b, str) and pag_b and pag_a != pag_b:
+                alertas.append("pagante diferente hoje")
+            dias_parado = (b["inicio"] - a["fim"]).days
+            if dias_parado < 0:
+                # o serial abasteceu nos dois lugares no mesmo período (ex.:
+                # 1 dia em Belford Roxo 1 no meio do uso em Nova Iguaçu)
+                alertas.append("uso simultâneo nos dois lugares")
+                dias_parado = None
+            eventos.append({
+                "serial": serial, "data": b["inicio"], "tipo": tipo,
+                "de": " + ".join(_rotulo_local(r, base) for r in a["linhas"]),
+                "para": " + ".join(_rotulo_local(r, base) for r in b["linhas"]),
+                "dias_parado": dias_parado,
+                "pagante_de": _pagante_curto(pag_a, la.get("pagante_nome")),
+                "pagante_para": _pagante_curto(pag_b, lb.get("pagante_nome")),
+                "alertas": ", ".join(alertas),
+                "_bomba_destino": lb["bomba_id"],
+            })
+    ev = pd.DataFrame(eventos)
+    if ev.empty:
+        return pd.DataFrame(columns=colunas), percursos
+    return ev.sort_values(["data", "serial"], ascending=[False, True]).reset_index(drop=True), percursos
+
+
+def renderizar_transferencias(transferencias: pd.DataFrame, aviso: str = None):
+    """Seção de transferências: quando um serial sai de uma bomba e é
+    reinstalado noutra — no cliente, vindo de outro cliente, indo pra outro
+    cliente ou entre bases. É o rastro das transferências que o processo não
+    documenta (troca de pagante sem registro, equipamento reaproveitado)."""
+    st.markdown("**Transferências de equipamento** · quando um serial sai de uma bomba e volta a abastecer em outra")
+    if aviso:
+        st.caption(aviso)
+    if transferencias is None or transferencias.empty:
+        st.caption("Nenhum serial deste cliente passou por outra bomba, cliente ou base.")
+        return
+    t = transferencias
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Dentro do cliente", int((t["tipo"] == TIPO_DENTRO).sum()))
+    c2.metric("Vieram de outro cliente", int((t["tipo"] == TIPO_ENTROU).sum()))
+    c3.metric("Foram para outro cliente", int((t["tipo"] == TIPO_SAIU).sum()))
+    c4.metric("Entre bases", int(t["alertas"].str.contains("entre bases").sum()))
+    c5.metric("Pagante diferente hoje", int(t["alertas"].str.contains("pagante diferente").sum()),
+              help="As duas bombas estão hoje com pagantes diferentes na alocação CIGAM. A alocação não guarda "
+                   "histórico: não dá pra dizer quem pagava na data da transferência.")
+    st.dataframe(
+        t[["data", "serial", "tipo", "alertas", "de", "para", "dias_parado", "pagante_de", "pagante_para"]].rename(columns={
+            "data": "Reinstalado em", "serial": "Serial", "tipo": "Tipo", "de": "Saiu de", "para": "Foi para",
+            "dias_parado": "Dias parado", "pagante_de": "Pagante hoje (origem)",
+            "pagante_para": "Pagante hoje (destino)", "alertas": "Sinais"}),
+        use_container_width=True, hide_index=True,
+        column_config={"Reinstalado em": st.column_config.DateColumn(format="DD/MM/YYYY")},
+    )
+    st.caption("A data é o primeiro abastecimento do serial no destino; \"dias parado\" conta do último abastecimento "
+               "na origem até ele. Passagem de menos de 50 L num lugar é tratada como teste e fica de fora. "
+               "Link2Pump não está no fato diário — passagem por lá não aparece.")
+
+
+def alertas_id_operacional(resumo: pd.DataFrame) -> list:
+    """ID operacional da alocação repetido em bombas de EQUIPAMENTOS
+    diferentes (canais do mesmo equipamento dividem o ID, isso é normal) —
+    ex.: São João de Meriti e Mangaratiba com o mesmo 1106920037 (23/10/2026)."""
+    if "id_op" not in resumo:
+        return []
+    r = resumo.dropna(subset=["id_op"])
+    linhas = []
+    for id_op, g in r.groupby("id_op"):
+        if g["equipamento_id"].nunique() > 1:
+            linhas.append(f"**ID operacional {id_op} está em {len(g)} bombas de equipamentos diferentes:** "
+                          + ", ".join(sorted(g["rotulo"])) + ". Na planilha só uma delas casa com esse ID.")
+    return linhas
+
+
 def anexar_alocacao(resumo: pd.DataFrame, alocacao: pd.DataFrame) -> pd.DataFrame:
     """Põe no resumo de bombas o pagante de hoje e o alerta de pagante de
     outra conta. Só vale para bomba instalada HOJE no cliente: a alocação é
     estado atual, e bomba retirada ou em outro cliente não tem o que mostrar."""
     resumo = resumo.drop(columns=[c for c in ("pagante_codigo", "pagante_nome", "pagante_outras_contas",
-                                              "pagante_fora_do_grupo", "pagante_rotulo") if c in resumo])
+                                              "pagante_fora_do_grupo", "pagante_rotulo", "local_rotulo",
+                                              "id_op") if c in resumo])
     ativa = resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])
     if alocacao is None or alocacao.empty:
         resumo["pagante_codigo"] = None
         resumo["pagante_nome"] = None
         resumo["pagante_outras_contas"] = None
         resumo["pagante_fora_do_grupo"] = False
+        resumo["local_rotulo"] = None
+        resumo["id_op"] = None
     else:
         aloc = alocacao.drop_duplicates("bomba_id").copy()
         raiz_pagante = aloc["pagante_cnpj"].fillna("").astype(str).str[:8]
         cliente_raiz = aloc["cliente_raiz"].fillna("").astype(str)
         aloc["pagante_fora_do_grupo"] = (aloc["pagante_outras_contas"].notna() & (cliente_raiz.str.len() == 8)
                                          & (raiz_pagante != cliente_raiz))
+        for col in ("local_codigo", "local_nome", "id_op"):
+            if col not in aloc:
+                aloc[col] = None
+        aloc["local_rotulo"] = [
+            f"{str(n or 'Sem nome no CIGAM').strip()} (CIGAM {c})" if isinstance(c, str) and c else None
+            for c, n in zip(aloc["local_codigo"], aloc["local_nome"])]
         resumo = resumo.merge(aloc[["bomba_id", "pagante_codigo", "pagante_nome", "pagante_outras_contas",
-                                    "pagante_fora_do_grupo"]], on="bomba_id", how="left")
-        resumo.loc[~ativa.to_numpy(), ["pagante_codigo", "pagante_nome", "pagante_outras_contas"]] = None
+                                    "pagante_fora_do_grupo", "local_rotulo", "id_op"]], on="bomba_id", how="left")
+        resumo.loc[~ativa.to_numpy(), ["pagante_codigo", "pagante_nome", "pagante_outras_contas",
+                                       "local_rotulo", "id_op"]] = None
         resumo["pagante_fora_do_grupo"] = (resumo["pagante_fora_do_grupo"].fillna(False).astype(bool)
                                            & ativa.to_numpy())
     resumo["pagante_rotulo"] = [
@@ -387,7 +609,8 @@ def gerar_dados_demo():
     """Diretório + parque fictícios no MESMO formato das consultas, pra
     testar a aba sem credenciais. Cobre: equipamento duplo (2 bombas no
     mesmo serial), bomba em comboio, troca de equipamento no meio do
-    período, bomba retirada (sem equipamento) e bomba nova."""
+    período, bomba retirada (sem equipamento) cujo serial é reinstalado
+    noutra bomba do cliente (Filial → Comboio 02) e bomba nova."""
     import numpy as np
 
     diretorio = pd.DataFrame([
@@ -434,7 +657,7 @@ def gerar_dados_demo():
         "5002": [("2022-03-01", "4410055"), ("2024-05-22", "4410071")],
         "5003": [("2023-06-10", "4410099"), ("2025-03-10", "4410188")],
         "5004": [("2022-03-01", "4410040")],
-        "5005": [("2025-04-01", "4410293")],
+        "5005": [("2025-04-01", "4410040"), ("2025-10-01", "4410293")],
         "5006": [("2024-01-15", "4410297")],
     }
 
@@ -481,15 +704,51 @@ def gerar_chaves_demo() -> pd.DataFrame:
     return df
 
 
+def gerar_percurso_demo(cadastro: pd.DataFrame, uso: pd.DataFrame, alocacao) -> pd.DataFrame:
+    """Percurso fictício dos seriais, no formato de carregar_percurso_seriais:
+    as passagens pelo próprio cliente (do uso demo) + de onde vieram e pra
+    onde foram — inclusive um serial que vai pra outra base."""
+    u = uso.dropna(subset=["bomba_id", "serial"])
+    p = u.groupby(["bomba_id", "serial"], as_index=False).agg(
+        inicio=("data", "min"), fim=("data", "max"), dias=("data", "nunique"), litros=("litros", "sum"))
+    p["base"] = "cta"
+    p = p.merge(cadastro[["bomba_id", "bomba_nome", "posto_nome"]], on="bomba_id", how="left")
+    p["cliente_id"], p["cliente_nome"] = "900101", "TRANSPORTE DEMO LTDA"
+    aloc = alocacao[["bomba_id", "pagante_codigo", "pagante_nome", "id_op"]] if alocacao is not None and "id_op" in alocacao \
+        else pd.DataFrame(columns=["bomba_id", "pagante_codigo", "pagante_nome", "id_op"])
+    p = p.merge(aloc, on="bomba_id", how="left")
+    fora = pd.DataFrame([
+        # de onde veio o serial do Comboio 01: outra construtora, outro pagante
+        {"base": "cta", "bomba_id": "7001", "serial": "4410188", "inicio": "2023-01-10", "fim": "2025-02-20",
+         "bomba_nome": "Construtora Exemplo - Comboio", "cliente_id": "700001", "cliente_nome": "CONSTRUTORA EXEMPLO",
+         "pagante_codigo": "000777", "pagante_nome": "CONSTRUTORA EXEMPLO LTDA"},
+        # pra onde foi o serial antigo do Comboio 01
+        {"base": "cta", "bomba_id": "7002", "serial": "4410099", "inicio": "2025-04-01", "fim": "2026-09-30",
+         "bomba_nome": "Construtora Exemplo - Pedestal", "cliente_id": "700001", "cliente_nome": "CONSTRUTORA EXEMPLO",
+         "pagante_codigo": "000777", "pagante_nome": "CONSTRUTORA EXEMPLO LTDA"},
+        # o serial antigo do equipamento duplo foi parar em OUTRA BASE
+        {"base": "ipc", "bomba_id": "8001", "serial": "4410055", "inicio": "2024-07-01", "fim": "2026-09-30",
+         "bomba_nome": "Posto Exemplo - Bomba 1", "cliente_id": "800001", "cliente_nome": "MINERAÇÃO EXEMPLO",
+         "pagante_codigo": "000490", "pagante_nome": "IPIRANGA PROD DE PETROLEO S/A"},
+    ])
+    for col in ("inicio", "fim"):
+        fora[col] = pd.to_datetime(fora[col])
+    fora["dias"], fora["litros"], fora["posto_nome"], fora["id_op"] = 300, 90000.0, None, None
+    return pd.concat([p, fora], ignore_index=True)
+
+
 def gerar_alocacao_demo() -> pd.DataFrame:
     """Alocação CIGAM fictícia, no formato de carregar_alocacao_cigam: o
     próprio cliente paga a maior parte, uma empresa do grupo sem conta no
     sistema paga o comboio 01, e uma distribuidora com conta própria paga o
-    comboio 02 (o caso que a aba sinaliza)."""
+    comboio 02 (o caso que a aba sinaliza). Os comboios 01 e 02 dividem o
+    mesmo ID operacional sem serem o mesmo equipamento (o outro alerta)."""
     proprio = ("000101", "TRANSPORTE DEMO LTDA", "12345678000100", None)
+    ids_op = {"5001": "1000001", "5002": "1000001", "5006": "1000006", "5003": "1000003", "5005": "1000003"}
     return pd.DataFrame([
         {"bomba_id": b, "pagante_codigo": c, "pagante_nome": n, "pagante_cnpj": j, "pagante_outras_contas": o,
-         "local_codigo": "000101", "local_nome": "TRANSPORTE DEMO LTDA", "cliente_raiz": "12345678"}
+         "local_codigo": "000101", "local_nome": "TRANSPORTE DEMO LTDA", "cliente_raiz": "12345678",
+         "id_op": ids_op[b]}
         for b, (c, n, j, o) in {
             "5001": proprio, "5002": proprio, "5006": proprio,
             "5003": ("000202", "LOGÍSTICA DEMO S.A.", "22333444000155", None),
@@ -516,6 +775,8 @@ def _motivo_chave(linha) -> tuple:
     tipo = linha["tipo"]
     if tipo == "bomba":
         return 0, f"bomba #{linha['chave']}"
+    if tipo == "id_op":
+        return 0, f"ID operacional {linha['chave']}"
     if tipo == "serial":
         return 0, f"serial {linha['chave']} instalado aqui"
     if tipo == "cigam_cnpj":
@@ -531,7 +792,8 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
       - código CIGAM ("580" ou "000580") de quem paga ou é local das bombas;
       - CNPJ/CPF completo do cliente no sistema ou da empresa no CIGAM, ou só
         a raiz do CNPJ (8 dígitos);
-      - cliente_id do sistema, nº da bomba ou serial do equipamento.
+      - cliente_id do sistema, nº da bomba, serial do equipamento ou ID
+        operacional da alocação (o "ID" das planilhas do financeiro).
     Devolve TODOS os candidatos, com a coluna `_motivo` dizendo por que cada
     um apareceu — quem escolhe entre eles é o usuário, nunca a busca. Um
     número pode ser várias coisas ao mesmo tempo (id, bomba, serial,
@@ -558,7 +820,7 @@ def buscar_clientes_sistema(diretorio: pd.DataFrame, termo: str, chaves: pd.Data
 
     if chaves is not None and not chaves.empty:
         if so_numero:
-            casou = (chaves["tipo"].isin(["bomba", "serial"]) & (chaves["chave"] == digitos))
+            casou = (chaves["tipo"].isin(["bomba", "serial", "id_op"]) & (chaves["chave"] == digitos))
             if len(digitos) <= 6:
                 casou |= chaves["_codigo_num"] == int(digitos)
             if len(digitos) in (11, 14):
@@ -949,7 +1211,7 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     return cores
 
 
-def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None):
+def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
     quebrado em pausas longas, agrupada pelo pagante de hoje (o posto vai no
     hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
@@ -964,6 +1226,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None):
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
                for b, n in info["bomba_nome"].items()}
     postos = info["posto_nome"].to_dict()
+    ids_op = info["id_op"].to_dict() if "id_op" in info else {}
     grupos = dict(zip(ordem["bomba_id"], ordem["grupo"]))
 
     def eixo_y(bombas):
@@ -985,7 +1248,9 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None):
 
     def _hover(p, extra):
         return [
-            f"<b>{rotulos.get(b, b)}</b><br>Posto: {postos.get(b) or '—'}<br>Serial {s or '—'} · {extra(b)}<br>"
+            f"<b>{rotulos.get(b, b)}</b><br>Posto: {postos.get(b) or '—'}"
+            + (f" · ID operacional {ids_op[b]}" if isinstance(ids_op.get(b), str) else "")
+            + f"<br>Serial {s or '—'} · {extra(b)}<br>"
             f"{i:%d/%m/%Y} → {f:%d/%m/%Y}<br>"
             + f"{d} dia(s) com abastecimento · {l:,.0f} L".replace(",", ".")
             for b, s, i, f, d, l in zip(p["bomba_id"], p["serial"], p["inicio"], p["fim_real"], p["dias"], p["litros"])
@@ -1044,6 +1309,7 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None):
             name="Troca de serial",
             marker=dict(symbol="star", size=10, color=COR_FUNDO_GRAFICO, line=dict(width=1.5, color=COR_TEXTO_GRAFICO)),
             hovertext=[f"<b>Troca de serial</b><br>{rotulos.get(b, b)}<br>{d:%d/%m/%Y}<br>{a} → <b>{n}</b>"
+                       + (f"<br>↳ {_truncar((origens or {})[(n, b)], 140)}" if (n, b) in (origens or {}) else "")
                        for b, d, a, n in zip(t["bomba_id"], t["data"], t["serial_anterior"], t["serial_novo"])],
             hoverinfo="text",
         ))
@@ -1173,6 +1439,24 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
                               str(getattr(e, "message", e))[:300])
     resumo = anexar_alocacao(resumo, alocacao) if alocacao is not None else resumo
 
+    # percurso de cada serial fora das bombas do cliente (outros clientes e
+    # outras bases): é o que mostra transferência não documentada
+    aviso_percurso = None
+    seriais_cliente = tuple(sorted(por_serial["serial"].dropna().unique())) if not por_serial.empty else ()
+    if modo_demo:
+        percurso = gerar_percurso_demo(cadastro, uso, alocacao)
+    elif not seriais_cliente:
+        percurso = None
+    else:
+        try:
+            percurso = carregar_percurso_seriais(client_bq, project_id, seriais_cliente, alocacao is not None)
+        except (Forbidden, NotFound, BadRequest) as e:
+            percurso = None
+            aviso_percurso = "Sem o percurso dos seriais fora do cliente: " + str(getattr(e, "message", e))[:300]
+    transferencias, percursos = derivar_transferencias(percurso, base, cliente_id)
+    origens = {(r["serial"], r["_bomba_destino"]): f"{r['tipo']}: {r['de']}"
+               for _, r in transferencias.iterrows()} if not transferencias.empty else {}
+
     # --- filtros (uma linha, valem pra tudo abaixo) ---
     anos = sorted(uso_b["data"].dt.year.unique().tolist()) if not uso_b.empty else []
     col_p, col_g, col_b = st.columns([1.2, 1.4, 4])
@@ -1233,7 +1517,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
                        "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
-            for linha in alertas_de_pagante(resumo):
+            for linha in alertas_de_pagante(resumo) + alertas_id_operacional(resumo):
                 st.warning(linha, icon="⚠️")
         elif aviso_alocacao:
             st.caption(aviso_alocacao)
@@ -1245,26 +1529,31 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if periodos.empty:
             st.caption("Nenhuma bomba abasteceu no período.")
         else:
-            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"]), use_container_width=True)
+            st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens),
+                            use_container_width=True)
 
     st.markdown("**Todas as bombas do cliente** (todo o período)")
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
-        "canal": "Canal", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
-        "pagante_rotulo": "Pagante hoje (CIGAM)",
+        "canal": "Canal", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
+        "pagante_rotulo": "Pagante hoje (CIGAM)", "local_rotulo": "Local hoje (CIGAM)",
         "primeiro_abastecimento": "Primeiro abastecimento", "ultimo_abastecimento": "Último abastecimento",
         "dias_com_uso": "Dias com uso", "litros_total": "Volume total (L)",
         "media_por_dia_de_uso": "Média por dia de uso (L)", "trocas_serial": "Trocas de serial",
         "historico_seriais": "Seriais (período de uso)",
     }
-    if "pagante_rotulo" not in resumo:
-        del colunas["pagante_rotulo"]
+    for col in ("pagante_rotulo", "local_rotulo", "id_op"):
+        if col not in resumo:
+            del colunas[col]
     tabela = resumo[list(colunas)].rename(columns=colunas)
     if "Pagante hoje (CIGAM)" in tabela:
         tabela["Pagante hoje (CIGAM)"] = [
             ("⚠ " if fora else "") + (p if isinstance(p, str) else "—")
             for p, fora in zip(tabela["Pagante hoje (CIGAM)"], resumo["pagante_fora_do_grupo"])]
     tabela["Serial atual"] = tabela["Serial atual"].fillna("—")
+    for col in ("ID operacional", "Local hoje (CIGAM)"):
+        if col in tabela:
+            tabela[col] = tabela[col].where(tabela[col].notna(), "—")
     tabela["Volume total (L)"] = tabela["Volume total (L)"].round(0)
     st.dataframe(
         tabela, use_container_width=True, hide_index=True,
@@ -1277,12 +1566,15 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     )
 
     equipamentos = montar_resumo_equipamentos(por_serial, resumo)
+    if not equipamentos.empty and percursos:
+        equipamentos["percurso"] = equipamentos["serial"].map(percursos).fillna("—")
     if not equipamentos.empty:
         st.markdown(f"**Equipamentos (seriais) que passaram pelo cliente** ({len(equipamentos)})")
         st.dataframe(
             equipamentos.rename(columns={
                 "serial": "Serial", "bombas": "Bombas em que esteve", "qtd_bombas": "Nº de bombas",
                 "primeiro": "Primeiro uso", "ultimo": "Último uso", "litros": "Volume (L)", "situacao": "Situação hoje",
+                "percurso": "Percurso completo (todos os clientes e bases)",
             }).assign(**{"Volume (L)": lambda d: d["Volume (L)"].round(0)}),
             use_container_width=True, hide_index=True,
             column_config={
@@ -1291,6 +1583,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
                 "Volume (L)": st.column_config.NumberColumn(format="localized"),
             },
         )
+
+    renderizar_transferencias(transferencias, aviso_percurso)
 
     if litros_sem_bomba > 0:
         st.caption(f"Além das bombas acima, {_fmt_litros(litros_sem_bomba)} foram abastecidos sem bomba "
