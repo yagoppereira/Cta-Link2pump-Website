@@ -28,6 +28,25 @@ import streamlit as st
 import equipamentos_sistema
 import gerar_espelho_nfse
 import gerar_nota_debito
+import importlib
+
+
+def _recarregar_se_mudou(modulo):
+    """O Streamlit reexecuta o app.py a cada interação, mas mantém em memória
+    os módulos importados: depois de um deploy, o app.py novo rodava com o
+    equipamentos_sistema.py ANTIGO (visto em 23/10/2026 — a aba seguia
+    agrupando por posto com dois PRs já mergeados). Recarrega o módulo
+    quando o arquivo dele mudou desde a última carga."""
+    mtime = os.path.getmtime(modulo.__file__)
+    if getattr(modulo, "_mtime_carregado", None) != mtime:
+        modulo = importlib.reload(modulo)
+        modulo._mtime_carregado = mtime
+    return modulo
+
+
+equipamentos_sistema = _recarregar_se_mudou(equipamentos_sistema)
+gerar_espelho_nfse = _recarregar_se_mudou(gerar_espelho_nfse)
+gerar_nota_debito = _recarregar_se_mudou(gerar_nota_debito)
 
 st.set_page_config(page_title="Histórico de Mensalidade — CIGAM", layout="wide")
 
