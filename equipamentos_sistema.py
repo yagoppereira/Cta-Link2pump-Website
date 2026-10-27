@@ -76,6 +76,9 @@ COR_ALERTA = "#FF4B4B"
 # seta de serial que mudou de bomba: clara e pontilhada, pra não competir
 # com as barras
 COR_MOVIMENTO = "rgba(241, 241, 241, 0.7)"
+# colchete que une os canais de um equipamento duplo: cheio, lilás claro —
+# fora da paleta dos pagantes
+COR_DUPLO = "#B8A9FF"
 CORES_PAGANTES = CORES_BOMBAS[:6]
 COR_OUTROS_PAGANTES = CORES_BOMBAS[6]
 
@@ -427,6 +430,56 @@ def _rotulo_local(linha, base_cliente: str, cliente_id: str) -> str:
     return f"{nome} (#{linha['bomba_id']}) · {cliente}"
 
 
+def _tipo_por_canais(n: int) -> str:
+    """Nº de bombas (canais) atendidas ao mesmo tempo → tipo do equipamento,
+    a mesma régua de silver.cadastro_bombas.bombas_no_equipamento."""
+    return {1: "simples", 2: "duplo", 3: "triplo"}.get(int(n), "quádruplo")
+
+
+def agrupar_instalacoes(passagens: pd.DataFrame) -> list:
+    """
+    Passagens de UM serial (colunas base, cliente_id, bomba_id, inicio, fim,
+    litros) → instalações, na ordem do tempo. Passagens no mesmo (base,
+    cliente) que se sobrepõem por DIAS_MIN_SOBREPOSICAO_CANAIS dias ou mais
+    são a MESMA instalação: os canais de um equipamento duplo/triplo. Cada
+    instalação traz `canais` (nº de bombas distintas) — 2 = duplo.
+    É a régua única de "duplo" da aba: linha do tempo, tabela de
+    equipamentos e transferências usam esta função.
+    """
+    instalacoes = []
+    for _, linha in passagens.sort_values("inicio").iterrows():
+        chave = (linha["base"], linha["cliente_id"])
+        atual = instalacoes[-1] if instalacoes else None
+        sobreposicao = (min(linha["fim"], atual["fim"]) - max(linha["inicio"], atual["inicio"])).days \
+            if atual else -1
+        if atual and atual["chave"] == chave and sobreposicao >= DIAS_MIN_SOBREPOSICAO_CANAIS:
+            atual["linhas"].append(linha)
+            atual["fim"] = max(atual["fim"], linha["fim"])
+        else:
+            instalacoes.append({"chave": chave, "inicio": linha["inicio"], "fim": linha["fim"], "linhas": [linha]})
+    for inst in instalacoes:
+        inst["canais"] = len({r["bomba_id"] for r in inst["linhas"]})
+    return instalacoes
+
+
+def canais_do_cliente(por_serial: pd.DataFrame) -> pd.DataFrame:
+    """Equipamentos que funcionaram como DUPLO (ou triplo) nas bombas do
+    cliente, inclusive os já retirados: uma linha por (serial, conjunto de
+    bombas) com o período em que os canais abasteceram juntos."""
+    colunas = ["serial", "bombas", "canais", "inicio", "fim"]
+    if por_serial is None or por_serial.empty:
+        return pd.DataFrame(columns=colunas)
+    p = por_serial.rename(columns={"primeiro": "inicio", "ultimo": "fim"}).assign(base="", cliente_id="")
+    linhas = []
+    for serial, g in p.groupby("serial"):
+        for inst in agrupar_instalacoes(g):
+            if inst["canais"] > 1:
+                bombas = tuple(r["bomba_id"] for r in sorted(inst["linhas"], key=lambda r: str(r["bomba_id"])))
+                linhas.append({"serial": serial, "bombas": bombas, "canais": inst["canais"],
+                               "inicio": inst["inicio"], "fim": inst["fim"]})
+    return pd.DataFrame(linhas, columns=colunas)
+
+
 def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -> tuple:
     """
     Transforma o percurso dos seriais em INSTALAÇÕES e TRANSFERÊNCIAS:
@@ -447,25 +500,16 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
     p["cliente_id"] = p["cliente_id"].astype(object).where(p["cliente_id"].notna(), None)
     eventos, percursos = [], {}
     for serial, g in p.sort_values(["serial", "inicio"]).groupby("serial"):
-        instalacoes = []
-        for _, linha in g.iterrows():
-            chave = (linha["base"], linha["cliente_id"])
-            atual = instalacoes[-1] if instalacoes else None
-            sobreposicao = (min(linha["fim"], atual["fim"]) - max(linha["inicio"], atual["inicio"])).days \
-                if atual else -1
-            if atual and atual["chave"] == chave and sobreposicao >= DIAS_MIN_SOBREPOSICAO_CANAIS:
-                atual["linhas"].append(linha)
-                atual["fim"] = max(atual["fim"], linha["fim"])
-            else:
-                instalacoes.append({"chave": chave, "inicio": linha["inicio"], "fim": linha["fim"], "linhas": [linha]})
+        instalacoes = agrupar_instalacoes(g)
         do_cliente = [inst["chave"] == (base, str(cliente_id)) for inst in instalacoes]
         if not any(do_cliente):
             continue
         def _onde(inst, do_proprio):
             # no próprio cliente o que importa é a BOMBA; fora dele, o cliente
             if do_proprio:
-                return " + ".join(f"{_truncar(r.get('bomba_nome'), 30) or 'bomba'} (#{r['bomba_id']})"
-                                  for r in inst["linhas"])
+                bombas = " + ".join(f"{_truncar(r.get('bomba_nome'), 30) or 'bomba'} (#{r['bomba_id']})"
+                                    for r in inst["linhas"])
+                return bombas + (f" [{_tipo_por_canais(inst['canais'])}]" if inst["canais"] > 1 else "")
             outra_base = "" if inst["chave"][0] == base else \
                 f" [{BASES_SISTEMA.get(inst['chave'][0], inst['chave'][0])}]"
             return f"{_truncar(inst['linhas'][0].get('cliente_nome'), 28) or 'cliente desconhecido'}{outra_base}"
@@ -496,9 +540,11 @@ def derivar_transferencias(percurso: pd.DataFrame, base: str, cliente_id: str) -
                 "serial": serial, "data": b["inicio"], "saida": a["fim"],
                 "periodo": periodo,
                 "tipo": tipo,
-                "de": " + ".join(_rotulo_local(r, base, cliente_id) for r in a["linhas"]),
+                "de": " + ".join(_rotulo_local(r, base, cliente_id) for r in a["linhas"])
+                      + (f" [{_tipo_por_canais(a['canais'])}]" if a["canais"] > 1 else ""),
                 "base_de": BASES_SISTEMA.get(a["chave"][0], a["chave"][0]),
-                "para": " + ".join(_rotulo_local(r, base, cliente_id) for r in b["linhas"]),
+                "para": " + ".join(_rotulo_local(r, base, cliente_id) for r in b["linhas"])
+                        + (f" [{_tipo_por_canais(b['canais'])}]" if b["canais"] > 1 else ""),
                 "base_para": BASES_SISTEMA.get(b["chave"][0], b["chave"][0]),
                 "entre_bases": a["chave"][0] != b["chave"][0],
                 "_bomba_destino": lb["bomba_id"],
@@ -543,6 +589,31 @@ def renderizar_transferencias(transferencias: pd.DataFrame, aviso: str = None):
                "Passagem de menos de 50 L num lugar é tratada como teste e fica de fora. O percurso completo de cada "
                "serial, inclusive por outras bases antes de chegar ao cliente, está na tabela de equipamentos acima. "
                "Link2Pump não está no fato diário — passagem por lá não aparece.")
+
+
+def contar_trocas_por_equipamento(trocas: pd.DataFrame) -> int:
+    """Trocas de serial contadas uma vez por EQUIPAMENTO: num duplo os dois
+    canais recebem o mesmo serial novo no mesmo período — é uma troca só."""
+    if trocas is None or trocas.empty:
+        return 0
+    return int(trocas.drop_duplicates(["serial_anterior", "serial_novo"]).shape[0])
+
+
+def alertas_duplo(resumo: pd.DataFrame) -> list:
+    """Equipamento duplo de hoje com pagantes diferentes nos canais: é UM
+    equipamento físico (uma licença de pedestal duplo) cobrado de dois
+    pagantes — vale conferir na planilha do financeiro."""
+    if "pagante_codigo" not in resumo:
+        return []
+    r = resumo[resumo["situacao"].isin(SITUACOES_ATIVAS)].dropna(subset=["equipamento_id"])
+    linhas = []
+    for _, g in r.groupby("equipamento_id"):
+        pagantes = set(g["pagante_rotulo"].dropna())
+        if len(g) > 1 and len(pagantes) > 1:
+            linhas.append(f"**Equipamento {_tipo_por_canais(len(g))} (serial {g['serial_equipamento'].iloc[0]}) com "
+                          f"pagantes diferentes nos canais:** "
+                          + "; ".join(f"{rb} → {pg}" for rb, pg in zip(g["rotulo"], g["pagante_rotulo"])) + ".")
+    return linhas
 
 
 def alertas_id_operacional(resumo: pd.DataFrame) -> list:
@@ -941,25 +1012,46 @@ def montar_resumo_bombas(cadastro: pd.DataFrame, uso: pd.DataFrame, por_serial: 
     resumo["rotulo"] = [_rotulo_bomba(b, n) for b, n in zip(resumo["bomba_id"], resumo["bomba_nome"])]
     resumo["situacao"] = resumo.apply(lambda l: _situacao(l, cliente_id), axis=1)
     resumo["instalacao"] = resumo["tanque_movel"].map({True: "Móvel (comboio)", False: "Fixa (pedestal)"})
+    # tipo do equipamento instalado HOJE: nº de bombas ativas do cliente com o
+    # mesmo equipamento_id (2 = duplo), e o canal desta bomba nele
+    ativa = resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"]) & resumo["equipamento_id"].notna()
+    n_canais = resumo[ativa].groupby("equipamento_id")["bomba_id"].transform("nunique")
+    resumo["equipamento_tipo"] = None
+    resumo.loc[ativa, "equipamento_tipo"] = [
+        _tipo_por_canais(n).capitalize() + (f" · canal {int(c)}" if n > 1 and pd.notna(c) else "")
+        for n, c in zip(n_canais, resumo.loc[ativa, "canal"])]
     return resumo.sort_values(["litros_total", "rotulo"], ascending=[False, True]).reset_index(drop=True)
 
 
 def montar_resumo_equipamentos(por_serial: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame:
-    """1 linha por SERIAL (equipamento): por quais bombas passou, primeiro e
-    último uso, volume, e se ainda está instalado hoje numa bomba do
-    cliente (pelo cadastro atual). Um equipamento duplo aparece uma vez,
-    com as 2 bombas (canais)."""
+    """1 linha por SERIAL (equipamento): tipo (simples/duplo pela régua de
+    agrupar_instalacoes), por onde passou no cliente — duplo aparece como UMA
+    instalação com os canais juntos, mudança de bomba aparece com "→" —,
+    primeiro e último uso, volume, e se ainda está instalado hoje numa bomba
+    do cliente (pelo cadastro atual)."""
     if por_serial.empty:
         return pd.DataFrame()
     rotulos = resumo.set_index("bomba_id")["rotulo"].to_dict()
     instalado = resumo[resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])]
     bombas_hoje = instalado.dropna(subset=["serial_equipamento"]).groupby("serial_equipamento")["rotulo"].apply(
         lambda s: ", ".join(sorted(s))).to_dict()
-    eq = por_serial.groupby("serial").agg(
-        bombas=("bomba_id", lambda s: ", ".join(rotulos.get(b, b) for b in sorted(set(s)))),
-        qtd_bombas=("bomba_id", "nunique"),
-        primeiro=("primeiro", "min"), ultimo=("ultimo", "max"), litros=("litros", "sum"),
-    ).reset_index()
+    p = por_serial.rename(columns={"primeiro": "inicio", "ultimo": "fim"}).assign(base="", cliente_id="")
+    linhas = []
+    for serial, g in p.groupby("serial"):
+        insts = agrupar_instalacoes(g)
+        onde = " → ".join(
+            (f"{_tipo_por_canais(i['canais'])}: " if i["canais"] > 1 else "")
+            + " + ".join(rotulos.get(r["bomba_id"], r["bomba_id"]) for r in i["linhas"])
+            + f" ({i['inicio']:%m/%y}–{i['fim']:%m/%y})"
+            for i in insts)
+        # tipo = como o equipamento está/esteve na ÚLTIMA instalação; se já
+        # foi diferente antes (duplo que virou simples), diz entre parênteses
+        atual, maximo = insts[-1]["canais"], max(i["canais"] for i in insts)
+        tipo = _tipo_por_canais(atual).capitalize() + \
+            (f" (foi {_tipo_por_canais(maximo)} antes)" if maximo != atual else "")
+        linhas.append({"serial": serial, "tipo": tipo, "onde": onde,
+                       "primeiro": g["inicio"].min(), "ultimo": g["fim"].max(), "litros": g["litros"].sum()})
+    eq = pd.DataFrame(linhas)
     eq["situacao"] = eq["serial"].map(
         lambda s: f"Instalado hoje em {bombas_hoje[s]}" if s in bombas_hoje else "Não está mais nas bombas do cliente")
     return eq.sort_values(["ultimo", "litros"], ascending=[False, False]).reset_index(drop=True)
@@ -1143,14 +1235,24 @@ def _sem_prefixo_do_cliente(nome, nome_cliente) -> str:
     return resto or nome
 
 
-def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame:
+def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None) -> pd.DataFrame:
     """Uma linha por bomba da timeline, na ordem de exibição, agrupada pelo
     PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
     mesma ordem das cores), "sem alocação" por último entre as instaladas;
     depois as bombas retiradas, as que hoje estão em outro cliente e as fora
     do cadastro. Dentro do grupo, pela data do primeiro uso. Sem alocação
-    carregada, as instaladas ficam num grupo só."""
+    carregada, as instaladas ficam num grupo só. Canais do mesmo equipamento
+    (duplo de hoje pelo equipamento_id; duplo já retirado por `canais`)
+    ficam lado a lado."""
     info = resumo.set_index("bomba_id")
+    equip_de = {}
+    if canais is not None and not canais.empty:
+        for _, c in canais.sort_values("inicio").iterrows():
+            for b in c["bombas"]:
+                equip_de[b] = f"serial {c['serial']}"
+    for b, e in info["equipamento_id"].items():
+        if isinstance(e, str) and e:
+            equip_de[b] = f"equip {e}"
     tem_alocacao = "pagante_rotulo" in resumo
     ordem_pagantes = {p: i for i, p in enumerate(cores_pagantes(resumo))} if tem_alocacao else {}
     linhas = []
@@ -1169,7 +1271,9 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame
     df = pd.DataFrame(linhas)
     if df.empty:
         return df
-    return df.sort_values(["rank", "grupo", "inicio"]).reset_index(drop=True)
+    df["equip"] = [equip_de.get(b, f"bomba {b}") for b in df["bomba_id"]]
+    df["inicio_equip"] = df.groupby(["grupo", "equip"])["inicio"].transform("min")
+    return df.sort_values(["rank", "grupo", "inicio_equip", "equip", "inicio"]).reset_index(drop=True)
 
 
 def alertas_de_pagante(resumo: pd.DataFrame) -> list:
@@ -1207,19 +1311,26 @@ def cores_pagantes(resumo: pd.DataFrame) -> dict:
     return cores
 
 
-def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None):
+def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=None, movimentos=None, canais=None):
     """Timeline: quando cada bomba abasteceu, um segmento por serial,
     quebrado em pausas longas, agrupada pelo pagante de hoje (o posto vai no
     hover). O trecho do serial instalado HOJE tem a cor do pagante de hoje
     (alocação CIGAM); pagante com conta própria no sistema ganha contorno
     vermelho e ⚠ no nome."""
-    ordem = ordem_timeline(periodos, resumo)
+    ordem = ordem_timeline(periodos, resumo, canais)
     info = resumo.set_index("bomba_id")
     tem_alocacao = "pagante_rotulo" in resumo
     alerta = info["pagante_fora_do_grupo"].to_dict() if tem_alocacao else {}
     # o nome da bomba repete o do cliente em boa parte da base — tira esse
     # prefixo e corta o nome, nunca o "(#id)", que é o que torna o rótulo único
+    # canais de um duplo ganham a marca no nome, além do colchete no gráfico
+    tipo_canal = {}
+    if canais is not None and not canais.empty:
+        for _, c in canais.iterrows():
+            for b in c["bombas"]:
+                tipo_canal[b] = _tipo_por_canais(c["canais"])
     rotulos = {b: ("⚠ " if alerta.get(b) else "") + _rotulo_bomba(b, _truncar(_sem_prefixo_do_cliente(n, nome_cliente), 38))
+               + (f" [{tipo_canal[b]}]" if b in tipo_canal else "")
                for b, n in info["bomba_nome"].items()}
     postos = info["posto_nome"].to_dict()
     ids_op = info["id_op"].to_dict() if "id_op" in info else {}
@@ -1297,6 +1408,26 @@ def plotar_periodos(periodos, trocas, resumo, ano, nome_cliente=None, origens=No
         p = periodos[periodos["categoria"] == categoria]
         if not p.empty:
             _barras(p, categoria, cor, hachura=hachura)
+
+    # colchete do equipamento duplo: linha cheia ligando os canais no início
+    # do período em que abasteceram juntos (a seta de mudança é pontilhada)
+    if canais is not None and not canais.empty:
+        primeira = True
+        for _, c in canais.iterrows():
+            visiveis_c = [b for b in ordem["bomba_id"] if b in c["bombas"]]
+            if len(visiveis_c) < 2:
+                continue
+            texto = (f"<b>Equipamento {_tipo_por_canais(c['canais'])} · serial {c['serial']}</b><br>"
+                     f"Canais: {', '.join(rotulos.get(b, b) for b in visiveis_c)}<br>"
+                     f"{c['inicio']:%d/%m/%Y} → {c['fim']:%d/%m/%Y}")
+            fig.add_trace(go.Scatter(
+                x=[c["inicio"]] * len(visiveis_c), y=eixo_y(visiveis_c), mode="lines+markers",
+                name="Mesmo equipamento (duplo)", legendgroup="duplo", showlegend=primeira,
+                hovertext=[texto] * len(visiveis_c), hoverinfo="text",
+                line=dict(color=COR_DUPLO, width=2.5),
+                marker=dict(symbol="line-ew", size=10, line=dict(width=2.5, color=COR_DUPLO)),
+            ))
+            primeira = False
 
     # seta discreta ligando o fim do serial numa bomba ao começo dele na
     # bomba seguinte — só quando as duas bombas estão na linha do tempo
@@ -1440,6 +1571,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
 
     uso_b = uso.dropna(subset=["bomba_id"])
     por_serial = seriais_por_bomba(uso_b)
+    # equipamentos que funcionaram como duplo/triplo no cliente (inclusive
+    # retirados) — a mesma régua das transferências
+    canais = canais_do_cliente(por_serial)
     trocas = derivar_trocas(por_serial)
     resumo = montar_resumo_bombas(cadastro, uso, por_serial, trocas, cliente_id)
     litros_sem_bomba = float(uso.loc[uso["bomba_id"].isna(), "litros"].sum())
@@ -1519,8 +1653,10 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         m4.metric("Período com abastecimento",
                   f"{uso_periodo['data'].min():%m/%y} – {uso_periodo['data'].max():%m/%y}",
                   help=f"{uso_periodo['data'].min():%d/%m/%Y} a {uso_periodo['data'].max():%d/%m/%Y}")
-    m5.metric("Trocas de serial", len(trocas_periodo),
-              help="Primeira vez que um serial novo aparece numa bomba, pelo serial gravado em cada abastecimento.")
+    m5.metric("Trocas de equipamento", contar_trocas_por_equipamento(trocas_periodo),
+              help="Primeira vez que um serial novo aparece numa bomba, pelo serial gravado em cada abastecimento. "
+                   "Contada uma vez por equipamento: num duplo, os dois canais trocam juntos e isso é UMA troca "
+                   "(no gráfico, cada canal ganha a sua ★).")
 
     if not selecionadas:
         st.info("Selecione ao menos uma bomba pra ver o gráfico de volume.")
@@ -1539,14 +1675,14 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
                        "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
-            for linha in alertas_de_pagante(resumo) + alertas_id_operacional(resumo):
+            for linha in alertas_de_pagante(resumo) + alertas_id_operacional(resumo) + alertas_duplo(resumo):
                 st.warning(linha, icon="⚠️")
         elif aviso_alocacao:
             st.caption(aviso_alocacao)
         # filtro de grupo (pagante / retiradas): esconde as LINHAS das bombas.
         # Clicar na legenda do Plotly só some com as barras e deixa a linha
         # vazia no eixo, por isso o clique na legenda fica desligado
-        ordem_grupos = ordem_timeline(periodos, resumo)
+        ordem_grupos = ordem_timeline(periodos, resumo, canais)
         grupos_disponiveis = list(dict.fromkeys(ordem_grupos["grupo"])) if not ordem_grupos.empty else []
         if len(grupos_disponiveis) > 1:
             grupos_vistos = st.pills(
@@ -1563,13 +1699,13 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
             st.caption("Nenhuma bomba abasteceu no período ou nos grupos escolhidos.")
         else:
             st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
-                                            transferencias),
+                                            transferencias, canais),
                             use_container_width=True)
 
     st.markdown("**Todas as bombas do cliente** (todo o período)")
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
-        "canal": "Canal", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
+        "equipamento_tipo": "Equipamento", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
         "pagante_rotulo": "Pagante hoje (CIGAM)", "local_rotulo": "Local hoje (CIGAM)",
         "primeiro_abastecimento": "Primeiro abastecimento", "ultimo_abastecimento": "Último abastecimento",
         "dias_com_uso": "Dias com uso", "litros_total": "Volume total (L)",
@@ -1585,6 +1721,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
             ("⚠ " if fora else "") + (p if isinstance(p, str) else "—")
             for p, fora in zip(tabela["Pagante hoje (CIGAM)"], resumo["pagante_fora_do_grupo"])]
     tabela["Serial atual"] = tabela["Serial atual"].fillna("—")
+    tabela["Equipamento"] = tabela["Equipamento"].fillna("—")
     for col in ("ID operacional", "Local hoje (CIGAM)"):
         if col in tabela:
             tabela[col] = tabela[col].where(tabela[col].notna(), "—")
@@ -1606,7 +1743,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         st.markdown(f"**Equipamentos (seriais) que passaram pelo cliente** ({len(equipamentos)})")
         st.dataframe(
             equipamentos.rename(columns={
-                "serial": "Serial", "bombas": "Bombas em que esteve", "qtd_bombas": "Nº de bombas",
+                "serial": "Serial", "tipo": "Tipo", "onde": "Onde esteve no cliente (duplo = canais juntos; → = mudou)",
                 "primeiro": "Primeiro uso", "ultimo": "Último uso", "litros": "Volume (L)", "situacao": "Situação hoje",
                 "percurso": "Percurso completo (todos os clientes e bases)",
             }).assign(**{"Volume (L)": lambda d: d["Volume (L)"].round(0)}),
