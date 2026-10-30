@@ -3589,19 +3589,42 @@ def _cache_itens_nf_por_numero():
 def _consultar_itens_notas_fiscais(numeros_validos: tuple) -> dict:
     """Consulta de fato os itens de NF no BigQuery — chamada só por
     buscar_itens_notas_fiscais_lote, com as NFs que ainda não estão no
-    cache por NF (ver lá)."""
+    cache por NF (ver lá).
+
+    Em 2 passos, não um só com "nf IN UNNEST(...) OR fatura IN UNNEST(...)":
+    cigam__notas_fiscais é CLUSTER BY nf (confirmado no DDL) — um filtro
+    limpo em `nf` deixa o BigQuery pular blocos que não têm nenhum dos
+    números pedidos. Um OR com `fatura` (sem cluster) tira essa garantia
+    pra query INTEIRA, e varre a tabela toda mesmo pra achar só 1 NF —
+    time de dados reportou consumo elevado nessa exata query. `nf` e
+    `fatura` guardam o MESMO número na grande maioria das linhas (a
+    varredura por `fatura` existe pra um caso raro que não foi
+    identificado), então o 2º passo só roda pros números que sobrarem
+    sem bater no 1º — na prática, quase nunca."""
     numeros_validos = list(numeros_validos)
     if MODO_DEMO:
         _, itens_demo = obter_dados_demo_bq()
         return {n: itens_demo[n] for n in numeros_validos if n in itens_demo}
 
+    resultado = _buscar_itens_por_coluna("nf", numeros_validos)
+    faltando = [n for n in numeros_validos if n not in resultado]
+    if faltando:
+        for chave, itens in _buscar_itens_por_coluna("fatura", faltando).items():
+            resultado.setdefault(chave, itens)
+    return resultado
+
+
+def _buscar_itens_por_coluna(coluna: str, numeros: list) -> dict:
+    """Roda a consulta de itens de NF filtrando só por UMA coluna (`nf`
+    ou `fatura`) — ver _consultar_itens_notas_fiscais pra saber por que
+    as duas não entram juntas num OR só."""
     query = f"""
     SELECT nf, fatura, itensNf_json
     FROM `{PROJECT_ID}.bronze.cigam__notas_fiscais`
-    WHERE nf IN UNNEST(@numeros) OR fatura IN UNNEST(@numeros)
+    WHERE {coluna} IN UNNEST(@numeros)
     """
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("numeros", "STRING", numeros_validos)]
+        query_parameters=[bigquery.ArrayQueryParameter("numeros", "STRING", numeros)]
     )
     df = client_bq.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
 
