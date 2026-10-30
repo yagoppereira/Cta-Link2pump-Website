@@ -84,9 +84,10 @@ COR_OUTROS_PAGANTES = CORES_BOMBAS[6]
 
 # timeline: mais de N dias sem abastecer quebra o período de uso
 DIAS_SEM_USO_QUEBRA_PERIODO = 30
-# acima disso a timeline mostra só as bombas selecionadas (cliente grande
-# chega a 200+ bombas, ~6000px de gráfico) — um toggle mostra todas
-LIMITE_TIMELINE_COMPLETA = 25
+# acima disso a timeline mostra só as N bombas de maior volume do filtro
+# (cliente grande chega a 200+ bombas, ~6000px de gráfico) — o filtro de
+# pagante/bomba no topo da aba é o caminho pra ver as outras
+LIMITE_TIMELINE_COMPLETA = 40
 
 GRANULARIDADES = {"Dia": "D", "Semana": "W", "Mês": "M"}
 
@@ -1235,6 +1236,43 @@ def _sem_prefixo_do_cliente(nome, nome_cliente) -> str:
     return resto or nome
 
 
+def grupos_das_bombas(resumo: pd.DataFrame) -> dict:
+    """bomba_id → (grupo, posição do grupo). Grupo = PAGANTE de hoje (com ⚠
+    se sinalizado) para bomba instalada; "Retiradas", "Hoje em outro cliente"
+    ou "Fora do cadastro atual" para as demais. É a mesma régua no filtro de
+    pagante e na linha do tempo."""
+    info = resumo.set_index("bomba_id")
+    tem_alocacao = "pagante_rotulo" in resumo
+    ordem_pagantes = {p: i for i, p in enumerate(cores_pagantes(resumo))} if tem_alocacao else {}
+    grupos = {}
+    for bomba in info.index:
+        situacao = info.at[bomba, "situacao"]
+        if situacao in SITUACOES_ATIVAS:
+            pagante = (info.at[bomba, "pagante_rotulo"] or SEM_ALOCACAO) if tem_alocacao else GRUPO_INSTALADAS
+            rank = ordem_pagantes.get(pagante, len(ordem_pagantes))
+            fora = bool(info.at[bomba, "pagante_fora_do_grupo"]) if tem_alocacao else False
+            grupo = ("⚠ " if fora else "") + (rotulo_pagante_curto(pagante) if tem_alocacao else pagante)
+        elif situacao in (GRUPO_OUTRO_CLIENTE, GRUPO_FORA_CADASTRO):
+            grupo, rank = situacao, 1000 + (situacao == GRUPO_FORA_CADASTRO)
+        else:
+            grupo, rank = GRUPO_RETIRADAS, 999
+        grupos[bomba] = (grupo, rank)
+    return grupos
+
+
+def rotulo_de_busca(linha) -> str:
+    """Rótulo da bomba no filtro: nome, nº da bomba, serial instalado hoje e
+    ID operacional — o filtro do Streamlit busca no texto do rótulo, então é
+    isso que deixa achar a bomba pelo serial ou pelo ID da planilha."""
+    partes = [linha["rotulo"]]
+    serial = linha.get("serial_equipamento")
+    partes.append(f"serial {serial}" if isinstance(serial, str) and serial else "sem equipamento hoje")
+    id_op = linha.get("id_op")
+    if isinstance(id_op, str) and id_op:
+        partes.append(f"ID {id_op}")
+    return " · ".join(partes)
+
+
 def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.DataFrame = None) -> pd.DataFrame:
     """Uma linha por bomba da timeline, na ordem de exibição, agrupada pelo
     PAGANTE de hoje (alocação CIGAM): pagantes com mais bombas primeiro (é a
@@ -1253,20 +1291,10 @@ def ordem_timeline(periodos: pd.DataFrame, resumo: pd.DataFrame, canais: pd.Data
     for b, e in info["equipamento_id"].items():
         if isinstance(e, str) and e:
             equip_de[b] = f"equip {e}"
-    tem_alocacao = "pagante_rotulo" in resumo
-    ordem_pagantes = {p: i for i, p in enumerate(cores_pagantes(resumo))} if tem_alocacao else {}
+    grupos = grupos_das_bombas(resumo)
     linhas = []
     for bomba, g in periodos.groupby("bomba_id"):
-        situacao = info.at[bomba, "situacao"] if bomba in info.index else GRUPO_FORA_CADASTRO
-        if situacao in SITUACOES_ATIVAS:
-            pagante = (info.at[bomba, "pagante_rotulo"] or SEM_ALOCACAO) if tem_alocacao else GRUPO_INSTALADAS
-            rank = ordem_pagantes.get(pagante, len(ordem_pagantes))
-            fora = bool(info.at[bomba, "pagante_fora_do_grupo"]) if tem_alocacao else False
-            grupo = ("⚠ " if fora else "") + (rotulo_pagante_curto(pagante) if tem_alocacao else pagante)
-        elif situacao in (GRUPO_OUTRO_CLIENTE, GRUPO_FORA_CADASTRO):
-            grupo, rank = situacao, 1000 + (situacao == GRUPO_FORA_CADASTRO)
-        else:
-            grupo, rank = GRUPO_RETIRADAS, 999
+        grupo, rank = grupos.get(bomba, (GRUPO_FORA_CADASTRO, 1001))
         linhas.append({"bomba_id": bomba, "grupo": grupo, "rank": rank, "inicio": g["inicio"].min()})
     df = pd.DataFrame(linhas)
     if df.empty:
@@ -1613,37 +1641,61 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     origens = {(r["serial"], r["_bomba_destino"]): f"{r['tipo']}: {r['de']}"
                for _, r in transferencias.iterrows()} if not transferencias.empty else {}
 
-    # --- filtros (uma linha, valem pra tudo abaixo) ---
+    # --- filtros: UM painel que vale para tudo abaixo (números, gráficos,
+    # tabelas e transferências). Antes eram três filtros soltos — bombas do
+    # gráfico, botões de pagante e "mostrar todas" na linha do tempo — que
+    # não conversavam, e a busca de bombas não achava o serial.
+    grupos_bomba = grupos_das_bombas(resumo)
+    posicao_grupo = {}
+    for g, r in grupos_bomba.values():
+        posicao_grupo[g] = min(r, posicao_grupo.get(g, r))
+    opcoes_grupo = sorted(posicao_grupo, key=lambda g: (posicao_grupo[g], g))
+    volume_total = resumo.set_index("bomba_id")["litros_total"].to_dict()
+    rotulos_busca = {r["bomba_id"]: rotulo_de_busca(r) for _, r in resumo.iterrows()}
     anos = sorted(uso_b["data"].dt.year.unique().tolist()) if not uso_b.empty else []
-    col_p, col_g, col_b = st.columns([1.2, 1.4, 4])
+
+    st.markdown("**Filtros** · valem para os números, os gráficos, as tabelas e as transferências abaixo")
+    col_p, col_g, col_b = st.columns([1, 2.4, 3.6])
     with col_p:
         periodo = st.selectbox("Período", ["Todo o período"] + [str(a) for a in reversed(anos)],
                                key=f"eq_periodo_{base}_{cliente_id}")
     ano = None if periodo == "Todo o período" else int(periodo)
     with col_g:
-        # todo o período por dia vira um emaranhado de linhas — semana por
-        # padrão; ao focar num ano, dia (como no gráfico original)
-        padrao = "Dia" if ano is not None else "Semana"
-        granularidade = st.segmented_control(
-            "Agrupar volume por", list(GRANULARIDADES), default=padrao,
-            key=f"eq_granularidade_{base}_{cliente_id}_{periodo}") or padrao
-
-    uso_periodo = uso_b if ano is None else uso_b[uso_b["data"].dt.year == ano]
-    trocas_periodo = trocas if ano is None else trocas[trocas["data"].dt.year == ano]
-    ranking = uso_periodo.groupby("bomba_id")["litros"].sum().sort_values(ascending=False).index.tolist()
-    rotulos = resumo.set_index("bomba_id")["rotulo"].to_dict()
+        grupos_escolhidos = st.multiselect(
+            "Pagante hoje / situação", opcoes_grupo, default=[], placeholder="Todos",
+            key=f"eq_grupos_{base}_{cliente_id}")
+    candidatas = [b for b in resumo["bomba_id"]
+                  if not grupos_escolhidos or grupos_bomba.get(b, ("", 0))[0] in grupos_escolhidos]
+    candidatas.sort(key=lambda b: -volume_total.get(b, 0.0))
     with col_b:
-        # a chave inclui o período: trocar o ano re-aplica a pré-seleção das
-        # bombas que de fato abasteceram nele (mais usadas primeiro)
-        selecionadas = st.multiselect(
-            f"Bombas no gráfico (até {MAX_BOMBAS_GRAFICO}; mais usadas no período primeiro)",
-            options=ranking, default=ranking[:MAX_BOMBAS_GRAFICO],
-            format_func=lambda b: rotulos.get(b, b), max_selections=MAX_BOMBAS_GRAFICO,
-            key=f"eq_bombas_{base}_{cliente_id}_{periodo}",
-        )
+        # a chave muda com os grupos: trocar o pagante limpa a escolha de
+        # bombas que talvez nem estejam mais nas opções
+        bombas_escolhidas = st.multiselect(
+            "Bombas", candidatas, default=[], format_func=lambda b: rotulos_busca.get(b, b),
+            placeholder="Todas — busque por nome, nº da bomba, serial atual ou ID operacional",
+            key=f"eq_bombas_{base}_{cliente_id}_{'|'.join(sorted(grupos_escolhidos))}")
+    filtradas = set(bombas_escolhidas) if bombas_escolhidas else set(candidatas)
+    filtro_ativo = bool(grupos_escolhidos or bombas_escolhidas)
+    if filtro_ativo:
+        st.caption(f"Filtro ativo: {len(filtradas)} de {resumo['bomba_id'].nunique()} bombas.")
 
-    # --- números do período ---
-    equipados = resumo[resumo["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])]
+    resumo_f = resumo[resumo["bomba_id"].isin(filtradas)]
+    uso_f = uso_b[uso_b["bomba_id"].isin(filtradas)]
+    trocas_f = trocas[trocas["bomba_id"].isin(filtradas)]
+    por_serial_f = por_serial[por_serial["bomba_id"].isin(filtradas)]
+    canais_f = canais[canais["bombas"].map(lambda bs: any(b in filtradas for b in bs))] if not canais.empty else canais
+    if transferencias is not None and not transferencias.empty:
+        transferencias_f = transferencias[
+            transferencias["_bomba_saida"].isin(filtradas) | transferencias["_bomba_chegada"].isin(filtradas)
+            | transferencias["_bomba_destino"].isin(filtradas)]
+    else:
+        transferencias_f = transferencias
+    uso_periodo = uso_f if ano is None else uso_f[uso_f["data"].dt.year == ano]
+    trocas_periodo = trocas_f if ano is None else trocas_f[trocas_f["data"].dt.year == ano]
+    ranking = uso_periodo.groupby("bomba_id")["litros"].sum().sort_values(ascending=False).index.tolist()
+
+    # --- números do período (com o filtro) ---
+    equipados = resumo_f[resumo_f["situacao"].isin(["Instalada", "Bomba inativa no cadastro"])]
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Bombas com uso no período", len(ranking))
     m2.metric("Equipamentos instalados hoje", int(equipados["equipamento_id"].nunique()),
@@ -1658,15 +1710,30 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
                    "Contada uma vez por equipamento: num duplo, os dois canais trocam juntos e isso é UMA troca "
                    "(no gráfico, cada canal ganha a sua ★).")
 
-    if not selecionadas:
-        st.info("Selecione ao menos uma bomba pra ver o gráfico de volume.")
-    else:
-        cores = _cores_estaveis(f"eq_cores_{base}_{cliente_id}", selecionadas)
+    # --- volume: as bombas do filtro, até MAX_BOMBAS_GRAFICO (mais volume primeiro) ---
+    no_grafico = ranking[:MAX_BOMBAS_GRAFICO]
+    col_t, col_gr = st.columns([3, 1.4], vertical_alignment="bottom")
+    with col_gr:
+        # todo o período por dia vira um emaranhado de linhas — semana por
+        # padrão; ao focar num ano, dia (como no gráfico original)
+        padrao = "Dia" if ano is not None else "Semana"
+        granularidade = st.segmented_control(
+            "Agrupar volume por", list(GRANULARIDADES), default=padrao,
+            key=f"eq_granularidade_{base}_{cliente_id}_{periodo}") or padrao
+    with col_t:
         st.markdown(f"**Volume abastecido por {granularidade.lower()}** · ★ = troca de serial")
-        st.plotly_chart(plotar_volume(uso_b, trocas, resumo, selecionadas, cores, granularidade, ano),
+        if len(ranking) > MAX_BOMBAS_GRAFICO:
+            st.caption(f"Mostrando as {MAX_BOMBAS_GRAFICO} de maior volume entre as {len(ranking)} do filtro — "
+                       "escolha bombas no filtro acima para ver outras.")
+    if not no_grafico:
+        st.info("Nenhuma bomba do filtro abasteceu no período.")
+    else:
+        cores = _cores_estaveis(f"eq_cores_{base}_{cliente_id}", no_grafico)
+        st.plotly_chart(plotar_volume(uso_f, trocas_f, resumo, no_grafico, cores, granularidade, ano),
                         use_container_width=True)
 
-    periodos = _periodos_de_uso(uso_b, resumo)
+    # --- linha do tempo: todas as bombas do filtro ---
+    periodos = _periodos_de_uso(uso_f, resumo)
     if not periodos.empty:
         if ano is not None:
             periodos = periodos[(periodos["inicio"].dt.year <= ano) & (periodos["fim_real"].dt.year >= ano)]
@@ -1675,34 +1742,26 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         if "pagante_rotulo" in resumo:
             st.caption("O trecho do serial instalado **hoje** tem a cor de quem **paga** a bomba hoje "
                        "(alocação CIGAM). A alocação é só o estado atual, então os trechos anteriores ficam cinza.")
-            for linha in alertas_de_pagante(resumo) + alertas_id_operacional(resumo) + alertas_duplo(resumo):
+            for linha in alertas_de_pagante(resumo_f) + alertas_id_operacional(resumo_f) + alertas_duplo(resumo_f):
                 st.warning(linha, icon="⚠️")
         elif aviso_alocacao:
             st.caption(aviso_alocacao)
-        # filtro de grupo (pagante / retiradas): esconde as LINHAS das bombas.
-        # Clicar na legenda do Plotly só some com as barras e deixa a linha
-        # vazia no eixo, por isso o clique na legenda fica desligado
-        ordem_grupos = ordem_timeline(periodos, resumo, canais)
-        grupos_disponiveis = list(dict.fromkeys(ordem_grupos["grupo"])) if not ordem_grupos.empty else []
-        if len(grupos_disponiveis) > 1:
-            grupos_vistos = st.pills(
-                "Mostrar na linha do tempo", grupos_disponiveis, selection_mode="multi",
-                default=grupos_disponiveis, key=f"eq_grupos_{base}_{cliente_id}_{periodo}")
-            bombas_vistas = set(ordem_grupos.loc[ordem_grupos["grupo"].isin(grupos_vistos or []), "bomba_id"])
-            periodos = periodos[periodos["bomba_id"].isin(bombas_vistas)]
         qtd_bombas_timeline = periodos["bomba_id"].nunique()
-        if qtd_bombas_timeline > LIMITE_TIMELINE_COMPLETA and not st.toggle(
-                f"Mostrar as {qtd_bombas_timeline} bombas (por padrão, só as selecionadas no gráfico acima)",
-                key=f"eq_timeline_todas_{base}_{cliente_id}"):
-            periodos = periodos[periodos["bomba_id"].isin(selecionadas)]
+        if qtd_bombas_timeline > LIMITE_TIMELINE_COMPLETA:
+            # cliente grande chega a 200+ bombas (~6000px): sem filtro, mostra
+            # as de maior volume e diz como ver as outras
+            maiores = sorted(periodos["bomba_id"].unique(), key=lambda b: -volume_total.get(b, 0.0))
+            periodos = periodos[periodos["bomba_id"].isin(maiores[:LIMITE_TIMELINE_COMPLETA])]
+            st.caption(f"Mostrando as {LIMITE_TIMELINE_COMPLETA} bombas de maior volume entre as "
+                       f"{qtd_bombas_timeline} do filtro — filtre por pagante ou bomba acima para ver as outras.")
         if periodos.empty:
-            st.caption("Nenhuma bomba abasteceu no período ou nos grupos escolhidos.")
+            st.caption("Nenhuma bomba do filtro abasteceu no período.")
         else:
             st.plotly_chart(plotar_periodos(periodos, trocas_periodo, resumo, ano, escolhido["cliente_nome"], origens,
-                                            transferencias, canais),
+                                            transferencias_f, canais_f),
                             use_container_width=True)
 
-    st.markdown("**Todas as bombas do cliente** (todo o período)")
+    st.markdown("**Bombas do cliente** (todo o período" + (", com o filtro" if filtro_ativo else "") + ")")
     colunas = {
         "rotulo": "Bomba", "posto_nome": "Posto", "tanque_nome": "Tanque", "instalacao": "Instalação",
         "equipamento_tipo": "Equipamento", "id_op": "ID operacional", "serial_equipamento": "Serial atual", "situacao": "Situação hoje",
@@ -1715,11 +1774,11 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
     for col in ("pagante_rotulo", "local_rotulo", "id_op"):
         if col not in resumo:
             del colunas[col]
-    tabela = resumo[list(colunas)].rename(columns=colunas)
+    tabela = resumo_f[list(colunas)].rename(columns=colunas)
     if "Pagante hoje (CIGAM)" in tabela:
         tabela["Pagante hoje (CIGAM)"] = [
             ("⚠ " if fora else "") + (p if isinstance(p, str) else "—")
-            for p, fora in zip(tabela["Pagante hoje (CIGAM)"], resumo["pagante_fora_do_grupo"])]
+            for p, fora in zip(tabela["Pagante hoje (CIGAM)"], resumo_f["pagante_fora_do_grupo"])]
     tabela["Serial atual"] = tabela["Serial atual"].fillna("—")
     tabela["Equipamento"] = tabela["Equipamento"].fillna("—")
     for col in ("ID operacional", "Local hoje (CIGAM)"):
@@ -1736,7 +1795,7 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         },
     )
 
-    equipamentos = montar_resumo_equipamentos(por_serial, resumo)
+    equipamentos = montar_resumo_equipamentos(por_serial_f, resumo)
     if not equipamentos.empty and percursos:
         equipamentos["percurso"] = equipamentos["serial"].map(percursos).fillna("—")
     if not equipamentos.empty:
@@ -1755,9 +1814,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
             },
         )
 
-    renderizar_transferencias(transferencias, aviso_percurso)
+    renderizar_transferencias(transferencias_f, aviso_percurso)
 
-    if litros_sem_bomba > 0:
+    if litros_sem_bomba > 0 and not filtro_ativo:
         st.caption(f"Além das bombas acima, {_fmt_litros(litros_sem_bomba)} foram abastecidos sem bomba "
                    "identificada (integração externa / lançamento manual) nos postos do cliente que têm bomba "
                    "cadastrada. Posto sem nenhuma bomba cadastrada não entra nesta conta.")
