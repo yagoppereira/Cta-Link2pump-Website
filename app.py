@@ -4402,7 +4402,31 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     if df_bombas is not None and not df_bombas.empty and "cliente_id_app" in df_bombas.columns:
         bombas = df_bombas.dropna(subset=["cliente_id_app"])
         codigos_achados = set(dir_df.loc[achados, "codigo_cliente"].dropna().astype(int))
-        ligadas = bombas[bombas["cliente_cigam_pagante"].isin(codigos_achados)
+        contas_sistema = _contas_sistema_por_raiz()
+        raiz_por_codigo = dict(zip(dir_df["codigo_cliente"], dir_df["_raiz_cnpj"]))
+
+        def _contas_proprias(cod):
+            raiz = str(raiz_por_codigo.get(cod) or "")
+            if contas_sistema is None or len(raiz) != 8:
+                return set()
+            mesmas = contas_sistema[contas_sistema["raiz"] == raiz]
+            return set(zip(mesmas["base"], mesmas["cliente_id"]))
+
+        # a busca partiu de uma DISTRIBUIDORA (paga bombas em 2+ contas que
+        # não são dela — ex.: buscar "PETROVERA"): pagar a bomba de um
+        # cliente não faz desse cliente parte do grupo dela, então só liga a
+        # conta onde ela é LOCAL ou que é a conta dela mesma
+        distribuidoras = set()
+        for cod in codigos_achados:
+            pagas = bombas[bombas["cliente_cigam_pagante"] == cod]
+            if len(set(zip(pagas["base"], pagas["cliente_id_app"])) - _contas_proprias(cod)) >= 2:
+                distribuidoras.add(cod)
+        conta_da_linha = list(zip(bombas["base"], bombas["cliente_id_app"]))
+        paga_e_liga = [
+            pd.notna(p) and int(p) in codigos_achados
+            and (int(p) not in distribuidoras or conta in _contas_proprias(int(p)))
+            for p, conta in zip(bombas["cliente_cigam_pagante"], conta_da_linha)]
+        ligadas = bombas[pd.Series(paga_e_liga, index=bombas.index)
                          | bombas["cliente_cigam_local"].isin(codigos_achados)]
         contas = set(zip(ligadas["base"], ligadas["cliente_id_app"]))
         if contas:
@@ -4412,6 +4436,34 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
                     if pd.notna(codigo):
                         contas_por_codigo.setdefault(int(codigo), set()).add(f"{base} {conta}")
             por_app = dir_df["codigo_cliente"].isin(list(contas_por_codigo))
+
+    # --- distribuidora / pagante de outras operações fica FORA do grupo ---
+    # Empresa que só entraria pelo ID do app porque PAGA bomba da conta do
+    # grupo, mas também paga bombas de OUTROS clientes do sistema (fora das
+    # contas do grupo e fora das contas dela mesma), é distribuidora — a
+    # carteira dela não é deste grupo. Ex.: Petrovera paga Gardênia Azul e
+    # Paciência na conta da Força Ambiental, e também Marbela, Intersea e
+    # Ouro Negro (03/11/2026): entrando no grupo União Norte, trazia todos
+    # esses contratos e bombas junto. Quem paga só bombas das contas do grupo
+    # (caso Orizon: CTRs, Vital, Econit...) continua entrando.
+    pagantes_externos = []
+    if por_app.any():
+        for idx in dir_df.index[por_app & ~achados]:
+            cod = int(dir_df.at[idx, "codigo_cliente"])
+            pagas = bombas[bombas["cliente_cigam_pagante"] == cod]
+            contas_pagas = set(zip(pagas["base"], pagas["cliente_id_app"]))
+            fora = contas_pagas - contas - _contas_proprias(cod)
+            if not fora:
+                continue
+            no_grupo = pagas[[c in contas for c in zip(pagas["base"], pagas["cliente_id_app"])]]
+            pagantes_externos.append({
+                "codigo": cod, "nome": dir_df.at[idx, "Cliente_Nome"],
+                "bombas_no_grupo": sorted(str(b) for b in no_grupo["bomba_nome"].dropna()),
+                "contas_fora": len(fora),
+                "bombas_fora": int(len(pagas) - len(no_grupo)),
+            })
+            por_app.at[idx] = False
+            contas_por_codigo.pop(cod, None)
 
     # --- troca de titularidade (um salto, a partir de quem já foi achado) ---
     # A alocação de bombas é só o estado de HOJE: empresa que pagava as
@@ -4475,7 +4527,26 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     grupo.loc[so_app, "_origem_match"] = grupo.loc[so_app, "codigo_cliente"].map(
         lambda c: "ID do app (" + ", ".join(sorted(contas_por_codigo.get(int(c), []))) + ")"
         if int(c) in contas_por_codigo else motivo_titularidade.get(int(c), "busca direta"))
-    return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
+    resultado = grupo.sort_values("Cliente_Nome").reset_index(drop=True)
+    resultado.attrs["pagantes_externos"] = pagantes_externos
+    return resultado
+
+
+def _contas_sistema_por_raiz():
+    """(base, cliente_id, raiz do CNPJ) das contas do sistema, do cadastro
+    de bombas que a aba Equipamentos já carrega (carga compartilhada de 1 h,
+    sem consulta nova quando ela já rodou). None se não der pra carregar —
+    aí a conta própria do pagante não é descontada."""
+    if MODO_DEMO:
+        return None
+    try:
+        cad = equipamentos_sistema.carregar_cadastro_bombas(client_bq, PROJECT_ID)
+    except Exception:
+        return None
+    contas = cad[cad["cliente_id"].notna() & (cad["cliente_cnpj"].str.len() == 14)][
+        ["base", "cliente_id", "cliente_cnpj"]].drop_duplicates()
+    contas["raiz"] = contas["cliente_cnpj"].str[:8]
+    return contas
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -4653,6 +4724,15 @@ def relatorio_grupo(termo: str):
     st.header(f"Grupo econômico — {nome_grupo}", anchor=False)
     st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por busca direta, raiz de CNPJ, ID do app "
                "e/ou troca de titularidade.")
+    for ext in grupo.attrs.get("pagantes_externos", []):
+        bombas_txt = ", ".join(ext["bombas_no_grupo"][:4]) + (
+            f" (+{len(ext['bombas_no_grupo']) - 4})" if len(ext["bombas_no_grupo"]) > 4 else "")
+        st.info(
+            f"**Fora do grupo: {ext['nome']} (CIGAM {ext['codigo']:06d}).** Paga "
+            f"{len(ext['bombas_no_grupo'])} bomba(s) deste grupo ({bombas_txt}), mas também paga "
+            f"{ext['bombas_fora']} bomba(s) de {ext['contas_fora']} outro(s) cliente(s) do sistema — é "
+            "distribuidora/pagante de outras operações, então os contratos e bombas dela não entram aqui.",
+            icon="ℹ️")
 
     codigos_grupo = tuple(int(c) for c in grupo["codigo_cliente"].dropna().unique())
     municipios_uf = buscar_municipio_uf_lote(codigos_grupo)
