@@ -2273,6 +2273,7 @@ def plotar_historico_multi(
                 "descricao": h.get("descricao", ""),
                 "empresa": h.get("empresa", ""),
                 "cor": cor,
+                "contratos_agrupados": h.get("contratos_agrupados"),
                 "mes": mes_fmt,
                 "valor_total": float(val) if pd.notna(val) else None,
                 "nfs": faturas[j] or "",
@@ -3164,29 +3165,47 @@ def agrupar_historicos_para_grafico(historicos: list, max_linhas: int = 20) -> l
     resultado = ativos + resto_mantido
 
     if resto_agrupado:
-        dfs_validos = [h["df"] for h in resto_agrupado if not h["df"].empty]
-        if dfs_validos:
-            df_outros = pd.concat(dfs_validos, ignore_index=True).groupby("mes", as_index=False)["valor"].sum()
-            df_outros["fatura"] = ""  # não faz sentido listar NF de um bucket agregado de vários contratos
-        else:
-            df_outros = pd.DataFrame(columns=["mes", "valor", "fatura"])
-        codigos_agrupados = ", ".join(str(h["grupo"]) for h in resto_agrupado)
-        resultado.append({
-            "grupo": "Outros",
-            "descricao": f"{len(resto_agrupado)} contrato(s) encerrado(s)",
-            "df": df_outros,
-            "data_cancelamento": None,
-            "motivo_cancelamento": None,
-            "descricao_item": "",
-            "observacao": f"Códigos agrupados: {resumir_lista(codigos_agrupados.split(', '), max_itens=8)}",
-            "qtd_itens": sum(h.get("qtd_itens", 0) for h in resto_agrupado),
-            "situacao": "E",
-            "valor_total": sum(h.get("valor_total", 0) for h in resto_agrupado),
-        })
+        # na view de GRUPO cada histórico tem "empresa": o "Outros" sai UM POR
+        # EMPRESA, com o nome e a cor dela — um "Outros" único misturava
+        # faturas de empresas diferentes e o resumo do período mostrava
+        # "Empresa não identificada" (grupo Aço Verde, 03/11/2026). Na view
+        # de cliente não há "empresa" e continua um "Outros" só.
+        por_empresa = {}
+        for h in resto_agrupado:
+            por_empresa.setdefault(h.get("empresa") or "", []).append(h)
+        for empresa, membros in por_empresa.items():
+            dfs_validos = [h["df"] for h in membros if not h["df"].empty]
+            if dfs_validos:
+                df_outros = pd.concat(dfs_validos, ignore_index=True).groupby("mes", as_index=False)["valor"].sum()
+                df_outros["fatura"] = ""  # não faz sentido listar NF de um bucket agregado de vários contratos
+            else:
+                df_outros = pd.DataFrame(columns=["mes", "valor", "fatura"])
+            codigos_agrupados = [str(h["grupo"]) for h in membros]
+            # código CIGAM no rótulo: filiais do mesmo grupo têm o mesmo nome
+            # curto ("ACO VERDE") e o rótulo é a chave da linha no gráfico
+            m_codigo = re.search(r"CIGAM (\d+)", empresa)
+            rotulo = (f"Outros — {_nome_curto_empresa(empresa.split(' · ')[0])}"
+                      + (f" (CIGAM {m_codigo.group(1)})" if m_codigo else "")) if empresa else "Outros"
+            resultado.append({
+                "grupo": rotulo,
+                "descricao": f"{len(membros)} contrato(s) encerrado(s)",
+                "df": df_outros,
+                "data_cancelamento": None,
+                "motivo_cancelamento": None,
+                "descricao_item": "",
+                "observacao": f"Códigos agrupados: {resumir_lista(codigos_agrupados, max_itens=8)}",
+                "qtd_itens": sum(h.get("qtd_itens", 0) for h in membros),
+                "situacao": "E",
+                "valor_total": sum(h.get("valor_total", 0) for h in membros),
+                "empresa": empresa,
+                "cor": next((h["cor"] for h in membros if h.get("cor")), None),
+                "contratos_agrupados": codigos_agrupados,
+            })
         st.caption(
             f"⚠ {len(resto_agrupado)} contrato(s) de menor relevância foram agrupados em "
-            f"uma única linha 'Outros' no gráfico, para manter a leitura possível "
-            f"(veja a lista completa na tabela de itens/contratos acima)."
+            + ("uma única linha 'Outros'" if len(por_empresa) == 1 and "" in por_empresa
+               else f"{len(por_empresa)} linha(s) 'Outros' (uma por empresa)")
+            + " no gráfico, para manter a leitura possível (veja a lista completa na tabela de itens/contratos acima)."
         )
 
     return resultado
@@ -4535,7 +4554,8 @@ def resumir_periodo_por_empresa(pontos_por_mes: dict) -> dict:
             l = linhas.setdefault(d.get("empresa") or "Empresa não identificada",
                                   {"contratos": set(), "meses": set(), "periodos": set(), "itens": 0,
                                    "total": 0.0, "cor": d.get("cor")})
-            l["contratos"].add(d.get("grupo"))
+            # linha "Outros" conta os contratos que ela agrega, não 1
+            l["contratos"].update(d.get("contratos_agrupados") or [d.get("grupo")])
             if periodo_eixo is not None:
                 l["meses"].add(periodo_eixo)
             l["total"] += float(d["valor_total"])
