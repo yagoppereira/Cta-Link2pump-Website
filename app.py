@@ -501,6 +501,7 @@ def carregar_bombas_do_dw():
     SELECT
       b.base,
       CAST(b.cliente_id AS STRING) AS cliente_id_app,
+      CAST(b.bomba_id AS STRING) AS bomba_id,
       b.bomba_nome,
       b.serial_equipamento,
       CAST(b.id_op_operacional AS STRING) AS id_op_operacional,
@@ -5542,7 +5543,10 @@ with aba_grupo:
         relatorio_grupo(st.session_state["grupo_buscado"])
 
 with aba_equipamentos:
-    equipamentos_sistema.renderizar_aba_equipamentos(client_bq, PROJECT_ID, MODO_DEMO)
+    # a aba Equipamentos reaproveita esta mesma carga horária da alocação
+    # (gold.bombas_alocadas) em vez de consultar a view de novo por cliente
+    equipamentos_sistema.renderizar_aba_equipamentos(client_bq, PROJECT_ID, MODO_DEMO,
+                                                     None if MODO_DEMO else df_bombas)
 
 with aba_espelho:
     renderizar_espelho_nfse()
