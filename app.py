@@ -1988,7 +1988,9 @@ def plotar_historico_multi(
         # cor resolvida em bloco (ver resolver_cores_dos_grupos): a
         # categoria semântica define a cor base, e o TOM varia entre
         # grupos da mesma categoria pra não virarem linhas idênticas
-        cor = mapa_cores_grupos.get(h["grupo"]) or interpolar_cor_gradiente(0.5)
+        # cor definida pelo caller (view de grupo: cor da EMPRESA, tons por
+        # contrato) tem prioridade sobre a cor por tipo de contrato
+        cor = h.get("cor") or mapa_cores_grupos.get(h["grupo"]) or interpolar_cor_gradiente(0.5)
         grupo_legenda = f"grupo_{i}"
         situacao_grupo = h.get("situacao")
 
@@ -2269,6 +2271,7 @@ def plotar_historico_multi(
                 "grupo": _cabecalho_para_mes(meses_str[j]).split("</b>")[0].replace("<b>Contrato ", "").strip(),
                 "descricao": h.get("descricao", ""),
                 "empresa": h.get("empresa", ""),
+                "cor": cor,
                 "mes": mes_fmt,
                 "valor_total": float(val) if pd.notna(val) else None,
                 "nfs": faturas[j] or "",
@@ -2796,7 +2799,12 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             f"<div style='font-size:0.85em; opacity:0.75;'>Contrato {dado_ponto.get('grupo','')} · {dado_ponto.get('descricao','')}</div>",
         ]
         if dado_ponto.get("empresa"):
-            linhas_cab.insert(1, f"<div style='font-size:0.9em;'><b>{dado_ponto['empresa']}</b></div>")
+            cor_emp = dado_ponto.get("cor") or COR_TEXTO_GRAFICO
+            linhas_cab.insert(1, f"<div style='font-size:0.9em; color:{cor_emp};'><b>{dado_ponto['empresa']}</b></div>")
+        if dado_ponto.get("cor"):
+            # faixa na cor da linha do gráfico: liga o card à linha certa
+            linhas_cab.insert(0, f"<div style='height:6px; background:{dado_ponto['cor']}; "
+                                 "border-radius:3px; margin-bottom:8px;'></div>")
         if dado_ponto.get("nfs"):
             linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
         if not dado_ponto.get("completo", True):
@@ -4484,6 +4492,108 @@ def carregar_trocas_titularidade() -> pd.DataFrame:
     return pd.DataFrame(linhas, columns=colunas)
 
 
+def colorir_historicos_por_empresa(historicos: list) -> dict:
+    """Uma COR por empresa (quem é faturado) e TONS dela por contrato — no
+    grupo econômico a pergunta é "de quem é esta fatura", não "que tipo de
+    contrato é". Paleta categórica validada contra o fundo escuro do
+    gráfico (a mesma da aba Equipamentos); tons só clareiam (variar_tom).
+    Grava h["cor"] em cada histórico e devolve {empresa: cor base}."""
+    paleta = equipamentos_sistema.CORES_BOMBAS
+    empresas = list(dict.fromkeys(h.get("empresa", "") for h in historicos))
+    cores_empresa = {e: paleta[i % len(paleta)] for i, e in enumerate(empresas)}
+    for empresa in empresas:
+        do_emp = sorted([h for h in historicos if h.get("empresa", "") == empresa],
+                        key=lambda h: (h.get("situacao") != "A", -(h.get("valor_total") or 0)))
+        for i, h in enumerate(do_emp):
+            fracao = i / (len(do_emp) - 1) if len(do_emp) > 1 else 0.0
+            h["cor"] = variar_tom(cores_empresa[empresa], fracao, intensidade=0.6)
+    return cores_empresa
+
+
+def _periodo_do_rotulo(rotulo):
+    """'Set/26' (formatar_mes_ano) → Period('2026-09')."""
+    try:
+        mes, ano = str(rotulo).split("/")
+        return pd.Period(year=2000 + int(ano), month=MESES_PT.index(mes.lower()) + 1, freq="M")
+    except (ValueError, AttributeError):
+        return None
+
+
+def resumir_periodo_por_empresa(pontos_por_mes: dict) -> dict:
+    """Por empresa (quem é faturado), a partir dos pontos EM EXIBIÇÃO no
+    gráfico (já respeita os filtros de situação e de contratos): contratos,
+    meses com NF, PERÍODOS cobrados segundo o texto dos itens ("PERÍODO:
+    Agosto/2026"), itens faturados, total e cor. Meses com NF ≠ períodos
+    cobrados mostra mês com 2 períodos juntos (ou NF sem texto de período)."""
+    linhas = {}
+    for rotulo, pontos in pontos_por_mes.items():
+        periodo_eixo = _periodo_do_rotulo(rotulo)
+        for d in pontos or []:
+            if not isinstance(d, dict) or d.get("valor_total") is None:
+                continue
+            l = linhas.setdefault(d.get("empresa") or "Empresa não identificada",
+                                  {"contratos": set(), "meses": set(), "periodos": set(), "itens": 0,
+                                   "total": 0.0, "cor": d.get("cor")})
+            l["contratos"].add(d.get("grupo"))
+            if periodo_eixo is not None:
+                l["meses"].add(periodo_eixo)
+            l["total"] += float(d["valor_total"])
+            for item in d.get("equipamentos") or []:
+                l["itens"] += 1
+                periodo = extrair_periodo_do_texto_item(item.get("texto"))
+                if periodo is not None:
+                    l["periodos"].add(periodo)
+    return linhas
+
+
+def _exibir_resumo_empresas(resumo: dict, equip_por_empresa: dict, por_mes: bool = False):
+    """Tabela do resumo por empresa, com a cor da empresa no gráfico."""
+    if not resumo:
+        return
+    linhas = []
+    for empresa, r in sorted(resumo.items(), key=lambda kv: -kv[1]["total"]):
+        linha = {"": "■", "Pagante (quem é faturado)": empresa, "Contratos": len(r["contratos"]),
+                 "Equipamentos hoje": equip_por_empresa.get(empresa, 0)}
+        if por_mes:
+            linha["Itens faturados"] = r["itens"]
+        else:
+            meses = sorted(r["meses"])
+            linha["Meses com NF"] = len(meses)
+            linha["De"] = formatar_mes_ano(meses[0]) if meses else "—"
+            linha["Até"] = formatar_mes_ano(meses[-1]) if meses else "—"
+        linha["Períodos cobrados (texto da NF)"] = len(r["periodos"])
+        linha["Faturado" + (" no mês" if por_mes else " no período")] = formatar_moeda(r["total"])
+        linhas.append(linha)
+    df = pd.DataFrame(linhas)
+    cores = [r["cor"] or COR_TEXTO_GRAFICO for _, r in sorted(resumo.items(), key=lambda kv: -kv[1]["total"])]
+    estilo = df.style.apply(lambda col: [f"color: {c}; font-size: 1.2em" for c in cores], subset=[""])
+    st.dataframe(estilo, use_container_width=True, hide_index=True)
+
+
+def renderizar_resumo_periodo_grupo(pontos_por_mes: dict, equip_por_empresa: dict):
+    """Cabeçalho do gráfico do grupo, SEGUINDO os filtros (situação e
+    contratos escolhidos): período em exibição, pagantes, equipamentos hoje,
+    total faturado, meses com NF e períodos cobrados — e uma linha por
+    pagante, na cor dele no gráfico."""
+    resumo = resumir_periodo_por_empresa(pontos_por_mes)
+    if not resumo:
+        return
+    meses = sorted({m for r in resumo.values() for m in r["meses"]})
+    periodos = {p for r in resumo.values() for p in r["periodos"]}
+    total = sum(r["total"] for r in resumo.values())
+    equip = sum(equip_por_empresa.get(e, 0) for e in resumo)
+    _md_seguro(
+        f"<b>Período em exibição:</b> {formatar_mes_ano(meses[0])} a {formatar_mes_ano(meses[-1])} · "
+        f"<b>{len(resumo)}</b> pagante(s) · <b>{equip}</b> equipamento(s) hoje · total faturado "
+        f"<b>{formatar_moeda(total)}</b> · <b>{len(meses)}</b> mês(es) com NF e <b>{len(periodos)}</b> período(s) "
+        f"cobrado(s) segundo o texto das NFs")
+    _exibir_resumo_empresas(resumo, equip_por_empresa)
+    st.caption("Segue os filtros acima (situação e contratos). \"Períodos cobrados\" lê o \"PERÍODO: mês/ano\" "
+               "dos itens da NF (só o licenciamento traz esse texto): mais períodos que meses = mês com 2 períodos "
+               "cobrados juntos; menos = mês sem texto de período. \"Equipamentos hoje\" vem da alocação de bombas "
+               "atual. A cor de cada pagante é a mesma das linhas do gráfico (um tom por contrato) e dos cards.")
+
+
 def _nome_curto_empresa(nome) -> str:
     """Duas primeiras palavras do nome da empresa, sem acento — "FORCA
     AMBIENTAL LTDA." → "FORCA AMBIENTAL", "UNIAO NORTE FLUMINENSE..." →
@@ -4575,6 +4685,9 @@ def relatorio_grupo(termo: str):
         return
 
     df_resumo = pd.DataFrame(linhas_resumo).sort_values("Mensalidade", ascending=False)
+    equip_por_empresa = {
+        f"{r['Empresa']} · CNPJ {r['CNPJ']} · CIGAM {int(r['Código']):06d}": int(r["Equipamentos"] or 0)
+        for _, r in df_resumo.iterrows()}
     total_contratos_ativos = int(df_resumo["Contratos ativos"].sum())
     total_equipamentos = int(df_resumo["Equipamentos"].sum())
     # valor médio POR EQUIPAMENTO (mensalidade do grupo / qtd. de
@@ -4696,6 +4809,7 @@ def relatorio_grupo(termo: str):
             })
 
     if historicos_grupo:
+        colorir_historicos_por_empresa(historicos_grupo)
         historicos_grafico_grupo = agrupar_historicos_para_grafico(historicos_grupo, max_linhas=20)
 
         # mesmos 3 controles do gráfico do cliente (filtro de situação,
@@ -4741,6 +4855,8 @@ def relatorio_grupo(termo: str):
             f"🔧 debug backfill: última falha = {_debug_faturamento_real['ultima_falha']!r} · "
             f"última qtd. de notas encontradas = {_debug_faturamento_real['ultima_qtd_notas']!r}"
         )
+        if pontos_por_mes_grupo:
+            renderizar_resumo_periodo_grupo(pontos_por_mes_grupo, equip_por_empresa)
         if fig_grupo is not None:
             # mesmo clique-pra-detalhe da view de cliente: clicar num
             # ponto mostra um card por CONTRATO em exibição naquele mês
@@ -4778,18 +4894,21 @@ def relatorio_grupo(termo: str):
                 total_por_empresa = {
                     e: sum((d.get("valor_total") or 0.0) for d in lst if isinstance(d, dict))
                     for e, lst in por_empresa_mes.items()}
-                st.dataframe(
-                    pd.DataFrame([{"Empresa (quem é faturado)": e, "Contratos": len(lst),
-                                   "Faturado no mês": formatar_moeda(total_por_empresa[e])}
-                                  for e, lst in sorted(por_empresa_mes.items(),
-                                                       key=lambda kv: -total_por_empresa[kv[0]])]),
-                    use_container_width=True, hide_index=True,
-                )
+                resumo_mes = resumir_periodo_por_empresa({mes_clicado_grupo or "": cards_do_mes_grupo})
+                periodos_mes = sorted({p for r in resumo_mes.values() for p in r["periodos"]})
+                _md_seguro(
+                    f"{len(resumo_mes)} pagante(s) · {sum(r['itens'] for r in resumo_mes.values())} item(ns) faturado(s) · "
+                    f"total {formatar_moeda(sum(r['total'] for r in resumo_mes.values()))} · períodos cobrados nas NFs "
+                    f"deste mês: <b>{', '.join(formatar_mes_ano(p) for p in periodos_mes) or 'nenhum texto de período'}</b>"
+                    + (" — <span style='color:#f59e0b;'>mais de um período no mesmo mês</span>" if len(periodos_mes) > 1 else ""))
+                _exibir_resumo_empresas(resumo_mes, equip_por_empresa, por_mes=True)
                 qtd_linhas_cards = sum(-(-len(lst) // 3) for lst in por_empresa_mes.values())
                 altura_cards_grupo = min(1200, max(400, 340 * min(qtd_linhas_cards, 3)))
                 with st.container(height=altura_cards_grupo):
                     for empresa_mes, lst in sorted(por_empresa_mes.items(), key=lambda kv: -total_por_empresa[kv[0]]):
-                        st.markdown(f"**{empresa_mes}** — {formatar_moeda(total_por_empresa[empresa_mes])} no mês")
+                        cor_emp = next((d.get("cor") for d in lst if isinstance(d, dict) and d.get("cor")), None)
+                        _md_seguro(f"<span style='color:{cor_emp or COR_TEXTO_GRAFICO};'>■</span> "
+                                   f"<b>{empresa_mes}</b> — {formatar_moeda(total_por_empresa[empresa_mes])} no mês")
                         col_cards_grupo = st.columns(min(3, len(lst)) or 1)
                         for i, dado_ponto in enumerate(lst):
                             with col_cards_grupo[i % len(col_cards_grupo)]:
