@@ -402,7 +402,12 @@ client_bq = None if MODO_DEMO else obter_clientes()
 def cnpj_invalido(cnpj: str) -> bool:
     """Placeholder comum na base (ex: '00.000.000/0000-00') — todos os
     dígitos iguais não é um CNPJ/CPF real e não deve ser usado como chave
-    de busca/consolidação (senão junta clientes não relacionados)."""
+    de busca/consolidação (senão junta clientes não relacionados).
+    Valor que não é texto (NULL do BigQuery vira NaN/None no pandas) também é
+    inválido — em 03/11/2026 um contrato com código de cliente em branco não
+    achou empresa, o CNPJ veio NULL e derrubou o app na carga do diretório."""
+    if not isinstance(cnpj, str):
+        return True
     return not cnpj or len(set(cnpj)) == 1
 
 
@@ -533,10 +538,11 @@ def carregar_diretorio_clientes_dw():
     FROM `{PROJECT_ID}.bronze.cigam__contratos` c
     LEFT JOIN `{PROJECT_ID}.bronze.cigam__empresas` e
       ON SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) = SAFE_CAST(e.codigo AS INT64)
-    WHERE COALESCE(c.cliente.codigo, c.contratante.codigo) IS NOT NULL
+    WHERE NULLIF(TRIM(COALESCE(c.cliente.codigo, c.contratante.codigo)), '') IS NOT NULL
     """
     df = client_bq.query(query).to_dataframe(create_bqstorage_client=False)
     df["codigo_cliente"] = pd.to_numeric(df["codigo_cliente"], errors="coerce").astype("Int64")
+    df["_cnpj_norm"] = df["_cnpj_norm"].fillna("")
     df.loc[df["_cnpj_norm"].apply(cnpj_invalido), "_cnpj_norm"] = ""
     return df
 
