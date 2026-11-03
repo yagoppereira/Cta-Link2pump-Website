@@ -112,88 +112,129 @@ def _norm_busca(texto) -> str:
 
 
 # --- 1. Dados (BigQuery) ---------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Carregando clientes do sistema (direto do BigQuery)...")
+# CUSTO NO DW (aviso de consumo, 03/11/2026). Na cobrança sob demanda o
+# BigQuery cobra pelo volume das COLUNAS lidas, com mínimo de 10 MB por
+# tabela referenciada. Por isso a aba faz só três leituras COMPARTILHADAS
+# (st.cache_data vale para todos os usuários do app) e o resto em memória:
+#   - cadastro de bombas inteiro (silver.cadastro_bombas, ~8 MB, 1 h):
+#     diretório, ponte de busca, postos e cadastro de cada cliente, contas
+#     para o alerta de pagante — antes eram 2 consultas por cliente aberto;
+#   - empresas do CIGAM (bronze.cigam__empresas, ~7 MB, 1 h);
+#   - passagens serial × bomba agregadas do fato (~20 mil linhas, 12 h — o
+#     fato só atualiza 1x por dia) — antes o fato INTEIRO (~280 MB das
+#     colunas usadas) era lido a cada cliente aberto, porque filtrar por
+#     serial não aproveita o cluster (base, posto, bomba).
+# A alocação CIGAM vem da carga horária que o app.py já faz de
+# gold.bombas_alocadas (passada em `bombas_alocadas`): antes a aba consultava
+# a view de novo a cada cliente, e ela referencia ~13 tabelas do bronze
+# (≥ 130 MB cobrados por consulta só pelo mínimo por tabela).
+# Por cliente aberto sobra UMA consulta: o uso diário dos postos dele, que o
+# cluster por posto mantém pequena.
+@st.cache_data(ttl=3600, show_spinner="Carregando o cadastro de bombas (direto do BigQuery)...")
+def carregar_cadastro_bombas(_client, project_id: str) -> pd.DataFrame:
+    """silver.cadastro_bombas inteiro das bases da aba, só as colunas usadas."""
+    sql = f"""
+    SELECT
+      base, bomba_id, bomba_nome, canal, bomba_ativa,
+      bomba_ultima_atualizacao AS bomba_atualizada_em,
+      equipamento_id, CAST(serial_equipamento AS STRING) AS serial_equipamento, equipamento_descricao,
+      tanque_nome, tanque_mobile AS tanque_movel,
+      CAST(posto_id AS STRING) AS posto_id, posto_nome, posto_cidade, posto_uf,
+      cliente_id, cliente_nome, REGEXP_REPLACE(IFNULL(cliente_cnpj, ''), r'\\D', '') AS cliente_cnpj,
+      trr_nome, IFNULL(trr_sistema_interno, FALSE) AS trr_interno
+    FROM {_tabela(project_id, TABELA_CADASTRO)}
+    WHERE base IN UNNEST(@bases)
+    """
+    return _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carregar_empresas_cigam(_client, project_id: str) -> pd.DataFrame:
+    """Código, nome, fantasia e CNPJ das empresas do CIGAM (~7 mil linhas)."""
+    sql = f"""
+    SELECT CAST(codigo AS STRING) AS codigo, ANY_VALUE(nomeCompleto) AS nome, ANY_VALUE(fantasia) AS fantasia,
+           ANY_VALUE(REGEXP_REPLACE(CAST(cnpjCpf AS STRING), r'\\D', '')) AS cnpj
+    FROM {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} GROUP BY 1
+    """
+    return _query(_client, sql, [])
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner="Carregando por onde cada serial já passou (direto do BigQuery)...")
+def carregar_passagens_seriais(_client, project_id: str) -> pd.DataFrame:
+    """Uma linha por (base, bomba, serial) do fato diário INTEIRO, com o
+    primeiro e o último dia de uso e os litros — ~20 mil linhas (03/11/2026).
+    Lida no máximo a cada 12 h e compartilhada entre todas as buscas."""
+    sql = f"""
+    SELECT base, CAST(bomba_id AS STRING) AS bomba_id, CAST(serial_equipamento AS STRING) AS serial,
+           MIN(data) AS inicio, MAX(data) AS fim, COUNT(*) AS dias, SUM(litros) AS litros
+    FROM {_tabela(project_id, TABELA_USO)}
+    WHERE serial_equipamento IS NOT NULL AND bomba_id IS NOT NULL
+    GROUP BY 1, 2, 3
+    """
+    df = _query(_client, sql, [])
+    df["inicio"] = pd.to_datetime(df["inicio"])
+    df["fim"] = pd.to_datetime(df["fim"])
+    df["litros"] = pd.to_numeric(df["litros"], errors="coerce").astype(float)
+    return df
+
+
 def carregar_clientes_sistema(_client, project_id: str) -> pd.DataFrame:
     """Diretório de clientes do sistema, com a contagem de bombas cadastradas
     hoje nos postos de cada um — só pra resolver a busca. Sai do cadastro de
-    bombas, então cliente sem nenhuma bomba cadastrada não aparece (e não
-    teria abastecimento por bomba pra mostrar)."""
-    sql = f"""
-    SELECT
-      base,
-      cliente_id,
-      ANY_VALUE(cliente_nome) AS cliente_nome,
-      REGEXP_REPLACE(IFNULL(ANY_VALUE(cliente_cnpj), ''), r'\\D', '') AS cnpj,
-      ANY_VALUE(trr_nome) AS trr_nome,
-      LOGICAL_OR(IFNULL(trr_sistema_interno, FALSE)) AS trr_interno,
-      COUNT(*) AS qtd_bombas,
-      COUNTIF(equipamento_id IS NOT NULL) AS qtd_bombas_com_equipamento
-    FROM {_tabela(project_id, TABELA_CADASTRO)}
-    WHERE base IN UNNEST(@bases) AND cliente_id IS NOT NULL
-    GROUP BY base, cliente_id
-    """
-    df = _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
+    bombas (carga compartilhada), então cliente sem nenhuma bomba cadastrada
+    não aparece (e não teria abastecimento por bomba pra mostrar)."""
+    cad = carregar_cadastro_bombas(_client, project_id)
+    cad = cad[cad["cliente_id"].notna()]
+    df = cad.groupby(["base", "cliente_id"], as_index=False).agg(
+        cliente_nome=("cliente_nome", "first"), cnpj=("cliente_cnpj", "first"), trr_nome=("trr_nome", "first"),
+        trr_interno=("trr_interno", "any"), qtd_bombas=("bomba_id", "size"),
+        qtd_bombas_com_equipamento=("equipamento_id", "count"))
+    df["cnpj"] = df["cnpj"].fillna("")
     df["_nome_norm"] = df["cliente_nome"].map(_norm_busca)
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner="Carregando a ponte CIGAM ↔ sistema (direto do BigQuery)...")
-def carregar_chaves_busca(_client, project_id: str) -> pd.DataFrame:
+def montar_chaves_busca(cadastro: pd.DataFrame, empresas: pd.DataFrame, bombas_alocadas: pd.DataFrame = None) -> pd.DataFrame:
     """
     Tudo que leva a um cliente do sistema além do nome/id/CNPJ dele, uma
     linha por (base, cliente_id, tipo, chave) — é a ponte que deixa o
-    financeiro buscar com o que ele tem na mão:
+    financeiro buscar com o que ele tem na mão. Montada em memória a partir
+    das cargas compartilhadas (sem consulta própria):
       - 'cigam': empresa do CIGAM que PAGA ou é LOCAL de bomba do cliente hoje
-        (gold.bombas_alocadas), com código, nome, fantasia e CNPJ do CIGAM;
+        (alocação de bombas), com código, nome, fantasia e CNPJ do CIGAM;
       - 'cigam_cnpj': empresa do CIGAM com o MESMO CNPJ do cliente no
         sistema — liga mesmo sem alocação;
       - 'bomba' e 'serial': bombas cadastradas hoje no cliente e o serial
         do equipamento instalado nelas;
-      - 'id_op': ID operacional da alocação (gold.bombas_alocadas.id_op_operacional)
-        — é o "ID" com que o financeiro e o controle de alocação identificam a
-        bomba nas planilhas ("ID 932169744 - São João da Barra").
+      - 'id_op': ID operacional da alocação — é o "ID" com que o financeiro e
+        o controle de alocação identificam a bomba nas planilhas ("ID
+        932169744 - São João da Barra").
     """
-    t_cad = _tabela(project_id, TABELA_CADASTRO)
-    t_emp = _tabela(project_id, TABELA_EMPRESAS_CIGAM)
-    sql = f"""
-    WITH emp AS (
-      SELECT CAST(codigo AS STRING) AS codigo, ANY_VALUE(nomeCompleto) AS nome, ANY_VALUE(fantasia) AS fantasia,
-             ANY_VALUE(REGEXP_REPLACE(CAST(cnpjCpf AS STRING), r'\\D', '')) AS cnpj
-      FROM {t_emp} GROUP BY 1
-    ),
-    aloc AS (
-      SELECT a.base, CAST(a.cliente_id AS STRING) AS cliente_id, p.papel, p.codigo, COUNT(*) AS bombas
-      FROM {_tabela(project_id, TABELA_ALOCACAO)} a,
-        UNNEST([STRUCT('pagante' AS papel, CAST(a.cliente_cigam_pagante AS STRING) AS codigo),
-                STRUCT('local' AS papel, CAST(a.cliente_cigam_local AS STRING) AS codigo)]) p
-      WHERE a.base IN UNNEST(@bases) AND p.codigo IS NOT NULL
-      GROUP BY 1, 2, 3, 4
-    ),
-    cad AS (
-      SELECT base, cliente_id, bomba_id, CAST(serial_equipamento AS STRING) AS serial,
-             REGEXP_REPLACE(IFNULL(cliente_cnpj, ''), r'\\D', '') AS cnpj
-      FROM {t_cad}
-      WHERE base IN UNNEST(@bases) AND cliente_id IS NOT NULL
-    )
-    SELECT a.base, a.cliente_id, 'cigam' AS tipo, a.codigo AS chave, a.papel, a.bombas,
-           e.nome, e.fantasia, e.cnpj
-    FROM aloc a LEFT JOIN emp e USING (codigo)
-    UNION ALL
-    SELECT DISTINCT c.base, c.cliente_id, 'cigam_cnpj', e.codigo, 'mesmo CNPJ', CAST(NULL AS INT64), e.nome, e.fantasia, e.cnpj
-    FROM cad c JOIN emp e ON e.cnpj = c.cnpj
-    WHERE LENGTH(c.cnpj) = 14 AND c.cnpj NOT LIKE '00000000%'
-    UNION ALL
-    SELECT DISTINCT a.base, CAST(a.cliente_id AS STRING), 'id_op', CAST(a.id_op_operacional AS STRING),
-           CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING)
-    FROM {_tabela(project_id, TABELA_ALOCACAO)} a
-    WHERE a.base IN UNNEST(@bases) AND a.id_op_operacional IS NOT NULL
-    UNION ALL
-    SELECT base, cliente_id, 'bomba', bomba_id, CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING) FROM cad
-    UNION ALL
-    SELECT DISTINCT base, cliente_id, 'serial', serial, CAST(NULL AS STRING), CAST(NULL AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING), CAST(NULL AS STRING)
-    FROM cad WHERE serial IS NOT NULL
-    """
-    df = _query(_client, sql, [bigquery.ArrayQueryParameter("bases", "STRING", list(BASES_SISTEMA))])
+    colunas = ["base", "cliente_id", "tipo", "chave", "papel", "bombas", "nome", "fantasia", "cnpj"]
+    partes = []
+    cad = cadastro[cadastro["cliente_id"].notna()]
+    emp = empresas.drop_duplicates("codigo") if empresas is not None and not empresas.empty else \
+        pd.DataFrame(columns=["codigo", "nome", "fantasia", "cnpj"])
+    if bombas_alocadas is not None and not bombas_alocadas.empty:
+        a = bombas_alocadas[bombas_alocadas["base"].isin(list(BASES_SISTEMA))]
+        for papel, col in (("pagante", "cliente_cigam_pagante"), ("local", "cliente_cigam_local")):
+            g = a.dropna(subset=[col]).assign(codigo=lambda d: d[col].map(lambda c: f"{int(c):06d}"))
+            g = g.groupby(["base", "cliente_id_app", "codigo"], as_index=False).size()
+            g = g.rename(columns={"cliente_id_app": "cliente_id", "size": "bombas", "codigo": "chave"})
+            partes.append(g.assign(tipo="cigam", papel=papel).merge(
+                emp.rename(columns={"codigo": "chave"}), on="chave", how="left"))
+        ids = a.dropna(subset=["id_op_operacional"])[["base", "cliente_id_app", "id_op_operacional"]].drop_duplicates()
+        partes.append(ids.rename(columns={"cliente_id_app": "cliente_id", "id_op_operacional": "chave"}).assign(tipo="id_op"))
+    cnpjs = cad[(cad["cliente_cnpj"].str.len() == 14) & ~cad["cliente_cnpj"].str.startswith("00000000")]
+    cnpjs = cnpjs[["base", "cliente_id", "cliente_cnpj"]].drop_duplicates()
+    partes.append(cnpjs.merge(emp, left_on="cliente_cnpj", right_on="cnpj").rename(columns={"codigo": "chave"})
+                  .assign(tipo="cigam_cnpj", papel="mesmo CNPJ").drop(columns=["cliente_cnpj"]))
+    partes.append(cad[["base", "cliente_id", "bomba_id"]].rename(columns={"bomba_id": "chave"}).assign(tipo="bomba"))
+    partes.append(cad.dropna(subset=["serial_equipamento"])[["base", "cliente_id", "serial_equipamento"]]
+                  .drop_duplicates().rename(columns={"serial_equipamento": "chave"}).assign(tipo="serial"))
+    df = pd.concat([p.reindex(columns=colunas) for p in partes], ignore_index=True)
+    df["cliente_id"] = df["cliente_id"].astype(str)
+    df["chave"] = df["chave"].astype(str)
     df["_nome_norm"] = df["nome"].map(_norm_busca)
     df["_fantasia_norm"] = df["fantasia"].map(_norm_busca)
     df["_codigo_num"] = pd.to_numeric(df["chave"].where(df["tipo"].isin(["cigam", "cigam_cnpj"])),
@@ -231,7 +272,7 @@ def _query(client, sql: str, params: list) -> pd.DataFrame:
     return client.query(sql, job_config=job_config).to_dataframe(create_bqstorage_client=False)
 
 
-@st.cache_data(ttl=1800, show_spinner="Buscando bombas e abastecimentos do cliente (direto do BigQuery)...")
+@st.cache_data(ttl=1800, show_spinner="Buscando os abastecimentos do cliente (direto do BigQuery)...")
 def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str):
     """
     Retorna (cadastro, uso) de um cliente do sistema:
@@ -240,22 +281,18 @@ def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str
         outro cliente ou sem equipamento), do fato diário da silver — que
         já aplica a limpeza canônica de silver.abastecimentos_validos.
         bomba_id e serial nulos vêm mantidos, pra soma de litros fechar
-        com a origem.
+        com a origem. É a ÚNICA consulta por cliente: o fato é clusterizado
+        por base, posto_id, bomba_id, e filtrar pelos postos do cliente é o
+        que mantém a leitura pequena.
       - cadastro: estado ATUAL de cada bomba (do cliente hoje + as que
-        apareceram nos abastecimentos), com o serial instalado hoje.
-    O fato é clusterizado por base, posto_id, bomba_id — filtrar pelos
-    postos do cliente é o que mantém a consulta barata.
+        apareceram nos abastecimentos), com o serial instalado hoje — sai do
+        cadastro compartilhado, sem consulta.
     """
-    t_cadastro, t_uso = _tabela(project_id, TABELA_CADASTRO), _tabela(project_id, TABELA_USO)
-    p_base = bigquery.ScalarQueryParameter("base", "STRING", base)
-    p_cliente = bigquery.ScalarQueryParameter("cliente_id", "STRING", str(cliente_id))
-
+    cad = carregar_cadastro_bombas(_client, project_id)
+    cad_base = cad[cad["base"] == base]
     # postos do cliente hoje — pelo cadastro de bombas, então posto sem
     # nenhuma bomba cadastrada hoje fica de fora (e o uso dele também)
-    postos = _query(_client, f"""
-    SELECT DISTINCT posto_id FROM {t_cadastro} WHERE base = @base AND cliente_id = @cliente_id
-    """, [p_base, p_cliente])
-    ids_postos = [int(p) for p in postos["posto_id"].dropna()]
+    ids_postos = sorted({int(p) for p in cad_base.loc[cad_base["cliente_id"] == str(cliente_id), "posto_id"].dropna()})
 
     if ids_postos:
         # o grão do fato inclui o posto: bomba que mudou de posto do mesmo
@@ -263,46 +300,33 @@ def carregar_parque_cliente(_client, project_id: str, base: str, cliente_id: str
         uso = _query(_client, f"""
         SELECT CAST(bomba_id AS STRING) AS bomba_id, data, CAST(serial_equipamento AS STRING) AS serial,
                SUM(litros) AS litros, SUM(qtd_abastecimentos) AS qtd_abastecimentos
-        FROM {t_uso}
+        FROM {_tabela(project_id, TABELA_USO)}
         WHERE base = @base AND posto_id IN UNNEST(@postos)
         GROUP BY 1, 2, 3
-        """, [p_base, bigquery.ArrayQueryParameter("postos", "INT64", ids_postos)])
+        """, [bigquery.ScalarQueryParameter("base", "STRING", base),
+              bigquery.ArrayQueryParameter("postos", "INT64", ids_postos)])
     else:
         uso = pd.DataFrame(columns=["bomba_id", "data", "serial", "litros", "qtd_abastecimentos"])
 
-    ids_bombas = [str(b) for b in uso["bomba_id"].dropna().unique()]
-    cadastro = _query(_client, f"""
-    SELECT
-      bomba_id,
-      bomba_nome,
-      canal,
-      bomba_ativa,
-      bomba_ultima_atualizacao AS bomba_atualizada_em,
-      equipamento_id,
-      CAST(serial_equipamento AS STRING) AS serial_equipamento,
-      equipamento_descricao,
-      tanque_nome,
-      tanque_mobile AS tanque_movel,
-      posto_nome,
-      posto_cidade,
-      posto_uf,
-      cliente_id AS cliente_id_atual
-    FROM {t_cadastro}
-    WHERE base = @base AND (cliente_id = @cliente_id OR bomba_id IN UNNEST(@bombas))
-    """, [p_base, p_cliente, bigquery.ArrayQueryParameter("bombas", "STRING", ids_bombas)])
+    ids_bombas = set(uso["bomba_id"].dropna().astype(str))
+    cadastro = cad_base[(cad_base["cliente_id"] == str(cliente_id)) | cad_base["bomba_id"].isin(ids_bombas)]
+    cadastro = cadastro.rename(columns={"cliente_id": "cliente_id_atual"})[[
+        "bomba_id", "bomba_nome", "canal", "bomba_ativa", "bomba_atualizada_em", "equipamento_id",
+        "serial_equipamento", "equipamento_descricao", "tanque_nome", "tanque_movel", "posto_nome",
+        "posto_cidade", "posto_uf", "cliente_id_atual"]].reset_index(drop=True)
 
     uso["data"] = pd.to_datetime(uso["data"])
     uso["litros"] = pd.to_numeric(uso["litros"], errors="coerce").astype(float)
     return cadastro, uso
 
 
-@st.cache_data(ttl=1800, show_spinner="Buscando a alocação CIGAM das bombas (direto do BigQuery)...")
-def carregar_alocacao_cigam(_client, project_id: str, base: str, cliente_id: str, bombas: tuple) -> pd.DataFrame:
+def alocacao_do_cliente(bombas_alocadas: pd.DataFrame, cadastro: pd.DataFrame, base: str, cliente_id: str,
+                        bombas) -> pd.DataFrame:
     """
-    Quem paga cada bomba HOJE (gold.bombas_alocadas, estado atual — não
-    serve pra atribuir período passado), com nome/CNPJ do CIGAM, e se o
-    pagante tem CONTA PRÓPRIA no sistema: outro cliente_id da mesma base cujo
-    CNPJ tem a mesma raiz (8 dígitos) do pagante. Pagante assim, com raiz
+    Quem paga cada bomba HOJE (alocação de bombas, estado atual — não serve
+    pra atribuir período passado), com nome/CNPJ do CIGAM, e se o pagante
+    tem CONTA PRÓPRIA no sistema: outro cliente_id da mesma base cujo CNPJ
+    tem a mesma raiz (8 dígitos) do pagante. Pagante assim, com raiz
     diferente da do próprio cliente, é sinal de bomba de outra operação no
     parque do cliente (ex.: Petrovera pagando 2 bombas nos postos da Força
     Ambiental, 22/10/2026). Não sinaliza:
@@ -318,94 +342,49 @@ def carregar_alocacao_cigam(_client, project_id: str, base: str, cliente_id: str
     Medido em 22/10/2026: 42 bombas de 15 clientes no CTA, quase todas pagas
     por distribuidora com conta própria (Combustran, Petrovera, Comercial
     Cordeiro, São Leopoldo TRR); nenhuma no Connect.
+    Tudo em memória: `bombas_alocadas` é a carga horária de
+    gold.bombas_alocadas que o app.py já faz; `cadastro`, a compartilhada.
     """
-    t_cad = _tabela(project_id, TABELA_CADASTRO)
-    sql = f"""
-    WITH aloc AS (
-      SELECT
-        CAST(a.bomba_id AS STRING) AS bomba_id,
-        CAST(a.cliente_cigam_pagante AS STRING) AS pagante_codigo,
-        p.nomeCompleto AS pagante_nome,
-        REGEXP_REPLACE(CAST(p.cnpjCpf AS STRING), r'\\D', '') AS pagante_cnpj,
-        CAST(a.cliente_cigam_local AS STRING) AS local_codigo,
-        l.nomeCompleto AS local_nome,
-        CAST(a.id_op_operacional AS STRING) AS id_op
-      FROM {_tabela(project_id, TABELA_ALOCACAO)} a
-      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} p
-        ON CAST(a.cliente_cigam_pagante AS STRING) = CAST(p.codigo AS STRING)
-      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} l
-        ON CAST(a.cliente_cigam_local AS STRING) = CAST(l.codigo AS STRING)
-      WHERE a.base = @base AND CAST(a.bomba_id AS STRING) IN UNNEST(@bombas)
-    ),
-    contas AS (
-      SELECT cliente_id, ANY_VALUE(cliente_nome) AS conta_nome,
-             SUBSTR(REGEXP_REPLACE(ANY_VALUE(cliente_cnpj), r'\\D', ''), 1, 8) AS raiz
-      FROM {t_cad}
-      WHERE base = @base AND LENGTH(REGEXP_REPLACE(cliente_cnpj, r'\\D', '')) = 14
-        AND NOT IFNULL(trr_sistema_interno, FALSE)
-      GROUP BY cliente_id
-    ),
-    outras AS (
-      SELECT a.bomba_id,
-             STRING_AGG(FORMAT('%s (id %s)', c.conta_nome, c.cliente_id), ', ' ORDER BY c.cliente_id LIMIT 3)
-               AS pagante_outras_contas
-      FROM aloc a
-      JOIN contas c ON c.raiz = SUBSTR(a.pagante_cnpj, 1, 8)
-      WHERE LENGTH(a.pagante_cnpj) = 14 AND c.raiz != '00000000' AND c.cliente_id != @cliente_id
-      GROUP BY a.bomba_id
-    )
-    SELECT
-      aloc.*,
-      o.pagante_outras_contas,
-      (SELECT ANY_VALUE(raiz) FROM contas WHERE cliente_id = @cliente_id) AS cliente_raiz
-    FROM aloc
-    LEFT JOIN outras o USING (bomba_id)
-    """
-    return _query(_client, sql, [
-        bigquery.ScalarQueryParameter("base", "STRING", base),
-        bigquery.ScalarQueryParameter("cliente_id", "STRING", str(cliente_id)),
-        bigquery.ArrayQueryParameter("bombas", "STRING", list(bombas)),
-    ])
+    colunas = ["bomba_id", "pagante_codigo", "pagante_nome", "pagante_cnpj", "local_codigo", "local_nome",
+               "id_op", "pagante_outras_contas", "cliente_raiz"]
+    if bombas_alocadas is None or bombas_alocadas.empty or "bomba_id" not in bombas_alocadas:
+        return pd.DataFrame(columns=colunas)
+    bombas = {str(b) for b in bombas}
+    a = bombas_alocadas[(bombas_alocadas["base"] == base) & bombas_alocadas["bomba_id"].astype(str).isin(bombas)]
+    codigo = lambda c: f"{int(c):06d}" if pd.notna(c) else None  # noqa: E731
+    aloc = pd.DataFrame({
+        "bomba_id": a["bomba_id"].astype(str),
+        "pagante_codigo": a["cliente_cigam_pagante"].map(codigo),
+        "pagante_nome": a["pagante_nome"],
+        "pagante_cnpj": a["pagante_cnpj"].fillna("").astype(str).str.replace(r"\D", "", regex=True),
+        "local_codigo": a["cliente_cigam_local"].map(codigo),
+        "local_nome": a["local_nome"],
+        "id_op": a["id_op_operacional"].where(a["id_op_operacional"].notna(), None),
+    })
+    contas = cadastro[(cadastro["base"] == base) & cadastro["cliente_id"].notna() & ~cadastro["trr_interno"].astype(bool)
+                      & (cadastro["cliente_cnpj"].str.len() == 14)]
+    contas = contas.groupby("cliente_id", as_index=False).agg(conta_nome=("cliente_nome", "first"),
+                                                              cnpj=("cliente_cnpj", "first"))
+    contas["raiz"] = contas["cnpj"].str[:8]
+    raiz_cliente = contas.loc[contas["cliente_id"] == str(cliente_id), "raiz"]
+    outras_por_raiz = (contas[(contas["cliente_id"] != str(cliente_id)) & (contas["raiz"] != "00000000")]
+                       .sort_values("cliente_id").groupby("raiz")
+                       .apply(lambda g: ", ".join(f"{n} (id {c})" for n, c in zip(g["conta_nome"][:3], g["cliente_id"][:3])),
+                              include_groups=False).to_dict())
+    raiz_pagante = aloc["pagante_cnpj"].where(aloc["pagante_cnpj"].str.len() == 14, "").str[:8]
+    aloc["pagante_outras_contas"] = raiz_pagante.map(outras_por_raiz)
+    aloc["cliente_raiz"] = raiz_cliente.iloc[0] if not raiz_cliente.empty else None
+    return aloc.reset_index(drop=True)[colunas]
 
 
-@st.cache_data(ttl=1800, show_spinner="Buscando por onde cada serial já passou (direto do BigQuery)...")
-def carregar_percurso_seriais(_client, project_id: str, seriais: tuple, com_alocacao: bool = True) -> pd.DataFrame:
-    """
-    Por onde cada serial (equipamento) já passou, em QUALQUER bomba, cliente
-    ou base do fato diário (cta + ipc): uma linha por (base, bomba, serial)
-    com o primeiro e o último dia de uso e os litros. Junta o cadastro atual
-    da bomba (nome, posto, cliente) e, com `com_alocacao`, quem paga a bomba
-    HOJE e o ID operacional dela.
-    Lê o fato inteiro filtrando por serial (o cluster é por posto/bomba, não
-    por serial) — medido em 23/10/2026: menos de R$ 0,01 por busca.
-    """
-    t_cad = _tabela(project_id, TABELA_CADASTRO)
-    sql_aloc = f"""
-      LEFT JOIN {_tabela(project_id, TABELA_ALOCACAO)} a
-        ON a.base = p.base AND CAST(a.bomba_id AS STRING) = p.bomba_id
-      LEFT JOIN {_tabela(project_id, TABELA_EMPRESAS_CIGAM)} e
-        ON CAST(e.codigo AS STRING) = CAST(a.cliente_cigam_pagante AS STRING)""" if com_alocacao else ""
-    colunas_aloc = ("CAST(a.cliente_cigam_pagante AS STRING) AS pagante_codigo, e.nomeCompleto AS pagante_nome, "
-                    "CAST(a.id_op_operacional AS STRING) AS id_op" if com_alocacao else
-                    "CAST(NULL AS STRING) AS pagante_codigo, CAST(NULL AS STRING) AS pagante_nome, "
-                    "CAST(NULL AS STRING) AS id_op")
-    sql = f"""
-    WITH p AS (
-      SELECT base, CAST(bomba_id AS STRING) AS bomba_id, CAST(serial_equipamento AS STRING) AS serial,
-             MIN(data) AS inicio, MAX(data) AS fim, COUNT(*) AS dias, SUM(litros) AS litros
-      FROM {_tabela(project_id, TABELA_USO)}
-      WHERE serial_equipamento IN UNNEST(@seriais) AND bomba_id IS NOT NULL
-      GROUP BY 1, 2, 3
-    )
-    SELECT p.*, c.bomba_nome, c.posto_nome, c.cliente_id, c.cliente_nome, {colunas_aloc}
-    FROM p
-    LEFT JOIN {t_cad} c ON c.base = p.base AND c.bomba_id = p.bomba_id{sql_aloc}
-    """
-    df = _query(_client, sql, [bigquery.ArrayQueryParameter("seriais", "INT64", [int(s) for s in seriais])])
-    df["inicio"] = pd.to_datetime(df["inicio"])
-    df["fim"] = pd.to_datetime(df["fim"])
-    df["litros"] = pd.to_numeric(df["litros"], errors="coerce").astype(float)
-    return df
+def percurso_dos_seriais(passagens: pd.DataFrame, cadastro: pd.DataFrame, seriais) -> pd.DataFrame:
+    """Por onde cada serial do cliente já passou, em QUALQUER bomba, cliente
+    ou base do fato diário (cta + ipc), com o cadastro atual da bomba (nome,
+    posto, cliente) — filtrado em memória das passagens compartilhadas."""
+    seriais = {str(s) for s in seriais}
+    p = passagens[passagens["serial"].isin(seriais)]
+    info = cadastro[["base", "bomba_id", "bomba_nome", "posto_nome", "cliente_id", "cliente_nome"]]
+    return p.merge(info, on=["base", "bomba_id"], how="left").reset_index(drop=True)
 
 
 # passagem de menos que isso num lugar é teste/configuração, não instalação
@@ -754,7 +733,7 @@ def gerar_dados_demo():
 
 
 def gerar_chaves_demo() -> pd.DataFrame:
-    """Ponte CIGAM ↔ sistema fictícia, no formato de carregar_chaves_busca."""
+    """Ponte CIGAM ↔ sistema fictícia, no formato de montar_chaves_busca."""
     linhas = [
         ("cta", "900101", "cigam", "000101", "pagante", 3, "TRANSPORTE DEMO LTDA", "TRANSDEMO", "12345678000100"),
         ("cta", "900101", "cigam", "000101", "local", 5, "TRANSPORTE DEMO LTDA", "TRANSDEMO", "12345678000100"),
@@ -773,7 +752,7 @@ def gerar_chaves_demo() -> pd.DataFrame:
 
 
 def gerar_percurso_demo(cadastro: pd.DataFrame, uso: pd.DataFrame, alocacao) -> pd.DataFrame:
-    """Percurso fictício dos seriais, no formato de carregar_percurso_seriais:
+    """Percurso fictício dos seriais, no formato de percurso_dos_seriais:
     as passagens pelo próprio cliente (do uso demo) + de onde vieram e pra
     onde foram — inclusive um serial que vai pra outra base."""
     u = uso.dropna(subset=["bomba_id", "serial"])
@@ -806,7 +785,7 @@ def gerar_percurso_demo(cadastro: pd.DataFrame, uso: pd.DataFrame, alocacao) -> 
 
 
 def gerar_alocacao_demo() -> pd.DataFrame:
-    """Alocação CIGAM fictícia, no formato de carregar_alocacao_cigam: o
+    """Alocação CIGAM fictícia, no formato de alocacao_do_cliente: o
     próprio cliente paga a maior parte, uma empresa do grupo sem conta no
     sistema paga o comboio 01, e uma distribuidora com conta própria paga o
     comboio 02 (o caso que a aba sinaliza). Os comboios 01 e 02 dividem o
@@ -1514,7 +1493,10 @@ def _fmt_litros(v: float) -> str:
     return f"{v:,.0f} L".replace(",", ".")
 
 
-def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
+def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bombas_alocadas: pd.DataFrame = None):
+    """`bombas_alocadas`: a carga horária de gold.bombas_alocadas que o app.py
+    já faz (com bomba_id) — a aba usa ela em vez de consultar a view de novo
+    (ver o comentário de custo no topo da seção de dados)."""
     st.caption(
         "Busque com o que tiver em mãos: **nome ou código do CIGAM**, **CNPJ/CPF** (do CIGAM ou do sistema, "
         "ou só a raiz de 8 dígitos), **nº da bomba**, **serial** ou o nome/cliente_id do sistema. A busca "
@@ -1546,7 +1528,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
             _mostrar_falta_de_permissao(project_id, e)
             return
         try:
-            chaves = carregar_chaves_busca(client_bq, project_id)
+            chaves = montar_chaves_busca(carregar_cadastro_bombas(client_bq, project_id),
+                                         carregar_empresas_cigam(client_bq, project_id), bombas_alocadas)
         except (Forbidden, NotFound, BadRequest) as e:
             st.caption("Busca só por nome, cliente_id e CNPJ do sistema — sem a ponte com o CIGAM, as bombas "
                        "e os seriais: " + str(getattr(e, "message", e))[:300])
@@ -1614,13 +1597,12 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         alocacao = gerar_alocacao_demo()
     elif ativas.empty:
         alocacao = None
+    elif bombas_alocadas is None or bombas_alocadas.empty or "bomba_id" not in bombas_alocadas:
+        alocacao = None
+        aviso_alocacao = "Sem a alocação CIGAM (quem paga cada bomba): o app não carregou a alocação de bombas."
     else:
-        try:
-            alocacao = carregar_alocacao_cigam(client_bq, project_id, base, cliente_id, tuple(sorted(ativas)))
-        except (Forbidden, NotFound, BadRequest) as e:
-            alocacao = None
-            aviso_alocacao = ("Sem a alocação CIGAM (quem paga cada bomba): " +
-                              str(getattr(e, "message", e))[:300])
+        alocacao = alocacao_do_cliente(bombas_alocadas, carregar_cadastro_bombas(client_bq, project_id),
+                                       base, cliente_id, ativas)
     resumo = anexar_alocacao(resumo, alocacao) if alocacao is not None else resumo
 
     # percurso de cada serial fora das bombas do cliente (outros clientes e
@@ -1633,7 +1615,8 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool):
         percurso = None
     else:
         try:
-            percurso = carregar_percurso_seriais(client_bq, project_id, seriais_cliente, alocacao is not None)
+            percurso = percurso_dos_seriais(carregar_passagens_seriais(client_bq, project_id),
+                                            carregar_cadastro_bombas(client_bq, project_id), seriais_cliente)
         except (Forbidden, NotFound, BadRequest) as e:
             percurso = None
             aviso_percurso = "Sem o percurso dos seriais fora do cliente: " + str(getattr(e, "message", e))[:300]
