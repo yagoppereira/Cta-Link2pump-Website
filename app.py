@@ -1894,7 +1894,13 @@ def plotar_historico_multi(
         st.info(f"Sem histórico de parcelas cobradas para: {titulo}")
         return None, "", {}
 
-    todos_periodos = sorted(set().union(*[set(h["df"]["mes"]) for h in historicos_validos]))
+    # eixo com TODOS os meses entre o primeiro e o último, não só os que
+    # têm parcela: só com os meses existentes, buraco no começo/fim do
+    # histórico (contrato antigo esparso, parcela futura) fazia o rótulo a
+    # cada `passo` categorias pular meses ("Out/20 → Fev/21") e parecer
+    # aleatório nas pontas
+    meses_com_dado = sorted(set().union(*[set(h["df"]["mes"]) for h in historicos_validos]))
+    todos_periodos = list(pd.period_range(meses_com_dado[0], meses_com_dado[-1], freq="M"))
     todos_meses_str = [str(p) for p in todos_periodos]
     todos_eixo_labels = [formatar_mes_ano(p) for p in todos_periodos]
     posicoes_texto = ["top center", "bottom center", "top left", "bottom right"]
@@ -2262,6 +2268,7 @@ def plotar_historico_multi(
             dados_estruturados.append({
                 "grupo": _cabecalho_para_mes(meses_str[j]).split("</b>")[0].replace("<b>Contrato ", "").strip(),
                 "descricao": h.get("descricao", ""),
+                "empresa": h.get("empresa", ""),
                 "mes": mes_fmt,
                 "valor_total": float(val) if pd.notna(val) else None,
                 "nfs": faturas[j] or "",
@@ -2561,8 +2568,13 @@ def plotar_historico_multi(
         return f"{titulo}<br><sup>{subtitulo}</sup>"
 
     # espaçamento dos rótulos do eixo X: com muitos meses, mostrar todos
-    # vira um borrão — mostra 1 a cada `passo` pra manter legível
-    passo = max(1, len(todos_meses_str) // 24)
+    # vira um borrão — mostra 1 a cada `passo` pra manter legível. O passo
+    # é um divisor de 12 e o primeiro rótulo cai num mês "redondo" (Jan,
+    # Abr, Jul, Out com passo 3), pra os rótulos serem sempre os mesmos
+    # meses do ano, em qualquer cliente
+    passo_bruto = max(1, len(todos_meses_str) // 24)
+    passo = next(d for d in (1, 2, 3, 4, 6, 12) if d >= passo_bruto) if passo_bruto <= 12 else 12
+    tick0_eixo = next((i for i, p in enumerate(todos_periodos) if (p.month - 1) % passo == 0), 0)
     range_inicial = None  # deixa o Plotly ajustar ao conteúdo
 
     # A legenda é horizontal e quebra em várias linhas quando há muitos
@@ -2592,6 +2604,14 @@ def plotar_historico_multi(
         y_max_permitido = y_max_real + margem_y
     else:
         y_min_permitido = y_max_permitido = None
+
+    # categoria só existe no eixo se algum trace a usa: um trace invisível
+    # com TODOS os meses garante os meses sem parcela no lugar certo
+    fig.add_trace(go.Scatter(
+        x=todos_eixo_labels, y=[None] * len(todos_eixo_labels), mode="markers",
+        marker=dict(opacity=0), showlegend=False, hoverinfo="skip",
+    ))
+    trace_situacao.append(None); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
 
     fig.update_layout(
         title=dict(
@@ -2675,7 +2695,7 @@ def plotar_historico_multi(
             # certo). Com o passo recalculado sobre o que está visível,
             # os rótulos ficam uniformemente espaçados em QUALQUER zoom.
             categoryorder="array", categoryarray=todos_eixo_labels,
-            tickmode="linear", dtick=passo,
+            tickmode="linear", dtick=passo, tick0=tick0_eixo,
             range=range_inicial,
             rangeslider=dict(visible=False),
             # minallowed/maxallowed REMOVIDO daqui de propósito — eixo do
@@ -2775,6 +2795,8 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             f"<div style='font-size:1.4em;'><b>{formatar_moeda(valor_total) if valor_total is not None else 'N/D'}</b></div>",
             f"<div style='font-size:0.85em; opacity:0.75;'>Contrato {dado_ponto.get('grupo','')} · {dado_ponto.get('descricao','')}</div>",
         ]
+        if dado_ponto.get("empresa"):
+            linhas_cab.insert(1, f"<div style='font-size:0.9em;'><b>{dado_ponto['empresa']}</b></div>")
         if dado_ponto.get("nfs"):
             linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
         if not dado_ponto.get("completo", True):
@@ -4363,7 +4385,55 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
                         contas_por_codigo.setdefault(int(codigo), set()).add(f"{base} {conta}")
             por_app = dir_df["codigo_cliente"].isin(list(contas_por_codigo))
 
-    grupo = dir_df[achados | por_app].copy()
+    # --- troca de titularidade (um salto, a partir de quem já foi achado) ---
+    # A alocação de bombas é só o estado de HOJE: empresa que pagava as
+    # bombas e passou a titularidade pra outra do grupo some do vínculo pelo
+    # ID do app. O registro que sobra é a observação do contrato encerrado
+    # ("TROCA DE TITULARIDADE PARA UNIAO NORTE 08/2026", Midas TRR → União
+    # Norte / Força Ambiental / Solução Ambiental, 24/08/2026).
+    membros = achados | por_app
+    por_titularidade = pd.Series(False, index=dir_df.index)
+    motivo_titularidade = {}
+    trocas = carregar_trocas_titularidade()
+    if trocas is not None and not trocas.empty:
+        nomes_norm = dir_df["Cliente_Nome"].fillna("").map(_sem_acento)
+        nome_por_codigo = dict(zip(dir_df["codigo_cliente"], dir_df["Cliente_Nome"]))
+
+        def _casa_nome(texto):
+            if not texto:
+                return pd.Series(False, index=dir_df.index)
+            return nomes_norm.str.contains(r"(?<![A-Z0-9])" + re.escape(texto), regex=True, na=False)
+
+        # segue a CADEIA de trocas (Midas → União Norte já no grupo, e
+        # Midas → Solução Ambiental) até não achar ninguém novo — só pelas
+        # trocas de titularidade, sem reabrir raiz de CNPJ nem ID do app
+        pendentes = set(trocas.index)
+        mudou = True
+        while mudou:
+            mudou = False
+            for idx_troca in sorted(pendentes):
+                troca = trocas.loc[idx_troca]
+                no_grupo = membros | por_titularidade
+                dono = int(troca["codigo_cliente"]) if pd.notna(troca["codigo_cliente"]) else None
+                casa_destino, casa_origem = _casa_nome(troca["destino_txt"]), _casa_nome(troca["origem_txt"])
+                dono_mask = (dir_df["codigo_cliente"] == dono).fillna(False) if dono is not None else casa_origem & False
+                # a troca toca o grupo se o dono do contrato, a origem ou o
+                # destino citados na observação já são do grupo
+                if not ((dono_mask & no_grupo).any() or (casa_destino & no_grupo).any()
+                        or (casa_origem & no_grupo).any()):
+                    continue
+                pendentes.discard(idx_troca)
+                de = troca["origem_txt"] or (nome_por_codigo.get(dono) or f"CIGAM {dono}")
+                texto = f"troca de titularidade ({de} → {troca['destino_txt']}, contrato {troca['contrato']})"
+                for mask in (dono_mask, casa_destino, casa_origem):
+                    novos = mask & ~(membros | por_titularidade)
+                    for c in dir_df.loc[novos, "codigo_cliente"].dropna():
+                        motivo_titularidade[int(c)] = texto
+                    if novos.any():
+                        por_titularidade |= novos
+                        mudou = True
+
+    grupo = dir_df[achados | por_app | por_titularidade].copy()
     # rótulo do critério que trouxe cada empresa — "raiz CNPJ" só quando a
     # raiz aparece em MAIS DE UMA empresa do grupo final (matriz/filial de
     # verdade); empresa sozinha no grupo é "busca direta", mesmo que a raiz
@@ -4375,8 +4445,52 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     # quem só entrou pelo app (não casou nome/código/CNPJ nem raiz)
     so_app = ~achados.loc[grupo.index]
     grupo.loc[so_app, "_origem_match"] = grupo.loc[so_app, "codigo_cliente"].map(
-        lambda c: "ID do app (" + ", ".join(sorted(contas_por_codigo.get(int(c), []))) + ")")
+        lambda c: "ID do app (" + ", ".join(sorted(contas_por_codigo.get(int(c), []))) + ")"
+        if int(c) in contas_por_codigo else motivo_titularidade.get(int(c), "busca direta"))
     return grupo.sort_values("Cliente_Nome").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def carregar_trocas_titularidade() -> pd.DataFrame:
+    """Contratos cuja observação registra troca de titularidade — "TROCA DE
+    TITULARIDADE PARA UNIAO NORTE 08/2026" no contrato antigo, ou
+    "TITULARIDADE MIDAS TRR COMBUSTÍVEL PARA UNIÃO NORTE FLUMINENSE" no novo.
+    Uma linha por menção: dono do contrato, texto de origem (quando citado)
+    e de destino, sem acento. Medido em 03/11/2026: 12 contratos de 3
+    empresas. Falha de acesso vira vazio — é critério extra do grupo, não
+    dependência."""
+    colunas = ["codigo_cliente", "contrato", "origem_txt", "destino_txt"]
+    if MODO_DEMO:
+        return pd.DataFrame(columns=colunas)
+    query = f"""
+    SELECT SAFE_CAST(COALESCE(c.cliente.codigo, c.contratante.codigo) AS INT64) AS codigo_cliente,
+           c.codigoContrato AS contrato, c.observacao
+    FROM `{PROJECT_ID}.bronze.cigam__contratos` c
+    WHERE REGEXP_CONTAINS(UPPER(c.observacao), r'TITULARIDADE')
+    """
+    try:
+        df = client_bq.query(query).to_dataframe(create_bqstorage_client=False)
+    except Exception:
+        return pd.DataFrame(columns=colunas)
+    padrao = re.compile(r"TITULARIDADE\s+(?:(?:DE\s+)?(.+?)\s+)?PARA\s+(.+?)(?:\s+\d{1,2}/\d{2,4})?\s*$")
+    linhas = []
+    for _, r in df.iterrows():
+        for linha in re.split(r"[\r\n]+", str(r["observacao"] or "")):
+            texto = re.sub(r"\s+", " ", unicodedata.normalize("NFKD", linha).encode("ascii", "ignore").decode().upper()).strip()
+            m = padrao.search(texto)
+            if m:
+                linhas.append({"codigo_cliente": r["codigo_cliente"], "contrato": r["contrato"],
+                               "origem_txt": (m.group(1) or "").strip(), "destino_txt": m.group(2).strip()})
+    return pd.DataFrame(linhas, columns=colunas)
+
+
+def _nome_curto_empresa(nome) -> str:
+    """Duas primeiras palavras do nome da empresa, sem acento — "FORCA
+    AMBIENTAL LTDA." → "FORCA AMBIENTAL", "UNIAO NORTE FLUMINENSE..." →
+    "UNIAO NORTE". Curto o bastante pra legenda do gráfico do grupo."""
+    texto = unicodedata.normalize("NFKD", str(nome or "")).encode("ascii", "ignore").decode().upper()
+    palavras = [p for p in re.split(r"[^A-Z0-9]+", texto) if p]
+    return " ".join(palavras[:2]) or "?"
 
 
 def _sufixo_cnpj(cnpj: str) -> str:
@@ -4406,7 +4520,8 @@ def relatorio_grupo(termo: str):
     # antes deixava o cabeçalho com o número em vez de um nome de verdade
     nome_grupo = grupo["Cliente_Nome"].astype(str).mode().iloc[0]
     st.header(f"Grupo econômico — {nome_grupo}", anchor=False)
-    st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por busca direta, raiz de CNPJ e/ou ID do app.")
+    st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por busca direta, raiz de CNPJ, ID do app "
+               "e/ou troca de titularidade.")
 
     codigos_grupo = tuple(int(c) for c in grupo["codigo_cliente"].dropna().unique())
     municipios_uf = buscar_municipio_uf_lote(codigos_grupo)
@@ -4485,7 +4600,9 @@ def relatorio_grupo(termo: str):
         "mesma conta do sistema CTA (base e cliente_id entre parênteses) que uma empresa já "
         "achada — paga ou recebe bomba dessa conta, mesmo com nome e CNPJ diferentes; "
         "'busca direta' bateu só com o termo digitado (início de palavra do nome, código ou "
-        "CNPJ), sem raiz de CNPJ em comum com o resto do grupo."
+        "CNPJ), sem raiz de CNPJ em comum com o resto do grupo; 'troca de titularidade' é "
+        "empresa que passou (ou recebeu) contratos de uma do grupo, pela observação do contrato "
+        "no CIGAM — ela some do 'ID do app' porque a alocação de bombas é só o estado de hoje."
     )
 
     # ------------------------------------------------------------------
@@ -4552,7 +4669,10 @@ def relatorio_grupo(termo: str):
             # contrato "guarda-chuva" com muitos equipamentos (16+),
             # isso virava um rótulo gigante e ilegível.
             resumo_equip = resumir_equipamentos_do_grupo(subset)
-            rotulo_grupo = f"{_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}"
+            # nome curto da empresa na frente do sufixo do CNPJ: num grupo
+            # com raízes de CNPJ diferentes (Força Ambiental, União Norte,
+            # Midas) o sufixo sozinho ("0001-40") não diz de QUEM é a fatura
+            rotulo_grupo = f"{_nome_curto_empresa(emp['Empresa'])} {_sufixo_cnpj(emp['CNPJ'])} · {cod_grupo}"
             if resumo_equip:
                 rotulo_grupo += f" · {resumo_equip}"
             historicos_grupo.append({
@@ -4570,6 +4690,9 @@ def relatorio_grupo(termo: str):
                 "codigos_grupo": [cod_grupo], "codigos_ativos": [cod_grupo],
                 "situacao": "A" if (subset["situacaoContrato"] == "A").any() else "E",
                 "valor_total": pd.to_numeric(df_hist["valor"], errors="coerce").sum(),
+                # quem é faturado neste contrato — vai pro card do mês e
+                # agrupa os cards por empresa
+                "empresa": f"{emp['Empresa']} · CNPJ {emp['CNPJ']} · CIGAM {cod:06d}",
             })
 
     if historicos_grupo:
@@ -4645,17 +4768,36 @@ def relatorio_grupo(termo: str):
                 # grupos grandes (15+ contratos no mesmo mês), a grade de
                 # cards ficava comprida demais sem um jeito de rolar até
                 # o fim dentro da própria seção.
-                qtd_linhas_cards = -(-len(cards_do_mes_grupo) // 3)  # arredonda pra cima
+                # cards AGRUPADOS POR EMPRESA (quem é faturado), com o total
+                # de cada uma no mês — antes vinham misturados e só o
+                # sufixo do CNPJ no rótulo dizia de quem era cada fatura
+                por_empresa_mes = {}
+                for dado_ponto in cards_do_mes_grupo:
+                    chave_emp = dado_ponto.get("empresa", "") if isinstance(dado_ponto, dict) else ""
+                    por_empresa_mes.setdefault(chave_emp or "Empresa não identificada", []).append(dado_ponto)
+                total_por_empresa = {
+                    e: sum((d.get("valor_total") or 0.0) for d in lst if isinstance(d, dict))
+                    for e, lst in por_empresa_mes.items()}
+                st.dataframe(
+                    pd.DataFrame([{"Empresa (quem é faturado)": e, "Contratos": len(lst),
+                                   "Faturado no mês": formatar_moeda(total_por_empresa[e])}
+                                  for e, lst in sorted(por_empresa_mes.items(),
+                                                       key=lambda kv: -total_por_empresa[kv[0]])]),
+                    use_container_width=True, hide_index=True,
+                )
+                qtd_linhas_cards = sum(-(-len(lst) // 3) for lst in por_empresa_mes.values())
                 altura_cards_grupo = min(1200, max(400, 340 * min(qtd_linhas_cards, 3)))
                 with st.container(height=altura_cards_grupo):
-                    col_cards_grupo = st.columns(min(3, len(cards_do_mes_grupo)) or 1)
-                    for i, dado_ponto in enumerate(cards_do_mes_grupo):
-                        with col_cards_grupo[i % len(col_cards_grupo)]:
-                            if isinstance(dado_ponto, dict):
-                                renderizar_card_detalhe_ponto(dado_ponto)
-                            elif dado_ponto:
-                                with st.container(border=True):
-                                    _md_seguro(dado_ponto)
+                    for empresa_mes, lst in sorted(por_empresa_mes.items(), key=lambda kv: -total_por_empresa[kv[0]]):
+                        st.markdown(f"**{empresa_mes}** — {formatar_moeda(total_por_empresa[empresa_mes])} no mês")
+                        col_cards_grupo = st.columns(min(3, len(lst)) or 1)
+                        for i, dado_ponto in enumerate(lst):
+                            with col_cards_grupo[i % len(col_cards_grupo)]:
+                                if isinstance(dado_ponto, dict):
+                                    renderizar_card_detalhe_ponto(dado_ponto)
+                                elif dado_ponto:
+                                    with st.container(border=True):
+                                        _md_seguro(dado_ponto)
     else:
         st.info("Nenhum histórico de faturamento encontrado para as empresas deste grupo.")
 
