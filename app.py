@@ -644,6 +644,9 @@ def buscar_itens_contrato_do_dw(codigos_cliente: tuple) -> pd.DataFrame:
                         "Quantidade": p.get("quantidade"),
                         "Preco_Unitario": p.get("precoUnitario"),
                         "Descricao": p.get("descricao"),
+                        # 1º mês cobrado pela parcela — dataInicio do contrato
+                        # não serve (vem igual à dataTermino de propósito)
+                        "Data_Competencia": p.get("dataCompetencia"),
                         "codigo_num": pd.to_numeric(str(row.get("codigoContrato", "")).lstrip("0"), errors="coerce"),
                     })
             return linhas
@@ -692,6 +695,7 @@ def buscar_itens_contrato_do_dw(codigos_cliente: tuple) -> pd.DataFrame:
                 "Cliente_Nome": lic["Cliente_Nome"], "observacao": lic["observacao"],
                 "contratoTerceiro": lic["contratoTerceiro"], "situacaoContrato": lic["situacaoContrato"],
                 "dataCriacao": lic["dataCriacao"], "motivoCancelamento": lic["motivoCancelamento"],
+                "Data_Competencia": lic.get("Data_Competencia") or alug.get("Data_Competencia"),
                 "Descricao_Cancelamento": lic.get("Descricao_Cancelamento"), "diaVencimento": lic["diaVencimento"],
             })
             idx_alug_usados.add(idx_alug)
@@ -4459,6 +4463,16 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
             pagantes_externos.append({
                 "codigo": cod, "nome": dir_df.at[idx, "Cliente_Nome"],
                 "bombas_no_grupo": sorted(str(b) for b in no_grupo["bomba_nome"].dropna()),
+                # pra achar os contratos DESSAS bombas na carteira dela
+                "bombas_grupo": [
+                    {"base": b, "bomba_id": str(bid), "bomba_nome": "" if pd.isna(nm) else str(nm),
+                     "id_op": "" if pd.isna(io) else str(io)}
+                    for b, bid, nm, io in zip(no_grupo["base"],
+                                              no_grupo.get("bomba_id", pd.Series(None, index=no_grupo.index)),
+                                              no_grupo.get("bomba_nome", pd.Series(None, index=no_grupo.index)),
+                                              no_grupo.get("id_op_operacional", pd.Series(None, index=no_grupo.index)))
+                    if pd.notna(bid)],
+                "contas_grupo": sorted(contas),
                 "contas_fora": len(fora),
                 "bombas_fora": int(len(pagas) - len(no_grupo)),
             })
@@ -4530,6 +4544,71 @@ def buscar_grupo_economico(termo: str) -> pd.DataFrame:
     resultado = grupo.sort_values("Cliente_Nome").reset_index(drop=True)
     resultado.attrs["pagantes_externos"] = pagantes_externos
     return resultado
+
+
+DIAS_JANELA_PERIODO_CONTRATO = 31
+
+
+def _texto_sem_acento(texto) -> str:
+    return unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode().upper()
+
+
+def associar_contratos_do_externo(contratos_ext: pd.DataFrame, ext: dict, nomes_grupo: set):
+    """
+    Dos contratos de uma DISTRIBUIDORA, quais são das bombas do grupo que ela
+    paga — sem chave de bomba no contrato, por evidência, nesta ordem:
+      1. ID operacional ou serial de uma dessas bombas na descrição ou na
+         observação ("ID 1231793848 - 19496 Paciência");
+      2. empresa do grupo citada na observação ("CLIENTE FORÇA AMBIENTAL");
+      3. período: o 1º mês cobrado (dataCompetencia da parcela) a até
+         DIAS_JANELA_PERIODO_CONTRATO dias do 1º uso de uma dessas bombas —
+         ou de uma bomba do grupo por onde o mesmo serial passou antes
+         (Gardênia Azul recebeu o equipamento de Petrópolis, 1º uso
+         03/08/2021; contrato 1521/1522 começa em 01/08/2021).
+    Devolve (linhas dos contratos ligados, {codigoContrato: motivo}).
+    Seriais e 1º uso vêm das cargas compartilhadas da aba Equipamentos
+    (passagens serial × bomba, cadastro) — sem consulta nova.
+    """
+    if contratos_ext is None or contratos_ext.empty or not ext.get("bombas_grupo"):
+        return pd.DataFrame(), {}
+    chaves = {(b["base"], b["bomba_id"]) for b in ext["bombas_grupo"]}
+    ids_op = {b["id_op"] for b in ext["bombas_grupo"] if len(b["id_op"]) >= 6}
+    seriais, primeiro_uso, nome_bomba = set(), {}, {b["bomba_id"]: b["bomba_nome"] for b in ext["bombas_grupo"]}
+    try:
+        passagens = equipamentos_sistema.carregar_passagens_seriais(client_bq, PROJECT_ID)
+        cad = equipamentos_sistema.carregar_cadastro_bombas(client_bq, PROJECT_ID)
+    except Exception:
+        passagens = cad = None
+    if passagens is not None and cad is not None:
+        chave_passagem = list(zip(passagens["base"], passagens["bomba_id"]))
+        seriais = set(passagens.loc[[k in chaves for k in chave_passagem], "serial"])
+        contas = {tuple(c) for c in ext.get("contas_grupo", [])}
+        cliente_da_bomba = dict(zip(zip(cad["base"], cad["bomba_id"]), cad["cliente_id"]))
+        nome_bomba.update(dict(zip(cad["bomba_id"], cad["bomba_nome"])))
+        candidatas = set(chaves) | {
+            k for k, s in zip(chave_passagem, passagens["serial"])
+            if s in seriais and (k[0], cliente_da_bomba.get(k)) in contas}
+        uso = passagens[[k in candidatas for k in chave_passagem]]
+        primeiro_uso = uso.groupby(["base", "bomba_id"])["inicio"].min().to_dict()
+    motivos = {}
+    for cod_contrato, g in contratos_ext.groupby("codigoContrato"):
+        texto = _texto_sem_acento(" ".join(str(x) for x in list(g["Descricao"]) + list(g["observacao"]) if pd.notna(x)))
+        motivo = next((f"ID operacional {i} na descrição" for i in sorted(ids_op) if i in texto), None)
+        if not motivo:
+            motivo = next((f"serial {s} na descrição" for s in sorted(seriais)
+                           if len(str(s)) >= 4 and re.search(rf"(?<!\d){re.escape(str(s))}(?!\d)", texto)), None)
+        if not motivo:
+            motivo = next((f"cita {n} na observação" for n in sorted(nomes_grupo)
+                           if n and re.search(r"(?<![A-Z0-9])" + re.escape(n) + r"(?![A-Z0-9])", texto)), None)
+        if not motivo and "Data_Competencia" in g:
+            comp = pd.to_datetime(g["Data_Competencia"], format="%d/%m/%Y", errors="coerce").min()
+            if pd.notna(comp):
+                motivo = next((f"1º mês cobrado {comp:%d/%m/%Y} ≈ 1º uso de {nome_bomba.get(k[1], k[1])} em {dt:%d/%m/%Y}"
+                               for k, dt in sorted(primeiro_uso.items(), key=lambda kv: abs((kv[1] - comp).days))
+                               if abs((dt - comp).days) <= DIAS_JANELA_PERIODO_CONTRATO), None)
+        if motivo:
+            motivos[cod_contrato] = motivo
+    return contratos_ext[contratos_ext["codigoContrato"].isin(list(motivos))].copy(), motivos
 
 
 def _contas_sistema_por_raiz():
@@ -4724,15 +4803,42 @@ def relatorio_grupo(termo: str):
     st.header(f"Grupo econômico — {nome_grupo}", anchor=False)
     st.caption(f"Busca: '{termo}' · {len(grupo)} empresa(s) encontradas por busca direta, raiz de CNPJ, ID do app "
                "e/ou troca de titularidade.")
+    # distribuidora que paga bombas do grupo: a carteira dela fica fora, mas
+    # os contratos DESSAS bombas entram (associação por ID/serial, empresa do
+    # grupo citada ou período de 1º uso — ver associar_contratos_do_externo)
+    contratos_forcados, bombas_forcadas = {}, {}
+    nomes_grupo = {_nome_curto_empresa(n) for n in grupo["Cliente_Nome"]}
+    linhas_extra = []
     for ext in grupo.attrs.get("pagantes_externos", []):
         bombas_txt = ", ".join(ext["bombas_no_grupo"][:4]) + (
             f" (+{len(ext['bombas_no_grupo']) - 4})" if len(ext["bombas_no_grupo"]) > 4 else "")
+        ligados, motivos = pd.DataFrame(), {}
+        if not MODO_DEMO:
+            try:
+                ligados, motivos = associar_contratos_do_externo(
+                    buscar_itens_contrato_do_dw((ext["codigo"],)), ext, nomes_grupo - {_nome_curto_empresa(ext["nome"])})
+            except Exception:
+                ligados, motivos = pd.DataFrame(), {}
+        texto_ligados = ""
+        if motivos:
+            contratos_forcados[ext["codigo"]] = ligados
+            bombas_forcadas[ext["codigo"]] = {b["bomba_id"] for b in ext["bombas_grupo"]}
+            texto_ligados = (" **Os contratos dela ligados a essas bombas entram no grupo:** "
+                             + "; ".join(f"{sem_zeros_esquerda(c)} ({m})" for c, m in sorted(motivos.items())) + ".")
+            dir_ext = diretorio_clientes[diretorio_clientes["codigo_cliente"] == ext["codigo"]]
+            linhas_extra.append({
+                "codigo_cliente": ext["codigo"], "Cliente_Nome": ext["nome"],
+                "_cnpj_norm": dir_ext["_cnpj_norm"].iloc[0] if not dir_ext.empty else "",
+                "_origem_match": "distribuidora — só os contratos das bombas do grupo",
+            })
         st.info(
-            f"**Fora do grupo: {ext['nome']} (CIGAM {ext['codigo']:06d}).** Paga "
-            f"{len(ext['bombas_no_grupo'])} bomba(s) deste grupo ({bombas_txt}), mas também paga "
-            f"{ext['bombas_fora']} bomba(s) de {ext['contas_fora']} outro(s) cliente(s) do sistema — é "
-            "distribuidora/pagante de outras operações, então os contratos e bombas dela não entram aqui.",
+            f"**{ext['nome']} (CIGAM {ext['codigo']:06d}) é distribuidora:** paga "
+            f"{len(ext['bombas_no_grupo'])} bomba(s) deste grupo ({bombas_txt}) e também "
+            f"{ext['bombas_fora']} bomba(s) de {ext['contas_fora']} outro(s) cliente(s) do sistema, então a "
+            "carteira dela não entra aqui." + (texto_ligados or " Nenhum contrato dela foi ligado a essas bombas."),
             icon="ℹ️")
+    if linhas_extra:
+        grupo = pd.concat([grupo, pd.DataFrame(linhas_extra)], ignore_index=True)
 
     codigos_grupo = tuple(int(c) for c in grupo["codigo_cliente"].dropna().unique())
     municipios_uf = buscar_municipio_uf_lote(codigos_grupo)
@@ -4749,7 +4855,9 @@ def relatorio_grupo(termo: str):
             if pd.isna(codigo):
                 continue
             try:
-                contratos_emp = buscar_itens_contrato_do_dw((int(codigo),))
+                contratos_emp = contratos_forcados.get(int(codigo))
+                if contratos_emp is None:
+                    contratos_emp = buscar_itens_contrato_do_dw((int(codigo),))
             except Exception:
                 continue
             contratos_por_empresa[int(codigo)] = contratos_emp
@@ -4767,7 +4875,8 @@ def relatorio_grupo(termo: str):
             mensalidade = pd.to_numeric(ativos["Preco_Unitario"], errors="coerce").sum() if not ativos.empty else 0.0
             total_grupo += mensalidade
             qtd_equip_emp = (
-                int((df_bombas["cliente_cigam_pagante"] == int(codigo)).sum()) if df_bombas is not None else 0
+                len(bombas_forcadas[int(codigo)]) if int(codigo) in bombas_forcadas
+                else int((df_bombas["cliente_cigam_pagante"] == int(codigo)).sum()) if df_bombas is not None else 0
             )
             linhas_resumo.append({
                 "Código": int(codigo),
@@ -4858,7 +4967,7 @@ def relatorio_grupo(termo: str):
         for cod_grupo, subset in grupos_da_empresa:
             materiais = materiais_ativos_da_empresa.get(cod_grupo)
             validar_faturamento_real = None
-            if materiais and not any(
+            if materiais and cod not in contratos_forcados and not any(
                 outro_cg != cod_grupo and (materiais & outros_materiais)
                 for outro_cg, outros_materiais in materiais_ativos_da_empresa.items()
             ):
@@ -5030,6 +5139,8 @@ def relatorio_grupo(termo: str):
         contratos_emp = contratos_por_empresa.get(cod, pd.DataFrame())
         ativos = contratos_emp[contratos_emp["situacaoContrato"] == "A"] if not contratos_emp.empty else pd.DataFrame()
         equip_emp = df_bombas[df_bombas["cliente_cigam_pagante"] == cod].copy() if df_bombas is not None else pd.DataFrame()
+        if cod in bombas_forcadas and not equip_emp.empty and "bomba_id" in equip_emp:
+            equip_emp = equip_emp[equip_emp["bomba_id"].astype(str).isin(bombas_forcadas[cod])]
 
         qtd_equip_rotulo = int(emp["Equipamentos"]) if pd.notna(emp.get("Equipamentos")) else 0
         rotulo = (
