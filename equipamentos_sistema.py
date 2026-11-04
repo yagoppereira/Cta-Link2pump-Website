@@ -1083,21 +1083,6 @@ def _periodos_de_uso(uso_b: pd.DataFrame, resumo: pd.DataFrame) -> pd.DataFrame:
 
 
 # --- 4. Gráficos -----------------------------------------------------------
-def _cores_estaveis(chave: str, selecionadas: list) -> dict:
-    """Cor segue a BOMBA, não a posição: quem continua selecionado mantém a
-    cor quando outra bomba entra/sai (senão o leitor que aprendeu 'S10 é
-    azul' é enganado). Slots livres vão pra quem entra."""
-    mapa = st.session_state.setdefault(chave, {})
-    for b in list(mapa):
-        if b not in selecionadas:
-            del mapa[b]
-    livres = [i for i in range(len(CORES_BOMBAS)) if i not in mapa.values()]
-    for b in selecionadas:
-        if b not in mapa and livres:
-            mapa[b] = livres.pop(0)
-    return {b: CORES_BOMBAS[i] for b, i in mapa.items()}
-
-
 def _layout_base(fig, altura: int):
     fig.update_layout(
         template="plotly_dark", height=altura,
@@ -1297,6 +1282,43 @@ def alertas_de_pagante(resumo: pd.DataFrame) -> list:
             f"com conta própria no sistema: {g['pagante_outras_contas'].iloc[0]}. "
             f"Pode ser bomba de outra operação: {bombas}.")
     return linhas
+
+
+def _clarear(cor_hex: str, fracao: float, intensidade: float = 0.6) -> str:
+    """Tom mais claro da mesma cor (fracao 0 = cor original). Só clareia:
+    contra o fundo escuro do gráfico, escurecer apagaria a linha."""
+    cor = cor_hex.lstrip("#")
+    r, g, b = (int(cor[i:i + 2], 16) for i in (0, 2, 4))
+    d = max(0.0, min(1.0, fracao)) * intensidade
+    return "#" + "".join(f"{round(c + (255 - c) * d):02x}" for c in (r, g, b))
+
+
+def cores_por_bomba(resumo: pd.DataFrame, bombas) -> dict:
+    """Cor de cada bomba no PADRÃO DA ABA: a cor do pagante de hoje (a mesma
+    da linha do tempo, cores_pagantes) com um tom por bomba; bomba sem
+    pagante hoje (retirada, em outro cliente, fora do cadastro) em tons de
+    cinza, como o "serial anterior" da linha do tempo. Usada no gráfico de
+    volume e no quadradinho da tabela de bombas."""
+    base = cores_pagantes(resumo)
+    info = resumo.set_index("bomba_id")
+    tem_alocacao = "pagante_rotulo" in info
+    familias = {}
+    for b in bombas:
+        situacao = info.at[b, "situacao"] if b in info.index else GRUPO_FORA_CADASTRO
+        if situacao in SITUACOES_ATIVAS:
+            if tem_alocacao:
+                pagante = info.at[b, "pagante_rotulo"] or SEM_ALOCACAO
+                cor = base.get(pagante, COR_OUTROS_PAGANTES)
+            else:
+                cor = COR_SERIAL_ATUAL
+        else:
+            cor = COR_SERIAL_ANTERIOR
+        familias.setdefault(cor, []).append(b)
+    cores = {}
+    for cor, membros in familias.items():
+        for i, b in enumerate(membros):
+            cores[b] = _clarear(cor, i / (len(membros) - 1) if len(membros) > 1 else 0.0)
+    return cores
 
 
 def cores_pagantes(resumo: pd.DataFrame) -> dict:
@@ -1711,7 +1733,9 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
     if not no_grafico:
         st.info("Nenhuma bomba do filtro abasteceu no período.")
     else:
-        cores = _cores_estaveis(f"eq_cores_{base}_{cliente_id}", no_grafico)
+        # cor do PAGANTE de hoje, um tom por bomba — o mesmo padrão da linha
+        # do tempo e da tabela de bombas (antes cada bomba tinha uma cor solta)
+        cores = cores_por_bomba(resumo, no_grafico)
         st.plotly_chart(plotar_volume(uso_f, trocas_f, resumo, no_grafico, cores, granularidade, ano),
                         use_container_width=True)
 
@@ -1768,8 +1792,14 @@ def renderizar_aba_equipamentos(client_bq, project_id: str, modo_demo: bool, bom
         if col in tabela:
             tabela[col] = tabela[col].where(tabela[col].notna(), "—")
     tabela["Volume total (L)"] = tabela["Volume total (L)"].round(0)
+    # quadradinho na cor da bomba (pagante de hoje, tom por bomba) — liga a
+    # linha da tabela à linha dos gráficos
+    cores_tabela = cores_por_bomba(resumo, list(resumo_f["bomba_id"]))
+    tabela.insert(0, "", "■")
+    cores_linhas = [cores_tabela.get(b, COR_SERIAL_ANTERIOR) for b in resumo_f["bomba_id"]]
+    tabela_estilo = tabela.style.apply(lambda col: [f"color: {c}; font-size: 1.2em" for c in cores_linhas], subset=[""])
     st.dataframe(
-        tabela, use_container_width=True, hide_index=True,
+        tabela_estilo, use_container_width=True, hide_index=True,
         column_config={
             "Primeiro abastecimento": st.column_config.DateColumn(format="DD/MM/YYYY"),
             "Último abastecimento": st.column_config.DateColumn(format="DD/MM/YYYY"),

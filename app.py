@@ -5018,15 +5018,16 @@ def relatorio_grupo(termo: str):
                 "empresa": f"{emp['Empresa']} · CNPJ {emp['CNPJ']} · CIGAM {cod:06d}",
             })
 
+    cores_empresa = {}
     if historicos_grupo:
-        colorir_historicos_por_empresa(historicos_grupo)
+        cores_empresa = colorir_historicos_por_empresa(historicos_grupo)
         historicos_grafico_grupo = agrupar_historicos_para_grafico(historicos_grupo, max_linhas=20)
 
         # mesmos 3 controles do gráfico do cliente (filtro de situação,
         # contratos no gráfico, total) — antes só existiam na view de
         # cliente, o que impedia usar o gráfico do grupo com poucas
         # empresas/contratos de cada vez ou tirar a linha Total dele.
-        col_g1, col_g2, col_g3 = st.columns([1, 2, 1])
+        col_g1, col_gp, col_g2, col_g3 = st.columns([1, 1.6, 1.8, 0.9])
         with col_g1:
             filtro_rotulo_grupo = st.radio(
                 "Mostrar", ["Todos", "Só ativos", "Só encerrados"],
@@ -5034,6 +5035,18 @@ def relatorio_grupo(termo: str):
             )
         filtro_situacao_grupo = {"Só ativos": "A", "Só encerrados": "E"}.get(filtro_rotulo_grupo)
 
+        # filtro por PAGANTE (empresa faturada): marca todos os contratos dela
+        # de uma vez — mais direto que escolher contrato por contrato num
+        # grupo com dezenas de filiais
+        opcoes_pagantes_grupo = list(dict.fromkeys(h["empresa"] for h in historicos_grafico_grupo if h.get("empresa")))
+        with col_gp:
+            pagantes_marcados_grupo = set(st.multiselect(
+                "Pagantes no gráfico (vazio = todos)", options=opcoes_pagantes_grupo, default=[],
+                format_func=lambda e: f"{_nome_curto_empresa(e.split(' · ')[0])} · "
+                                      f"{e.split(' · ')[-1] if ' · ' in e else ''}",
+                key=f"sel_pagantes_grupo_{termo}",
+                help="Mostra todos os contratos dos pagantes escolhidos (somado ao filtro de contratos).",
+            ))
         opcoes_contratos_grupo = [h["grupo"] for h in historicos_grafico_grupo]
         with col_g2:
             grupos_marcados_grupo = set(st.multiselect(
@@ -5055,7 +5068,8 @@ def relatorio_grupo(termo: str):
             titulo=f"Mensalidade consolidada — grupo {termo}",
             subtitulo=f"{len(historicos_grupo)} contrato(s) em {len(df_resumo)} empresa(s)",
             incluir_total=incluir_total_grupo, mostrar_eventos_cancelamento=False,
-            grupos_visiveis=grupos_marcados_grupo or None,
+            grupos_visiveis=(grupos_marcados_grupo | {
+                h["grupo"] for h in historicos_grafico_grupo if h.get("empresa") in pagantes_marcados_grupo}) or None,
             filtro_situacao=filtro_situacao_grupo,
         )
         # DIAGNÓSTICO TEMPORÁRIO — ver _debug_faturamento_real. Remover
@@ -5147,6 +5161,10 @@ def relatorio_grupo(termo: str):
             f"{emp['Empresa']} · {emp['CNPJ']} — {formatar_moeda(emp['Mensalidade'])} · "
             f"{qtd_equip_rotulo} equipamento(s)"
         )
+        # faixa na cor da empresa (a mesma das linhas do gráfico, dos cards e
+        # do resumo do período) — liga o detalhe ao resto da tela
+        cor_emp = cores_empresa.get(f"{emp['Empresa']} · CNPJ {emp['CNPJ']} · CIGAM {cod:06d}", "#8A95A8")
+        _md_seguro(f"<div style='height:5px; background:{cor_emp}; border-radius:3px; margin:12px 0 -10px 0;'></div>")
         with st.expander(rotulo, expanded=False):
             if len(ativos):
                 st.markdown("**Contratos ativos**")
