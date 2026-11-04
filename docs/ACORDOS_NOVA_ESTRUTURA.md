@@ -1,121 +1,105 @@
-# Acordos: acompanhamento na planilha de inadimplência
-
-Planilha: `14.10 INADIMPLÊNCIA` (Google Sheets).
-
-A planilha só **acompanha** o fluxo de acordos e baixas e mostra se ele está
-correndo como esperado. A única coisa construída nela são os acordos, e sempre
-pelo script (macro), para manter o padrão. Todo o resto é reconstruído a partir
-da imagem do ERP (CIGAM).
+# Acordos: da Calculadora para a planilha de inadimplência
 
 ```
-ACORDOS_REGISTRO        o que foi acordado        ← macro GerarPropostaPercentil (colar)
-CIGAM_IMAGEM            o que o CIGAM mostra      ← Apps Script atualizarCigamAcordos (diário)
-ACORDOS_ACOMPANHAMENTO  como está cada acordo     ← só fórmulas
+CALCULADORA (Excel, .xlsm)            14.10 INADIMPLÊNCIA (Google Sheets)
+filtra o cliente, marca K/J,          ACORDOS    1 linha por título × pagamento
+data de referência (juros)    ──►     (envio     (o que baixar, em que parcela, quanto)
+macro firma o acordo                  automático)
+  REGISTRO_ACORDO (A:U)                  │  todo dia, 7h: status pela baixa no CIGAM
+                                         ▼
+                                      Bloqueios  quem está cumprindo / lista dos quebrados
+                                      + e-mail com os acordos que quebraram no dia
 ```
 
-A aba `ACORDOS` antiga não foi alterada (é lida pela aba `Bloqueios`).
+Nada novo para preencher: a Calculadora continua sendo onde o acordo é montado e a
+aba ACORDOS continua sendo a base da baixa. O que muda é que o acordo chega sozinho
+na ACORDOS e o status (coluna A) passa a ser calculado.
 
-## ACORDOS_REGISTRO
+## 1. Firmar o acordo na Calculadora
 
-Uma linha por **título × parcela**, na ordem do plano.
+Como hoje: filtrar o cliente (colunas A/B), marcar em **K** os títulos do acordo e em
+**J** os que cobram juros; a data de referência (juros congelados) é perguntada pela
+macro. Títulos marcados mas escondidos pelo filtro ficam fora e a macro avisa.
 
-| Coluna | Conteúdo |
+Dois tipos de acordo, as duas macros agora registram e enviam:
+
+| Macro | Tipo | Como o plano é montado |
+|---|---|---|
+| `GerarPropostaPercentil` | parcelas iguais | entrada = X% do total; saldo em N parcelas iguais; títulos alocados em ordem de vencimento (um título pode ser partido entre pagamentos) |
+| `GerarPropostaNegociacao` (Module5) | títulos inteiros | entrada escolhida pelos títulos que chegam mais perto de X% (ou pela coluna N); resto distribuído em N parcelas por valor; cada título inteiro em um pagamento |
+
+Ao final as duas perguntam se é para **firmar** o acordo. Respondendo sim:
+responsável, forma de pagamento e TERMO (já vem preenchido com o ID
+`AC-<cód. cliente>-<aaaammdd>`). O status **não é mais perguntado** (entra "Em Dia").
+As linhas vão para `REGISTRO_ACORDO` e, em seguida, para a aba ACORDOS. A coluna V de
+`REGISTRO_ACORDO` mostra "ENVIADO …" ou "PENDENTE - motivo"; se ficar pendente (sem
+internet, por exemplo), a macro `EnviarPendentes` reenvia. Reenviar não duplica: na
+ACORDOS, o acordo com o mesmo CNPJ + TERMO é substituído.
+
+Arquivos (`vba/`): `PropostaPercentil_RegistroAcordo.bas`, `Module5_PropostaNegociacao.bas`,
+`Module9_EnvioPlanilha.bas` (novo). Continuam dependendo do `Module0_Nucleo`.
+
+## 2. Baixa
+
+A aba ACORDOS recebe uma linha por **título × pagamento**, na ordem da baixa:
+
+| Coluna | Para a baixa |
 |---|---|
-| A ID ACORDO | `AC-<cód. cliente>-<aaaammdd>` (macro) ou `L-nnn` (migrados da aba antiga) |
-| B DATA DO ACORDO | em branco nos migrados (o legado não tinha) |
-| C RESPONSÁVEL, D EMPRESA | `000123 - NOME` |
-| E Nº PARCELA | 0 = entrada |
-| F VENCIMENTO DA PARCELA | |
-| G FATURA | `fatura/parcela` do CIGAM |
-| H PRINCIPAL, I JUROS, J VALOR | valor desta parcela neste título; principal primeiro, juros por último |
-| K SITUAÇÃO MANUAL | **única edição manual**: CANCELADO (ou outro texto) sobrepõe a situação |
-| L OBSERVAÇÕES | condição do acordo |
+| N DATA DE PAGAMENTO | vencimento da entrada/parcela |
+| S Nº PGTO | ENTRADA, PARCELA 1/3, … |
+| E DOC / F NFS-e | título a baixar |
+| T VALOR ALOCADO | quanto deste pagamento vai neste título |
+| U SALDO APÓS | o que sobra do título para o pagamento seguinte (título partido) |
+| P VALOR DE PARCELA | total do pagamento (na primeira linha do bloco) |
+| O VALOR PAGO | opcional: preenchido, confirma a linha como paga |
 
-Colunas M:U são calculadas (não digitar):
+## 3. Status automático e acordos quebrados
 
-| Coluna | Regra |
+`atualizarStatusAcordos` (Apps Script `apps_script/Acordos.gs`, todo dia às 7h)
+recalcula a coluna A das linhas feitas pela macro (coluna S preenchida com ENTRADA /
+PARCELA n/m) a partir das baixas do CIGAM:
+
+| Status | Regra |
 |---|---|
-| M CHAVE CIGAM | `empresa|fatura/parcela` |
-| N RENEGOCIADA EM | se o mesmo título está num acordo registrado depois, o ID desse acordo. **O título pertence ao acordo mais recente**; a linha antiga sai das contas |
-| O TÍTULO NO CIGAM | NÃO ENCONTRADO, LIQUIDADO, UNIFICADO, EM PERDA (X90) ou EM ABERTO |
-| P PRINCIPAL BAIXADO | ver abaixo |
-| Q VALOR BAIXADO | valor da linha se baixada; senão o principal baixado |
-| R SITUAÇÃO | BAIXADA, PARCIAL, VENCIDA, PARCIAL - VENCIDA, A VENCER, SEM VENCIMENTO, UNIFICADA NO CIGAM, RENEGOCIADA EM … |
-| S DATA DA BAIXA | data do pagamento (E/L) no CIGAM que completou esta linha |
-| T DIAS DE ATRASO | baixada: data da baixa − vencimento (negativo = antecipado); vencida: hoje − vencimento |
-| U JUROS LANÇADOS NO CIGAM | lançamentos E/J do título (na primeira linha dele) |
+| Quitado | a parte desta linha já foi baixada no CIGAM (ou VALOR PAGO ≥ VALOR ALOCADO) |
+| Acordo Quebrado | não baixada e vencida há 1 dia ou mais (`DIAS_PARA_QUEBRAR`) |
+| Em Dia | não baixada e ainda no prazo |
 
-### Como o pagamento é lido do CIGAM
+Vencimento da linha = DATA DE PAGAMENTO, ou o VENCIMENTO do título se ele for
+posterior (título que ainda não venceu não quebra o acordo).
 
-Não há lançamento manual de recebimento. Para cada título:
+Baixa lida do CIGAM: VALOR ORIGINAL é o saldo do título no dia do acordo; o principal
+baixado depois = VALOR ORIGINAL − (valor do título − liquidações E/L). Esse valor
+cobre as linhas do título em ordem (ENTRADA, PARCELA 1, 2…). Título liquidado no CIGAM
+= todas as linhas dele Quitado. Baixa por perda (X90) não conta.
 
-```
-principal pago no acordo = principal do título no acordo − (valor do título − liquidações E/L)
-```
+Não são tocadas: linhas antigas sem o formato da macro (status continua manual) e
+linhas marcadas como Cancelado, Renegociado, Jurídico ou Suspenso.
 
-Esse valor cobre as linhas do título em ordem (FIFO). Não depende da data do
-acordo, que não existe nos migrados. É a regra do CIGAM na baixa parcial: o
-recebido abate o principal e os juros entram como lançamento E/J na quitação.
-Baixa por perda (X90) e unificação não contam como pagamento. Título LIQUIDADO
-no CIGAM conta como baixado.
+A aba **Bloqueios** continua igual e passa a refletir o status calculado. Quando
+alguma linha passa a "Acordo Quebrado", o script manda um e-mail ao dono do script
+com cliente, DOC, parcela e vencimento. A data da última atualização fica em
+`ACORDOS!R1`.
 
-## CIGAM_IMAGEM
+Conferência em 04/11/2026, com as 91 linhas no formato da macro: 87 iguais ao status
+marcado à mão. Os 23 acordos quebrados marcados pela equipe são os mesmos que a
+regra aponta. Diferenças: 3 linhas "A Vencer" viram "Em Dia" e 1 entrada do LEONARDO
+(21744/3) vira Quitado, porque a baixa parcial de R$ 2.427,23 está no CIGAM.
 
-Cópia do ERP, uma linha por lançamento dos títulos de `ACORDOS_REGISTRO`
-(fonte: `silver.lancamentos_receber` no BigQuery):
+## Instalação
 
-| LANÇAMENTO | Origem |
-|---|---|
-| TÍTULO | o próprio título (R/c): valor, saldo, vencimento, portador |
-| PAGAMENTO | entrada E/L (baixa de principal) |
-| JUROS | entrada E/J |
-| UNIFICAÇÃO | entrada E/U (o saldo foi para outro título) |
-| PERDA (X90) | entrada com portador X90/X91/X92 |
+Na planilha de inadimplência, Extensões > Apps Script, colar `apps_script/Acordos.gs` e:
 
-Nada é digitado nela; `atualizarCigamAcordos()` (`apps_script/AtualizarCigamAcordos.gs`)
-regrava a aba inteira e a data em `L1`. `instalarGatilhoDiario()` agenda para as 7h.
+1. Serviços (+) > **BigQuery API**.
+2. Rodar `gerarToken()` e copiar o token.
+3. Implantar > Nova implantação > **App da Web**: executar como *Eu*, acesso
+   *Qualquer pessoa*. Copiar a URL. (A macro não tem como fazer login Google; o token
+   é o que impede envio de terceiros.)
+4. Rodar `simularStatusAcordos()` e conferir a aba `STATUS_SIMULACAO` (não altera a
+   ACORDOS). Depois `instalarGatilhoDiario()`.
 
-## ACORDOS_ACOMPANHAMENTO
+Na Calculadora: importar os três `.bas` de `vba/` (substituindo os módulos de mesmo
+nome) e colar URL e token em `URL_PLANILHA` / `TOKEN_PLANILHA` no `Module9_EnvioPlanilha`.
 
-Topo: dois parâmetros (dias de atraso para quebrar — nome `P_DIAS_QUEBRA`;
-tolerância em R$ — `P_TOL`), data da imagem do CIGAM e quantos acordos e quanto em
-aberto/vencido há em cada situação.
-
-Tabela (linha 13 em diante), uma linha por acordo, ordenada por QUEBRADO →
-ATRASADO → EM DIA → QUITADO → demais, e dentro de cada uma pelo maior atraso:
-
-| Coluna | Conteúdo |
-|---|---|
-| SITUAÇÃO | situação manual, senão RENEGOCIADO (todas as linhas renegociadas/unificadas), QUITADO, QUEBRADO (atraso ≥ parâmetro), ATRASADO, EM DIA |
-| VALOR / BAIXADO / EM ABERTO | sem as linhas renegociadas ou unificadas |
-| PARCELAS BAIXADAS | "2 de 5" |
-| VENCIDO SEM BAIXA, DIAS DE ATRASO | parcela vencida mais antiga ainda sem baixa |
-| ATRASO MÉDIO NAS BAIXAS | comportamento de pagamento (negativo = paga antes) |
-| PRÓXIMO VENCIMENTO / VALOR | |
-| JUROS DO ACORDO / JUROS LANÇADOS NO CIGAM | juros previstos nos títulos já quitados x lançados (E/J) |
-| ATENÇÃO | baixa em parcela posterior com parcela vencida em aberto (indica baixa no título errado); título unificado; título em perda (X90); título não encontrado; parcela sem vencimento |
-
-O que a planilha **não** consegue separar: parcela vencida sem baixa pode ser
-cliente que não pagou ou pagamento que ainda não foi baixado — a imagem do ERP só
-mostra a baixa. Baixa feita num título do cliente fora do acordo também não aparece.
-
-## Rotina
-
-1. **Novo acordo**: `GerarPropostaPercentil` (`vba/PropostaPercentil_RegistroAcordo.bas`)
-   grava as linhas na aba `ACORDOS_REGISTRO` do Excel, com as mesmas colunas A:L.
-   Copiar e colar **somente valores** no fim de `ACORDOS_REGISTRO` na planilha.
-2. **Baixa**: feita no CIGAM como sempre, pelas faturas e valores da parcela
-   (filtrar `ACORDOS_REGISTRO` pelo ID e Nº PARCELA).
-3. **Acompanhamento**: a imagem do CIGAM atualiza sozinha; `ACORDOS_ACOMPANHAMENTO`
-   mostra quem está em dia, atrasado ou quebrou e o que conferir.
-4. **Renegociação**: registrar o novo acordo pela macro com os mesmos títulos; as
-   linhas antigas passam a "RENEGOCIADA EM …" automaticamente.
-
-## Migração do histórico
-
-Os 891 registros da aba `ACORDOS` viraram 84 acordos `L-001` a `L-084` e 967 linhas
-de registro. Principal e juros de cada linha foram separados pela mesma regra da
-macro (principal do título primeiro, juros por último). 181 linhas migradas não têm
-vencimento de parcela (o legado não tinha a data); aparecem como SEM VENCIMENTO.
-Títulos repetidos entre acordos migrados: L-011/L-048 (1 título), L-026/L-034
-(1 título) e L-036/L-049 (17 títulos) — pela regra do acordo mais recente.
+As abas ACORDOS_ACOMPANHAMENTO, ACORDOS_REGISTRO e CIGAM_IMAGEM da versão anterior
+estão ocultas na planilha (não apagadas).

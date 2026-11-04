@@ -12,8 +12,9 @@
  *    silver.lancamentos_receber):
  *      Quitado          - a parte do titulo desta linha ja foi baixada no CIGAM
  *                         (ou VALOR PAGO preenchido >= VALOR ALOCADO)
- *      Acordo Quebrado  - nao baixada e DATA DE PAGAMENTO vencida ha
- *                         DIAS_PARA_QUEBRAR dias ou mais
+ *      Acordo Quebrado  - nao baixada e vencida ha DIAS_PARA_QUEBRAR dias ou
+ *                         mais (vencimento = DATA DE PAGAMENTO, ou o
+ *                         VENCIMENTO do titulo, se for posterior)
  *      Em Dia           - nao baixada e ainda no prazo
  *    Linhas com status manual de encerramento (Cancelado, Renegociado,
  *    Juridico, Suspenso) e linhas antigas sem o formato da macro nao sao
@@ -196,7 +197,10 @@ function calcularStatus_(aplicar) {
         status = 'Quitado';
         motivo = pagoManual > 0 && !liquidado && acum + parte > pago + TOL ? 'VALOR PAGO preenchido' : origem;
       } else {
-        const venc = data_(vals[i][C.DTPGTO]) || data_(disp[i][C.DTPGTO]);
+        // vence na data acordada, mas nunca antes do vencimento do proprio titulo
+        const dPgto = data_(vals[i][C.DTPGTO]) || data_(disp[i][C.DTPGTO]);
+        const dTit = data_(vals[i][C.VENC]) || data_(disp[i][C.VENC]);
+        const venc = dPgto && dTit ? (dTit > dPgto ? dTit : dPgto) : dPgto;
         const dias = venc ? Math.floor((hoje - venc) / 86400000) : null;
         if (dias !== null && dias >= DIAS_PARA_QUEBRAR) {
           status = 'Acordo Quebrado';
