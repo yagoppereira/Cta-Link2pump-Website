@@ -9,15 +9,17 @@
 ' Duas saidas a partir do MESMO plano:
 '   EmitirProposta  -> PROPOSTA_NEGOCIACAO (documento do cliente; a aba e
 '                      refeita a cada geracao)
-'   EmitirRegistro  -> aba CUMULATIVA ACORDOS_REGISTRO, com exatamente as
-'                      colunas A:L da aba ACORDOS_REGISTRO da planilha Google
-'                      (1 linha por titulo x parcela).
+'   EmitirRegistro  -> REGISTRO_ACORDO (planilha operacional da baixa;
+'                      CUMULATIVA - so acrescenta, nunca limpa). As linhas
+'                      gravadas sao ENVIADAS para a aba ACORDOS da planilha de
+'                      inadimplencia (Module9_EnvioPlanilha).
 '
-'   O registro e a UNICA coisa construida na planilha Google: pagamentos,
-'   baixas e saldos vem da imagem do CIGAM. Depois de gerar, copie as linhas
-'   novas e cole (somente valores) no fim de ACORDOS_REGISTRO.
+' O STATUS ACORDO nao e mais perguntado: entra como "Em Dia" e a planilha de
+' inadimplencia recalcula todo dia pelas baixas do CIGAM (Quitado / Em Dia /
+' Acordo Quebrado). O TERMO, se ficar em branco, recebe o ID do acordo
+' (AC-<cod cliente>-<aaaammdd>), que agrupa as linhas do mesmo acordo.
 '
-' Depende de Module0_Nucleo.
+' Depende de Module0_Nucleo e Module9_EnvioPlanilha.
 '
 ' NOTA SOBRE FORMATO DE MOEDA
 ' Em NumberFormat o "$" NAO e literal: o Excel troca pelo simbolo monetario do
@@ -26,21 +28,36 @@
 '==============================================================================
 Option Explicit
 
-'--- Aba do registro (= ACORDOS_REGISTRO A:L na planilha Google) ------------
-Public Const ABA_REG As String = "ACORDOS_REGISTRO"
-Public Const RG_ID       As Long = 1
-Public Const RG_DATA     As Long = 2
-Public Const RG_RESP     As Long = 3
-Public Const RG_EMPRESA  As Long = 4
-Public Const RG_PARCELA  As Long = 5
-Public Const RG_VENC     As Long = 6
-Public Const RG_FATURA   As Long = 7
-Public Const RG_PRINC    As Long = 8
-Public Const RG_JUROS    As Long = 9
-Public Const RG_VALOR    As Long = 10
-Public Const RG_SITMAN   As Long = 11
-Public Const RG_OBS      As Long = 12
+'--- Layout da aba REGISTRO_ACORDO (= aba ACORDOS da planilha de inadimplencia)
+Public Const ABA_REGISTRO As String = "REGISTRO_ACORDO"
+Public Const REG_LIN_CAB  As Long = 2     ' linha 1 = totais, linha 2 = cabecalho
+Public Const REG_LIN_INI  As Long = 3
 
+Public Const RG_STATUS   As String = "A"
+Public Const RG_RESP     As String = "B"
+Public Const RG_EMPRESA  As String = "C"
+Public Const RG_CNPJ     As String = "D"
+Public Const RG_DOC      As String = "E"
+Public Const RG_NF       As String = "F"
+Public Const RG_ATRASO   As String = "G"
+Public Const RG_VENC     As String = "H"
+Public Const RG_VLRORIG  As String = "I"
+Public Const RG_JUROS    As String = "J"
+Public Const RG_VLRTOT   As String = "K"
+Public Const RG_CJUROS   As String = "L"
+Public Const RG_CTITULO  As String = "M"
+Public Const RG_DTPGTO   As String = "N"
+Public Const RG_VLRPAGO  As String = "O"
+Public Const RG_VLRPARC  As String = "P"
+Public Const RG_FORMA    As String = "Q"
+Public Const RG_TERMO    As String = "R"
+' --- acrescentadas: sem elas o registro nao fecha quando um titulo e partido
+Public Const RG_NPGTO    As String = "S"
+Public Const RG_ALOCADO  As String = "T"
+Public Const RG_SALDO    As String = "U"
+' --- V = resultado do envio para a planilha (Module9_EnvioPlanilha.RG_ENVIO)
+
+Public Const STATUS_INICIAL As String = "Em Dia"
 Public Const FMT_MOEDA   As String = """R$ ""#,##0.00"
 
 '--- Um titulo (ou fracao de titulo) dentro de UM pagamento ------------------
@@ -59,7 +76,7 @@ Public Type AlocItem
     ValorAlocado  As Double    ' fracao deste titulo NESTE pagamento
     Parcial       As Boolean
     SaldoApos     As Double
-    PrimeiraVez   As Boolean   ' TRUE na 1a linha do titulo no plano
+    PrimeiraVez   As Boolean   ' TRUE na 1a linha do titulo no registro
 End Type
 
 '--- Um pagamento do plano (0 = entrada) ------------------------------------
@@ -270,17 +287,22 @@ Sub GerarPropostaPercentil()
     End If
 
     '--------------------------------------------------------------------------
-    ' 5. Dados do registro (perguntados uma vez)
+    ' 5. Dados do registro (perguntados uma vez, aplicados a todas as linhas)
+    '    STATUS nao e perguntado: entra STATUS_INICIAL e a planilha recalcula.
     '--------------------------------------------------------------------------
     Dim gerarReg As Boolean
-    Dim responsavel As String, obs As String
+    Dim responsavel As String, statusAcordo As String, forma As String, termo As String
 
-    gerarReg = (MsgBox("Alem da proposta, lancar este acordo na aba " & ABA_REG & "?", _
-                       vbYesNo + vbQuestion, "Registro") = vbYes)
+    gerarReg = (MsgBox("Alem da proposta, firmar este acordo (aba " & ABA_REGISTRO & _
+                       " e planilha de inadimplencia)?", vbYesNo + vbQuestion, "Registro") = vbYes)
     If gerarReg Then
         responsavel = Trim$(CStr(InputBox("RESPONSAVEL pelo acordo:", "Responsavel", "")))
-        obs = Trim$(CStr(InputBox("OBSERVACOES do acordo (forma de pagamento etc.; pode ficar em branco):", _
-                                  "Observacoes", "")))
+        statusAcordo = STATUS_INICIAL
+        forma = Trim$(CStr(InputBox("FORMA de pagamento (Boleto, PIX, Transferencia...):", _
+                                    "Forma", "Boleto")))
+        termo = Trim$(CStr(InputBox("TERMO / numero do acordo:", "Termo", _
+                                    IdAcordoPadrao(cliente, cnpj, dataAcordo))))
+        If Len(termo) = 0 Then termo = IdAcordoPadrao(cliente, cnpj, dataAcordo)
     End If
 
     On Error GoTo Falha
@@ -431,17 +453,18 @@ Sub GerarPropostaPercentil()
 
     EmitirProposta pags, nPag, nomeLimpo, cnpj, dataAcordo, total, termos
 
-    Dim idAcordo As String, resumoReg As String
+    Dim linhasReg As Long, rIniReg As Long, msgEnvio As String
     If gerarReg Then
-        idAcordo = EmitirRegistro(pags, nPag, cliente, cnpj, dataAcordo, _
-                                  responsavel, termos, obs, resumoReg)
-        If idAcordo = "" Then      ' cancelado no registro
+        linhasReg = EmitirRegistro(pags, nPag, cliente, cnpj, _
+                                   responsavel, statusAcordo, forma, termo, rIniReg)
+        If linhasReg < 0 Then      ' cancelado no registro
             Turbo False
             ThisWorkbook.Worksheets(ABA_PROPOSTA).Activate
             MsgBox "Proposta gerada. O lancamento no registro foi cancelado.", _
                    vbExclamation, "CTA SMART"
             Exit Sub
         End If
+        EnviarLinhasRegistro rIniReg, rIniReg + linhasReg - 1, msgEnvio
     End If
 
     Turbo False
@@ -452,7 +475,9 @@ Sub GerarPropostaPercentil()
            "Entrada: R$ " & Format$(valEntrada, "#,##0.00") & " (" & Format$(pct, "0%") & ")" & vbCrLf & _
            "Parcelas: " & nParc & " de R$ " & Format$(valParcela, "#,##0.00") & vbCrLf & vbCrLf & _
            "Proposta: aba " & ABA_PROPOSTA & vbCrLf & _
-           IIf(gerarReg, "Registro: acordo " & idAcordo & vbCrLf & resumoReg, _
+           IIf(gerarReg, "Registro: " & linhasReg & " linha(s) em " & ABA_REGISTRO & _
+                         " (termo " & termo & ")" & vbCrLf & _
+                         "Planilha de inadimplencia: " & msgEnvio, _
                          "Registro: nao lancado") & vbCrLf & vbCrLf & _
            "Plano em N/O/P. Coluna L intocada.", _
            vbInformation, "CTA SMART"
@@ -465,190 +490,267 @@ End Sub
 
 
 '==============================================================================
-' EMISSOR DO REGISTRO  (aba CUMULATIVA ACORDOS_REGISTRO)
+' EMISSOR DO REGISTRO OPERACIONAL  (aba CUMULATIVA)
 '------------------------------------------------------------------------------
-' 1 linha por TITULO x PAGAMENTO (0 = entrada), na ordem do plano (FIFO).
-' Cada linha separa o valor alocado em PRINCIPAL e JUROS: o principal do
-' titulo e alocado primeiro e os juros por ultimo, que e como o CIGAM baixa
-' (baixa parcial abate principal; juros entram como lancamento proprio na
-' quitacao). Assim:
-'     soma(VALOR) por parcela          = valor da parcela
-'     soma(PRINCIPAL) por titulo       = valor em aberto do titulo
-'     soma(JUROS) por titulo           = juros do titulo no acordo
-' A planilha Google compara o PRINCIPAL de cada titulo com o que o CIGAM
-' baixou nele.
+' Uma linha por par TITULO x PAGAMENTO, ordenada por No PGTO e, dentro de cada
+' pagamento, por VENCIMENTO (ordem FIFO = ordem de trabalho da baixa).
 '
-' Retorna o ID do acordo, ou "" se o usuario cancelou. Em resumoReg devolve a
-' faixa de linhas gravadas (para copiar e colar na planilha).
+' Regras que mantem a soma das colunas integra quando um titulo e partido:
+'   VALOR ORIGINAL / JUROS / VALOR NF TOTAL -> so na PRIMEIRA linha do titulo
+'   VALOR DE PARCELA                        -> so na PRIMEIRA linha do pagamento
+'   VALOR ALOCADO                           -> em TODAS as linhas
+'        soma por titulo   = VALOR NF TOTAL
+'        soma por pagamento = VALOR DE PARCELA
+'   VALOR PAGO                              -> sempre em branco (a colega baixa)
+'
+' Usado pelas duas macros (GerarPropostaPercentil e GerarPropostaNegociacao).
+' Retorna quantas linhas gravou, ou -1 se o usuario cancelou. Em linhaIni
+' devolve a primeira linha gravada (para o envio a planilha).
 '==============================================================================
 Public Function EmitirRegistro(pags() As PagPlano, ByVal nPag As Long, _
                                ByVal empresa As String, ByVal cnpj As String, _
-                               ByVal dataAcordo As Date, _
-                               ByVal responsavel As String, _
-                               ByVal condicao As String, ByVal obs As String, _
-                               ByRef resumoReg As String) As String
+                               ByVal responsavel As String, ByVal statusAcordo As String, _
+                               ByVal forma As String, ByVal termo As String, _
+                               Optional ByRef linhaIni As Long) As Long
     Dim ws As Worksheet
-    Dim k As Long, i As Long, r As Long
-    Dim idAcordo As String
+    Dim r As Long, k As Long, i As Long, nEscritas As Long
+    Dim existentes As Long, primeira As Long
 
-    Set ws = GarantirAbaRegistro(ABA_REG, Array("ID ACORDO", "DATA DO ACORDO", _
-                "RESPONSAVEL", "EMPRESA", "No PARCELA (0 = ENTRADA)", "VENCIMENTO DA PARCELA", _
-                "FATURA", "PRINCIPAL", "JUROS", "VALOR", "SITUACAO MANUAL", "OBSERVACOES"))
-
-    '--- ID: AC-<codigo do cliente>-<aaaammdd> --------------------------------
-    Dim codCliente As String
-    codCliente = Trim$(empresa)
-    If InStr(codCliente, " - ") > 0 Then codCliente = Left$(codCliente, InStr(codCliente, " - ") - 1)
-    If Len(codCliente) = 0 Then codCliente = SoDigitos(cnpj)
-    idAcordo = "AC-" & codCliente & "-" & Format$(dataAcordo, "yyyymmdd")
-
-    If LinhaDoId(ws, idAcordo) > 0 Then
-        Dim resp As VbMsgBoxResult
-        resp = MsgBox("O acordo " & idAcordo & " ja esta no registro." & vbCrLf & vbCrLf & _
-                      "SIM      = substituir (apaga as linhas dele e lanca de novo)" & vbCrLf & _
-                      "NAO      = lancar como um acordo novo, com sufixo no ID" & vbCrLf & _
-                      "CANCELAR = nao lancar nada" & vbCrLf & vbCrLf & _
-                      "Se o acordo antigo ja foi colado na planilha Google, apague-o la tambem " & _
-                      "ou marque SITUACAO MANUAL = RENEGOCIADO.", _
-                      vbYesNoCancel + vbExclamation, "Acordo ja registrado")
-        If resp = vbCancel Then
-            EmitirRegistro = ""
-            Exit Function
-        End If
-        If resp = vbYes Then
-            ApagarLinhasDoId ws, idAcordo
-        Else
-            Dim suf As Long: suf = 2
-            Do While LinhaDoId(ws, idAcordo & "-" & suf) > 0
-                suf = suf + 1
-            Loop
-            idAcordo = idAcordo & "-" & suf
-        End If
-    End If
-
-    '--- Linhas ---------------------------------------------------------------
-    Dim princJa As Object: Set princJa = CreateObject("Scripting.Dictionary")
-    Dim princ As Double, jur As Double, resta As Double
-    Dim nomeEmp As String: nomeEmp = Replace(empresa, vbLf, " ")
-    Dim ini As Long: ini = ProximaLinha(ws)
-    r = ini
-    For k = 1 To nPag
-        For i = 1 To pags(k).NItens
-            With pags(k).Itens(i)
-                ' principal primeiro, juros por ultimo
-                If Not princJa.Exists(.Doc) Then princJa(.Doc) = 0#
-                resta = .ValorOriginal - princJa(.Doc)
-                If resta < 0 Then resta = 0
-                princ = .ValorAlocado
-                If princ > resta Then princ = resta
-                princ = Round(princ, 2)
-                jur = Round(.ValorAlocado - princ, 2)
-                princJa(.Doc) = princJa(.Doc) + princ
-
-                ws.Cells(r, RG_ID).Value = idAcordo
-                ws.Cells(r, RG_DATA).Value = dataAcordo
-                ws.Cells(r, RG_RESP).Value = responsavel
-                ws.Cells(r, RG_EMPRESA).Value = nomeEmp
-                ws.Cells(r, RG_PARCELA).Value = pags(k).Numero
-                ws.Cells(r, RG_VENC).Value = pags(k).Data
-                ' FATURA como texto: "165/1" nao pode virar data
-                ws.Cells(r, RG_FATURA).NumberFormat = "@"
-                ws.Cells(r, RG_FATURA).Value = .Doc
-                ws.Cells(r, RG_PRINC).Value = princ
-                ws.Cells(r, RG_JUROS).Value = jur
-                ws.Cells(r, RG_VALOR).Value = Round(.ValorAlocado, 2)
-            End With
-            If r = ini Then
-                ws.Cells(r, RG_OBS).Value = condicao & IIf(Len(obs) > 0, ". " & obs, "")
-            End If
-            ' Borda superior marca o inicio de cada pagamento
-            If i = 1 Then
-                ws.Range(ws.Cells(r, RG_ID), ws.Cells(r, RG_OBS)).Borders(xlEdgeTop).LineStyle = xlContinuous
-            End If
-            r = r + 1
-        Next i
-    Next k
-    Dim fim As Long: fim = r - 1
-    If fim >= ini Then
-        ws.Range(ws.Cells(ini, RG_DATA), ws.Cells(fim, RG_DATA)).NumberFormat = "dd/mm/yyyy"
-        ws.Range(ws.Cells(ini, RG_VENC), ws.Cells(fim, RG_VENC)).NumberFormat = "dd/mm/yyyy"
-        ws.Range(ws.Cells(ini, RG_PRINC), ws.Cells(fim, RG_VALOR)).NumberFormat = FMT_MOEDA
-    End If
-
-    resumoReg = ABA_REG & ": linhas " & ini & " a " & fim & vbCrLf & _
-                "Copie essas linhas (colunas A:L) e cole (somente valores) no fim da aba " & _
-                "ACORDOS_REGISTRO da planilha Google."
-    EmitirRegistro = idAcordo
-End Function
-
-
-'==============================================================================
-' Apoio do registro
-'==============================================================================
-Private Function GarantirAbaRegistro(ByVal nome As String, cab As Variant) As Worksheet
-    Dim ws As Worksheet, c As Long
+    '--- Aba: cria se nao existir; se existir, NUNCA limpa -------------------
     On Error Resume Next
-    Set ws = ThisWorkbook.Worksheets(nome)
+    Set ws = ThisWorkbook.Worksheets(ABA_REGISTRO)
     On Error GoTo 0
 
     If ws Is Nothing Then
         Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
-        ws.Name = nome
+        ws.Name = ABA_REGISTRO
+        MontarCabecalhoRegistro ws
+    ElseIf Len(Trim$(CStr(ws.Cells(REG_LIN_CAB, RG_EMPRESA).Value))) = 0 Then
+        MontarCabecalhoRegistro ws
     End If
 
-    If Len(Trim$(CStr(ws.Cells(1, 1).Value))) = 0 Then
-        For c = LBound(cab) To UBound(cab)
-            ws.Cells(1, c - LBound(cab) + 1).Value = cab(c)
-        Next c
-        With ws.Range(ws.Cells(1, 1), ws.Cells(1, UBound(cab) - LBound(cab) + 1))
-            .Font.Bold = True
-            .Font.Color = vbWhite
-            .Interior.Color = RGB(17, 202, 160)
-            .HorizontalAlignment = xlCenter
-            .WrapText = True
-        End With
-        ws.Rows(1).RowHeight = 30
-        ws.Columns(1).ColumnWidth = 22
-        For c = 2 To UBound(cab) - LBound(cab) + 1
-            ws.Columns(c).ColumnWidth = 16
-        Next c
-    End If
-    Set GarantirAbaRegistro = ws
-End Function
+    '--- Ja existe acordo lancado para este CNPJ? ----------------------------
+    Dim ultReg As Long
+    ultReg = ws.Cells(ws.Rows.Count, RG_EMPRESA).End(xlUp).Row
+    If ultReg < REG_LIN_INI Then ultReg = REG_LIN_INI - 1
 
-Private Function ProximaLinha(ws As Worksheet) As Long
-    Dim u As Long
-    u = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-    If u < 1 Then u = 1
-    ProximaLinha = u + 1
-End Function
-
-Private Function LinhaDoId(ws As Worksheet, ByVal id As String) As Long
-    Dim r As Long, u As Long
-    u = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-    For r = 2 To u
-        If Trim$(CStr(ws.Cells(r, 1).Value)) = id Then
-            LinhaDoId = r
-            Exit Function
+    For r = REG_LIN_INI To ultReg
+        If Trim$(CStr(ws.Cells(r, RG_CNPJ).Value)) = Trim$(cnpj) Then
+            existentes = existentes + 1
+            If primeira = 0 Then primeira = r
         End If
     Next r
+
+    If existentes > 0 Then
+        Dim resp As VbMsgBoxResult
+        resp = MsgBox("Ja existem " & existentes & " linha(s) para o CNPJ " & cnpj & _
+                      " no registro (a partir da linha " & primeira & ")." & vbCrLf & vbCrLf & _
+                      "SIM      = substituir (apaga as antigas e lanca as novas)" & vbCrLf & _
+                      "NAO      = acrescentar mesmo assim (acordo novo)" & vbCrLf & _
+                      "CANCELAR = nao lancar nada" & vbCrLf & vbCrLf & _
+                      "Na planilha de inadimplencia, o acordo com o mesmo TERMO e " & _
+                      "substituido; com TERMO diferente, entra como acordo novo.", _
+                      vbYesNoCancel + vbExclamation, "Acordo ja registrado")
+        If resp = vbCancel Then
+            EmitirRegistro = -1
+            Exit Function
+        End If
+        If resp = vbYes Then
+            For r = ultReg To REG_LIN_INI Step -1
+                If Trim$(CStr(ws.Cells(r, RG_CNPJ).Value)) = Trim$(cnpj) Then
+                    ws.Rows(r).Delete
+                End If
+            Next r
+            ultReg = ws.Cells(ws.Rows.Count, RG_EMPRESA).End(xlUp).Row
+            If ultReg < REG_LIN_INI Then ultReg = REG_LIN_INI - 1
+        End If
+    End If
+
+    '--- Gravacao ------------------------------------------------------------
+    Dim rIni As Long
+    rIni = ultReg + 1
+    r = rIni
+
+    Dim nParcelas As Long
+    For k = 1 To nPag
+        If pags(k).Numero > 0 Then nParcelas = nParcelas + 1
+    Next k
+
+    For k = 1 To nPag
+        For i = 1 To pags(k).NItens
+            With pags(k).Itens(i)
+                ws.Cells(r, RG_STATUS).Value = statusAcordo
+                ws.Cells(r, RG_RESP).Value = responsavel
+                ws.Cells(r, RG_EMPRESA).Value = empresa
+                ws.Cells(r, RG_CNPJ).NumberFormat = "@"
+                ws.Cells(r, RG_CNPJ).Value = cnpj
+                ' DOC e NF como texto: "165/1" nao pode virar data
+                ws.Cells(r, RG_DOC).NumberFormat = "@"
+                ws.Cells(r, RG_DOC).Value = .Doc
+                ws.Cells(r, RG_NF).NumberFormat = "@"
+                ws.Cells(r, RG_NF).Value = .NF
+                ws.Cells(r, RG_VENC).Value = .Venc
+                ws.Cells(r, RG_CJUROS).Value = IIf(.CobraJuros, "SIM", "NAO")
+                ws.Cells(r, RG_CTITULO).Value = "SIM"
+                ws.Cells(r, RG_DTPGTO).Value = pags(k).Data
+                ws.Cells(r, RG_FORMA).Value = forma
+                ws.Cells(r, RG_TERMO).Value = termo
+
+                ws.Cells(r, RG_NPGTO).Value = IIf(pags(k).Numero = 0, "ENTRADA", _
+                                                  "PARCELA " & pags(k).Numero & "/" & nParcelas)
+                ws.Cells(r, RG_ALOCADO).Value = .ValorAlocado
+                ws.Cells(r, RG_SALDO).Value = .SaldoApos
+
+                ' Valores do TITULO so na primeira linha dele: evita soma dupla
+                If .PrimeiraVez Then
+                    ws.Cells(r, RG_ATRASO).Value = .Atraso
+                    ws.Cells(r, RG_VLRORIG).Value = .ValorOriginal
+                    ws.Cells(r, RG_JUROS).Value = .Juros
+                    ws.Cells(r, RG_VLRTOT).Value = .ValorTotal
+                End If
+
+                ' Destaque quando a linha e fracao de titulo
+                If .Parcial Or Not .PrimeiraVez Then
+                    ws.Range(ws.Cells(r, RG_STATUS), ws.Cells(r, RG_SALDO)).Font.Italic = True
+                    ws.Cells(r, RG_ALOCADO).Font.Color = RGB(170, 90, 0)
+                End If
+            End With
+
+            ' VALOR DE PARCELA so na primeira linha do bloco do pagamento
+            If i = 1 Then
+                ws.Cells(r, RG_VLRPARC).Value = pags(k).Valor
+                ws.Cells(r, RG_VLRPARC).Font.Bold = True
+                ws.Range(ws.Cells(r, RG_STATUS), ws.Cells(r, RG_SALDO)) _
+                  .Borders(xlEdgeTop).LineStyle = xlContinuous
+            End If
+
+            r = r + 1
+            nEscritas = nEscritas + 1
+        Next i
+    Next k
+
+    '--- Formatos do bloco recem-escrito -------------------------------------
+    If nEscritas > 0 Then
+        ws.Range(ws.Cells(rIni, RG_VENC), ws.Cells(r - 1, RG_VENC)).NumberFormat = "dd/mm/yyyy"
+        ws.Range(ws.Cells(rIni, RG_DTPGTO), ws.Cells(r - 1, RG_DTPGTO)).NumberFormat = "dd/mm/yyyy"
+        ws.Range(ws.Cells(rIni, RG_VLRORIG), ws.Cells(r - 1, RG_VLRTOT)).NumberFormat = FMT_MOEDA
+        ws.Range(ws.Cells(rIni, RG_VLRPAGO), ws.Cells(r - 1, RG_VLRPARC)).NumberFormat = FMT_MOEDA
+        ws.Range(ws.Cells(rIni, RG_ALOCADO), ws.Cells(r - 1, RG_SALDO)).NumberFormat = FMT_MOEDA
+        ws.Range(ws.Cells(rIni, RG_ATRASO), ws.Cells(r - 1, RG_ATRASO)).NumberFormat = "0"
+    End If
+
+    AtualizarTotaisRegistro ws
+    linhaIni = rIni
+    EmitirRegistro = nEscritas
 End Function
 
-Private Sub ApagarLinhasDoId(ws As Worksheet, ByVal id As String)
-    Dim r As Long, u As Long
-    u = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-    For r = u To 2 Step -1
-        If Trim$(CStr(ws.Cells(r, 1).Value)) = id Then ws.Rows(r).Delete
-    Next r
+
+'==============================================================================
+Private Sub MontarCabecalhoRegistro(ws As Worksheet)
+    Dim c As Long
+
+    ws.Cells(1, RG_DTPGTO).Value = "TOTAL EM ACORDO:"
+    ws.Cells(1, RG_DTPGTO).Font.Bold = True
+    ws.Cells(1, RG_DTPGTO).HorizontalAlignment = xlRight
+
+    ws.Cells(REG_LIN_CAB, RG_STATUS).Value = "STATUS ACORDO"
+    ws.Cells(REG_LIN_CAB, RG_RESP).Value = "RESPONS" & Chr(193) & "VEL"
+    ws.Cells(REG_LIN_CAB, RG_EMPRESA).Value = "EMPRESA"
+    ws.Cells(REG_LIN_CAB, RG_CNPJ).Value = "CNPJ"
+    ws.Cells(REG_LIN_CAB, RG_DOC).Value = "DOC"
+    ws.Cells(REG_LIN_CAB, RG_NF).Value = "NFS-e"
+    ws.Cells(REG_LIN_CAB, RG_ATRASO).Value = "ATRASO"
+    ws.Cells(REG_LIN_CAB, RG_VENC).Value = "VENCIMENTO"
+    ws.Cells(REG_LIN_CAB, RG_VLRORIG).Value = "VALOR ORIGINAL"
+    ws.Cells(REG_LIN_CAB, RG_JUROS).Value = "JUROS"
+    ws.Cells(REG_LIN_CAB, RG_VLRTOT).Value = "VALOR NF TOTAL"
+    ws.Cells(REG_LIN_CAB, RG_CJUROS).Value = "COBRA JUROS?"
+    ws.Cells(REG_LIN_CAB, RG_CTITULO).Value = "COBRA T" & Chr(205) & "TULO?"
+    ws.Cells(REG_LIN_CAB, RG_DTPGTO).Value = "DATA DE PAGAMENTO"
+    ws.Cells(REG_LIN_CAB, RG_VLRPAGO).Value = "VALOR PAGO"
+    ws.Cells(REG_LIN_CAB, RG_VLRPARC).Value = "VALOR DE PARCELA"
+    ws.Cells(REG_LIN_CAB, RG_FORMA).Value = "FORMA"
+    ws.Cells(REG_LIN_CAB, RG_TERMO).Value = "TERMO"
+    ws.Cells(REG_LIN_CAB, RG_NPGTO).Value = "N" & Chr(186) & " PGTO"
+    ws.Cells(REG_LIN_CAB, RG_ALOCADO).Value = "VALOR ALOCADO"
+    ws.Cells(REG_LIN_CAB, RG_SALDO).Value = "SALDO AP" & Chr(211) & "S"
+    ws.Cells(REG_LIN_CAB, RG_ENVIO).Value = "ENVIO PLANILHA"
+
+    With ws.Range(ws.Cells(REG_LIN_CAB, RG_STATUS), ws.Cells(REG_LIN_CAB, RG_ENVIO))
+        .Font.Bold = True
+        .Interior.Color = RGB(0, 80, 136)
+        .Font.Color = vbWhite
+        .HorizontalAlignment = xlCenter
+        .WrapText = True
+    End With
+    ws.Rows(REG_LIN_CAB).RowHeight = 30
+
+    ' Coluna que a colega preenche fica destacada
+    ws.Cells(REG_LIN_CAB, RG_VLRPAGO).Interior.Color = RGB(17, 202, 160)
+
+    ws.Columns(RG_STATUS).ColumnWidth = 14
+    ws.Columns(RG_RESP).ColumnWidth = 12
+    ws.Columns(RG_EMPRESA).ColumnWidth = 38
+    ws.Columns(RG_CNPJ).ColumnWidth = 19
+    ws.Columns(RG_DOC).ColumnWidth = 11
+    ws.Columns(RG_NF).ColumnWidth = 11
+    ws.Columns(RG_ATRASO).ColumnWidth = 8
+    ws.Columns(RG_VENC).ColumnWidth = 12
+    For c = ws.Columns(RG_VLRORIG).Column To ws.Columns(RG_VLRTOT).Column
+        ws.Columns(c).ColumnWidth = 15
+    Next c
+    ws.Columns(RG_CJUROS).ColumnWidth = 12
+    ws.Columns(RG_CTITULO).ColumnWidth = 12
+    ws.Columns(RG_DTPGTO).ColumnWidth = 16
+    ws.Columns(RG_VLRPAGO).ColumnWidth = 15
+    ws.Columns(RG_VLRPARC).ColumnWidth = 16
+    ws.Columns(RG_FORMA).ColumnWidth = 13
+    ws.Columns(RG_TERMO).ColumnWidth = 20
+    ws.Columns(RG_NPGTO).ColumnWidth = 14
+    ws.Columns(RG_ALOCADO).ColumnWidth = 15
+    ws.Columns(RG_SALDO).ColumnWidth = 14
+    ws.Columns(RG_ENVIO).ColumnWidth = 30
+
+    On Error Resume Next
+    ws.Range(ws.Cells(REG_LIN_CAB, RG_STATUS), ws.Cells(REG_LIN_CAB, RG_ENVIO)).AutoFilter
+    On Error GoTo 0
 End Sub
 
-Private Function SoDigitos(ByVal s As String) As String
-    Dim i As Long, ch As String
-    For i = 1 To Len(s)
-        ch = Mid$(s, i, 1)
-        If ch Like "#" Then SoDigitos = SoDigitos & ch
-    Next i
-End Function
+
+'==============================================================================
+' Totais de controle na linha 1.
+' A conferencia central: SOMA(VALOR ALOCADO) - SOMA(VALOR NF TOTAL) = 0.
+' Se der diferente de zero, a celula fica vermelha: algum titulo foi alocado
+' a mais ou a menos.
+'==============================================================================
+Private Sub AtualizarTotaisRegistro(ws As Worksheet)
+    Dim ult As Long
+    ult = ws.Cells(ws.Rows.Count, RG_EMPRESA).End(xlUp).Row
+    If ult < REG_LIN_INI Then Exit Sub
+
+    ws.Cells(1, RG_VLRPAGO).Formula = _
+        "=SUM(" & RG_VLRTOT & REG_LIN_INI & ":" & RG_VLRTOT & ult & ")"
+    ws.Cells(1, RG_VLRPAGO).NumberFormat = FMT_MOEDA
+    ws.Cells(1, RG_VLRPAGO).Font.Bold = True
+
+    ws.Cells(1, RG_NPGTO).Value = "CONFERENCIA:"
+    ws.Cells(1, RG_NPGTO).HorizontalAlignment = xlRight
+    ws.Cells(1, RG_NPGTO).Font.Bold = True
+
+    ws.Cells(1, RG_ALOCADO).Formula = _
+        "=SUM(" & RG_ALOCADO & REG_LIN_INI & ":" & RG_ALOCADO & ult & ")-SUM(" & _
+        RG_VLRTOT & REG_LIN_INI & ":" & RG_VLRTOT & ult & ")"
+    ws.Cells(1, RG_ALOCADO).NumberFormat = FMT_MOEDA
+    ws.Cells(1, RG_ALOCADO).Font.Bold = True
+
+    On Error Resume Next
+    ws.Cells(1, RG_ALOCADO).FormatConditions.Delete
+    With ws.Cells(1, RG_ALOCADO).FormatConditions.Add(xlCellValue, xlNotEqual, "=0")
+        .Font.Color = RGB(200, 0, 0)
+        .Interior.Color = RGB(255, 220, 220)
+    End With
+    On Error GoTo 0
+End Sub
 
 
 '==============================================================================
