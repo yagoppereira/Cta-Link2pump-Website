@@ -302,6 +302,43 @@ def extrair_serial_de_texto(texto: str):
     return m.group(1) if m else None
 
 
+_MESES_EXTENSO = ("JANEIRO|FEVEREIRO|MARCO|ABRIL|MAIO|JUNHO|JULHO|AGOSTO|SETEMBRO|OUTUBRO|NOVEMBRO|DEZEMBRO|"
+                  "JAN|FEV|MAR|ABR|MAI|JUN|JUL|AGO|SET|OUT|NOV|DEZ")
+
+
+def chave_item_fatura(tipo, texto) -> str:
+    """Identidade de um item de NF entre um mês e outro. O texto do item traz
+    o período cobrado ("PERÍODO: Julho/2024"), que muda TODO mês — usar o
+    texto cru como chave fazia todo item sem ID parecer "Novo". Ordem de
+    preferência: ID do aparelho → número de série → tipo + texto sem a
+    parte de período/mês/ano."""
+    t = str(texto or "")
+    m = re.search(r"\bID\s*:?\s*(\d+)", t, re.IGNORECASE)
+    if m:
+        return f"id:{m.group(1)}"
+    serial = extrair_serial_de_texto(t)
+    if serial:
+        return f"serie:{serial}"
+    limpo = unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode().upper()
+    limpo = re.sub(r"PERIODO\s*:?.*$", "", limpo)            # "PERÍODO: Julho/2024 ..." até o fim
+    limpo = re.sub(rf"\b({_MESES_EXTENSO})\b", " ", limpo)
+    limpo = re.sub(r"\b\d{1,2}/\d{2,4}\b|\b(19|20)\d{2}\b", " ", limpo)
+    limpo = re.sub(r"[^A-Z0-9]+", " ", limpo).strip()
+    return f"{str(tipo or '').upper()}|{limpo}"
+
+
+def chaves_itens_do_mes(itens) -> list:
+    """Uma chave por item (ver chave_item_fatura), numerando repetições
+    ("ALUGUEL|" duas vezes vira "ALUGUEL|#1" e "ALUGUEL|#2") pra dois itens
+    iguais no mesmo mês não virarem um só."""
+    vistos, chaves = {}, []
+    for _nf, tipo, _v, texto in itens:
+        base = chave_item_fatura(tipo, texto)
+        vistos[base] = vistos.get(base, 0) + 1
+        chaves.append(f"{base}#{vistos[base]}")
+    return chaves
+
+
 def ordenar_equipamentos_por_contrato(df_contratos, df_equipamentos, coluna_origem="Descricao"):
     """
     Reordena a tabela de EQUIPAMENTOS pra seguir a mesma ordem da tabela
@@ -2147,6 +2184,7 @@ def plotar_historico_multi(
             if "itens_mes_lista" in df_m.columns else [[] for _ in valores]
         )
 
+        primeiro_idx_valor = next((k for k, v in enumerate(valores) if v is not None and not pd.isna(v)), None)
         hover_texts = []
         dados_estruturados = []  # customdata: cabeçalho + itens (nf, desc, valor) — pro detalhe do ponto clicado poder montar 1 card por item (ex: aluguel/licenciamento separados)
         for j, (mes_fmt, val) in enumerate(zip(eixo_labels, valores)):
@@ -2244,20 +2282,24 @@ def plotar_historico_multi(
             for j_ant in range(j - 1, -1, -1):
                 anteriores = _normalizar_itens(itens_mes_lista_pontos[j_ant])
                 if anteriores:
-                    for _nf_a, _d_a, v_a, t_a in anteriores:
-                        chave_a = _extrair_id_equipamento(t_a) or t_a
-                        if chave_a and v_a is not None and not pd.isna(v_a):
+                    for chave_a, (_nf_a, _d_a, v_a, _t_a) in zip(chaves_itens_do_mes(anteriores), anteriores):
+                        if v_a is not None and not pd.isna(v_a):
                             itens_mes_anterior[chave_a] = v_a
                     break
 
-            for nf_item, desc_item, val_item, texto_item in itens_do_ponto:
+            # 1ª cobrança do contrato: tudo nele é novo por definição — o
+            # card mostra isso no cabeçalho, não item a item
+            primeira_cobranca = j == primeiro_idx_valor
+            for chave_item, (nf_item, desc_item, val_item, texto_item) in zip(
+                    chaves_itens_do_mes(itens_do_ponto), itens_do_ponto):
                 if val_item is None or pd.isna(val_item):
                     continue
                 composicao_por_tipo[desc_item] = composicao_por_tipo.get(desc_item, 0.0) + val_item
 
-                chave_item = _extrair_id_equipamento(texto_item) or texto_item
                 valor_anterior = itens_mes_anterior.get(chave_item)
-                if not itens_mes_anterior:
+                if primeira_cobranca:
+                    situacao_item, pct_item = "contrato_novo", None
+                elif not itens_mes_anterior:
                     situacao_item, pct_item = "", None  # sem base de comparação
                 elif valor_anterior is None:
                     situacao_item, pct_item = "novo", None
@@ -2283,6 +2325,7 @@ def plotar_historico_multi(
                 "nfs": faturas[j] or "",
                 "observacao": h.get("observacao", ""),
                 "completo": bool(completos[j]),
+                "primeira_cobranca": primeira_cobranca,
                 "variacao_pct": variacoes_pct[j],
                 "variacao_bruto": variacoes_bruto[j],
                 "composicao_por_tipo": composicao_por_tipo,
@@ -2820,6 +2863,12 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
                                  "border-radius:3px; margin-bottom:8px;'></div>")
         if dado_ponto.get("nfs"):
             linhas_cab.append(f"<div style='font-size:0.85em; opacity:0.75;'>NF: {dado_ponto['nfs']}</div>")
+        if dado_ponto.get("primeira_cobranca"):
+            onde = " no grupo" if dado_ponto.get("empresa") else ""
+            linhas_cab.append(
+                "<div style='margin-top:4px;'><span style='background:#3b82f633; color:#93c5fd; "
+                "border:1px solid #3b82f6; border-radius:10px; padding:1px 8px; font-size:0.8em;'>"
+                f"🆕 Contrato novo{onde} — 1ª cobrança</span></div>")
         if not dado_ponto.get("completo", True):
             linhas_cab.append(
                 "<div style='font-size:0.85em; color:#f59e0b;'>⚠ Mês incompleto — "
@@ -2883,8 +2932,10 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             novo não há base de comparação pra calcular %)."""
             situacao = item.get("situacao_item")
             pct = item.get("pct_item")
+            if situacao == "contrato_novo":
+                return "🆕 1ª cobrança"
             if situacao == "novo":
-                return "🔵 Novo"
+                return "🔵 Novo item"
             if situacao == "subiu" and pct is not None:
                 return f"🟢 +{pct:.1f}%"
             if situacao == "caiu" and pct is not None:
@@ -4687,6 +4738,53 @@ def colorir_historicos_por_empresa(historicos: list) -> dict:
     return cores_empresa
 
 
+def variacao_empresa_no_mes(pontos_por_mes: dict, mes_fmt: str, empresa: str) -> str:
+    """HTML curto com o que mudou para UMA empresa (CNPJ) neste mês, contra
+    o último mês anterior em que ela foi faturada: valor (▲/▼ R$ e %),
+    contratos que entraram e que pararam de cobrar. Sem mês anterior, é
+    empresa nova no grupo. Respeita os filtros do gráfico (pontos_por_mes
+    só traz o que está em exibição)."""
+    atual = _periodo_do_rotulo(mes_fmt)
+    if atual is None:
+        return ""
+
+    def _da_empresa(rotulo):
+        return [d for d in (pontos_por_mes.get(rotulo) or [])
+                if isinstance(d, dict) and d.get("empresa") == empresa and d.get("valor_total") is not None]
+
+    anteriores = sorted(((p, r) for r in pontos_por_mes if (p := _periodo_do_rotulo(r)) is not None and p < atual),
+                        reverse=True)
+    if not anteriores:
+        return ""  # 1º mês do gráfico: não há com o que comparar
+    rotulo_ant = next((r for _p, r in anteriores if _da_empresa(r)), None)
+    cur = _da_empresa(mes_fmt)
+    if rotulo_ant is None:
+        return ("<span style='background:#3b82f633; color:#93c5fd; border:1px solid #3b82f6; border-radius:10px; "
+                "padding:1px 8px; font-size:0.85em;'>🆕 Empresa nova no grupo — 1º mês faturado</span>")
+    ant = _da_empresa(rotulo_ant)
+    tot_cur = sum(d["valor_total"] for d in cur)
+    tot_ant = sum(d["valor_total"] for d in ant)
+    partes = []
+    dif = tot_cur - tot_ant
+    if abs(dif) >= 0.01:
+        cor = COR_AUMENTO if dif > 0 else COR_REDUCAO
+        pct = f" ({dif / tot_ant * 100:+.1f}%)" if tot_ant else ""
+        partes.append(f"<span style='color:{cor};'>{'▲' if dif > 0 else '▼'} {formatar_moeda(abs(dif))}{pct}</span>")
+    else:
+        partes.append("<span style='opacity:0.7;'>= mesmo valor</span>")
+    partes[-1] += f" <span style='opacity:0.7;'>vs {rotulo_ant}</span>"
+    contratos_cur = {d.get("grupo") for d in cur}
+    contratos_ant = {d.get("grupo") for d in ant}
+    if contratos_cur - contratos_ant:
+        partes.append(f"<span style='color:#93c5fd;'>🆕 {len(contratos_cur - contratos_ant)} contrato(s) novo(s)</span>")
+    if contratos_ant - contratos_cur:
+        nomes = ", ".join(sorted(str(g) for g in contratos_ant - contratos_cur)[:3])
+        partes.append(f"<span style='color:#f59e0b;'>⏹ {len(contratos_ant - contratos_cur)} contrato(s) sem cobrança "
+                      f"neste mês</span> <span style='opacity:0.7;'>({nomes}"
+                      f"{'…' if len(contratos_ant - contratos_cur) > 3 else ''})</span>")
+    return " · ".join(partes)
+
+
 def _periodo_do_rotulo(rotulo):
     """'Set/26' (formatar_mes_ano) → Period('2026-09')."""
     try:
@@ -5150,13 +5248,28 @@ def relatorio_grupo(termo: str):
                     f"deste mês: <b>{', '.join(formatar_mes_ano(p) for p in periodos_mes) or 'nenhum texto de período'}</b>"
                     + (" — <span style='color:#f59e0b;'>mais de um período no mesmo mês</span>" if len(periodos_mes) > 1 else ""))
                 _exibir_resumo_empresas(resumo_mes, equip_por_empresa, por_mes=True)
+                # pagante faturado no mês anterior e não neste: some da lista
+                # de cards abaixo, então é avisado aqui
+                periodo_clicado = _periodo_do_rotulo(mes_clicado_grupo)
+                if periodo_clicado is not None:
+                    rotulo_mes_ant = formatar_mes_ano(periodo_clicado - 1)
+                    empresas_ant = {d.get("empresa") for d in (pontos_por_mes_grupo.get(rotulo_mes_ant) or [])
+                                    if isinstance(d, dict) and d.get("empresa") and d.get("valor_total") is not None}
+                    sairam = sorted(empresas_ant - set(por_empresa_mes))
+                    if sairam:
+                        _md_seguro("<span style='color:#f59e0b;'>⏹ Faturado(s) em "
+                                   f"{rotulo_mes_ant} e sem cobrança neste mês:</span> "
+                                   + "; ".join(f"<b>{e}</b>" for e in sairam))
                 qtd_linhas_cards = sum(-(-len(lst) // 3) for lst in por_empresa_mes.values())
                 altura_cards_grupo = min(1200, max(400, 340 * min(qtd_linhas_cards, 3)))
                 with st.container(height=altura_cards_grupo):
                     for empresa_mes, lst in sorted(por_empresa_mes.items(), key=lambda kv: -total_por_empresa[kv[0]]):
                         cor_emp = next((d.get("cor") for d in lst if isinstance(d, dict) and d.get("cor")), None)
+                        variacao_emp = variacao_empresa_no_mes(pontos_por_mes_grupo, mes_clicado_grupo, empresa_mes)
                         _md_seguro(f"<span style='color:{cor_emp or COR_TEXTO_GRAFICO};'>■</span> "
-                                   f"<b>{empresa_mes}</b> — {formatar_moeda(total_por_empresa[empresa_mes])} no mês")
+                                   f"<b>{empresa_mes}</b> — {formatar_moeda(total_por_empresa[empresa_mes])} no mês"
+                                   + (f"<div style='font-size:0.9em; margin:2px 0 6px 14px;'>{variacao_emp}</div>"
+                                      if variacao_emp else ""))
                         col_cards_grupo = st.columns(min(3, len(lst)) or 1)
                         for i, dado_ponto in enumerate(lst):
                             with col_cards_grupo[i % len(col_cards_grupo)]:
