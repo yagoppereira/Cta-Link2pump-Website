@@ -2217,7 +2217,7 @@ def plotar_historico_multi(
                 )
             elif variacoes_pct[j] is not None:
                 direcao = "Aumento" if variacoes_bruto[j] > 0 else "Redução"
-                texto += f"<br>{direcao}: {formatar_moeda(abs(variacoes_bruto[j]))} ({variacoes_pct[j]:+.1f}%)"
+                texto += f"<br>{direcao}: {formatar_moeda(abs(variacoes_bruto[j]))} ({variacoes_pct[j]:+.2f}%)"
                 # a LISTA de equipamentos que entraram/saíram/mudaram de
                 # valor saiu do hover (era outra fonte de balão gigante) —
                 # aqui fica só a contagem; o detalhe item a item está no
@@ -2428,7 +2428,7 @@ def plotar_historico_multi(
                     y=[valores[j] for j in idx_relevantes],
                     mode="text",
                     text=[
-                        f"{'+' if variacoes_bruto[j] > 0 else '-'}{formatar_moeda(abs(variacoes_bruto[j]))} ({variacoes_pct[j]:+.1f}%)"
+                        f"{'+' if variacoes_bruto[j] > 0 else '-'}{formatar_moeda(abs(variacoes_bruto[j]))} ({variacoes_pct[j]:+.2f}%)"
                         for j in idx_relevantes
                     ],
                     textposition=posicoes_texto[i % len(posicoes_texto)],
@@ -2527,7 +2527,7 @@ def plotar_historico_multi(
             texto = f"<b>{nome}</b><br>{m}: {formatar_moeda(v)}"
             if var_pct_t[j] is not None:
                 direcao = "Aumento" if var_bruto_t[j] > 0 else "Redução"
-                texto += f"<br>{direcao}: {formatar_moeda(abs(var_bruto_t[j]))} ({var_pct_t[j]:+.1f}%)"
+                texto += f"<br>{direcao}: {formatar_moeda(abs(var_bruto_t[j]))} ({var_pct_t[j]:+.2f}%)"
             hover_total.append(texto)
             # mesmo formato de customdata das linhas de grupo, só sem
             # itens (é uma soma agregada de vários grupos, não faz
@@ -2578,7 +2578,7 @@ def plotar_historico_multi(
                         y=[valores_t[j] for j in idx_var_t_relevantes],
                         mode="text",
                         text=[
-                            f"{'+' if var_bruto_t[j] > 0 else '-'}{formatar_moeda(abs(var_bruto_t[j]))} ({var_pct_t[j]:+.1f}%)"
+                            f"{'+' if var_bruto_t[j] > 0 else '-'}{formatar_moeda(abs(var_bruto_t[j]))} ({var_pct_t[j]:+.2f}%)"
                             for j in idx_var_t_relevantes
                         ],
                         textposition="top center",
@@ -2773,7 +2773,7 @@ def plotar_historico_multi(
     # como markdown pro caller mostrar num expander do Streamlit.
     linhas_detalhe_md = []
     for grupo, mes_fmt, direcao, bruto, pct, novos, removidos, alterados in detalhes_mudancas_console:
-        linhas_detalhe_md.append(f"**{mes_fmt} — Contrato {grupo} — {direcao}: {formatar_moeda(abs(bruto))} ({pct:+.1f}%)**")
+        linhas_detalhe_md.append(f"**{mes_fmt} — Contrato {grupo} — {direcao}: {formatar_moeda(abs(bruto))} ({pct:+.2f}%)**")
         if alterados:
             linhas_detalhe_md.append("- Valor alterado:")
             linhas_detalhe_md += [f"  - {item}" for item in alterados]
@@ -2881,7 +2881,7 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
             linhas_cab.append(
                 f"<div style='font-size:0.9em; color:{cor_var};'>{seta} "
-                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%)</div>"
+                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.2f}%)</div>"
             )
         _md_seguro("".join(linhas_cab))
 
@@ -2937,9 +2937,9 @@ def renderizar_card_detalhe_ponto(dado_ponto: dict):
             if situacao == "novo":
                 return "🔵 Novo item"
             if situacao == "subiu" and pct is not None:
-                return f"🟢 +{pct:.1f}%"
+                return f"🟢 +{pct:.2f}%"
             if situacao == "caiu" and pct is not None:
-                return f"🔴 {pct:.1f}%"
+                return f"🔴 {pct:.2f}%"
             if situacao == "igual":
                 return "—"
             return ""
@@ -3037,7 +3037,7 @@ def mostrar_cards_contratos(historicos: list, chave_prefixo: str = "", grupos_ex
             cor_var = COR_AUMENTO if variacao_bruto > 0 else COR_REDUCAO
             texto_variacao = (
                 f"<div style='font-size:0.85em; color:{cor_var};'>{seta} "
-                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.1f}%) vs. mês anterior</div>"
+                f"{formatar_moeda(abs(variacao_bruto))} ({variacao_pct:+.2f}%) vs. mês anterior</div>"
             )
 
         with st.container(border=True):
@@ -4768,7 +4768,7 @@ def variacao_empresa_no_mes(pontos_por_mes: dict, mes_fmt: str, empresa: str) ->
     dif = tot_cur - tot_ant
     if abs(dif) >= 0.01:
         cor = COR_AUMENTO if dif > 0 else COR_REDUCAO
-        pct = f" ({dif / tot_ant * 100:+.1f}%)" if tot_ant else ""
+        pct = f" ({dif / tot_ant * 100:+.2f}%)" if tot_ant else ""
         partes.append(f"<span style='color:{cor};'>{'▲' if dif > 0 else '▼'} {formatar_moeda(abs(dif))}{pct}</span>")
     else:
         partes.append("<span style='opacity:0.7;'>= mesmo valor</span>")
