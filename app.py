@@ -2555,14 +2555,21 @@ def plotar_historico_multi(
                     ))
                     trace_situacao.append(tag); trace_eh_grupo_individual.append(False); trace_grupo_dono.append(None)
 
-    if incluir_total and len(historicos_validos) > 1:
+    # o Total soma só o que está SELECIONADO nos filtros (contratos/pagantes)
+    # — somar o grupo inteiro com só um pagante escolhido deixava a linha
+    # Total muito acima das linhas visíveis e sem relação com elas
+    base_total = ([h for h in historicos_validos if h["grupo"] in grupos_visiveis]
+                  if grupos_visiveis else historicos_validos)
+    if incluir_total and len(base_total) > 1:
         # 3 variantes pré-calculadas do Total, uma pra cada botão de
         # filtro — "dinâmico" no sentido de que o Total muda junto com o
         # filtro Ativos/Encerrados (checkbox por contrato individual não
         # dá pra fazer de forma confiável só com Plotly, sem um backend).
-        ativos_hist = [h for h in historicos_validos if h.get("situacao") == "A"]
-        encerrados_hist = [h for h in historicos_validos if h.get("situacao") == "E"]
-        adicionar_linha_total(historicos_validos, "todos", "Total (todos os contratos)", True)
+        ativos_hist = [h for h in base_total if h.get("situacao") == "A"]
+        encerrados_hist = [h for h in base_total if h.get("situacao") == "E"]
+        adicionar_linha_total(
+            base_total, "todos",
+            "Total (selecionados)" if grupos_visiveis else "Total (todos os contratos)", True)
         adicionar_linha_total(ativos_hist, "A", "Total (só ativos)", False)
         adicionar_linha_total(encerrados_hist, "E", "Total (só encerrados)", False)
 
@@ -5045,15 +5052,30 @@ def relatorio_grupo(termo: str):
                 format_func=lambda e: f"{_nome_curto_empresa(e.split(' · ')[0])} · "
                                       f"{e.split(' · ')[-1] if ' · ' in e else ''}",
                 key=f"sel_pagantes_grupo_{termo}",
-                help="Mostra todos os contratos dos pagantes escolhidos (somado ao filtro de contratos).",
+                help="Mostra só os contratos dos pagantes escolhidos; a lista de contratos ao lado passa a trazer só os deles.",
             ))
-        opcoes_contratos_grupo = [h["grupo"] for h in historicos_grafico_grupo]
+        # com pagante escolhido, a lista de contratos mostra só os DELE (e,
+        # com o filtro "Mostrar", só os da situação escolhida) — a segunda
+        # barra refina a primeira em vez de listar o grupo inteiro
+        opcoes_contratos_grupo = [
+            h["grupo"] for h in historicos_grafico_grupo
+            if (not pagantes_marcados_grupo or h.get("empresa") in pagantes_marcados_grupo)
+            and (filtro_situacao_grupo is None or h.get("situacao") == filtro_situacao_grupo)
+        ]
+        chave_contratos_grupo = f"sel_contratos_grupo_{termo}"
+        # contrato marcado que saiu das opções (trocou o pagante) é descartado
+        # antes do widget — senão o Streamlit reclama do valor fora da lista
+        if chave_contratos_grupo in st.session_state:
+            st.session_state[chave_contratos_grupo] = [
+                g for g in st.session_state[chave_contratos_grupo] if g in opcoes_contratos_grupo]
         with col_g2:
             grupos_marcados_grupo = set(st.multiselect(
-                "Contratos no gráfico (vazio = todos)",
-                options=opcoes_contratos_grupo, default=[],
-                key=f"sel_contratos_grupo_{termo}",
-                help="Escolha quais empresa(s)/contrato(s) do grupo desenhar.",
+                "Contratos no gráfico (vazio = todos do pagante)" if pagantes_marcados_grupo
+                else "Contratos no gráfico (vazio = todos)",
+                options=opcoes_contratos_grupo,
+                key=chave_contratos_grupo,
+                help="Escolha quais contratos desenhar. Com pagante escolhido ao lado, "
+                     "a lista traz só os contratos dele.",
             ))
         with col_g3:
             incluir_total_grupo = st.toggle(
@@ -5068,8 +5090,10 @@ def relatorio_grupo(termo: str):
             titulo=f"Mensalidade consolidada — grupo {termo}",
             subtitulo=f"{len(historicos_grupo)} contrato(s) em {len(df_resumo)} empresa(s)",
             incluir_total=incluir_total_grupo, mostrar_eventos_cancelamento=False,
-            grupos_visiveis=(grupos_marcados_grupo | {
-                h["grupo"] for h in historicos_grafico_grupo if h.get("empresa") in pagantes_marcados_grupo}) or None,
+            # contrato escolhido manda; sem contrato, valem todos os dos
+            # pagantes escolhidos; sem nenhum dos dois, o grupo inteiro
+            grupos_visiveis=grupos_marcados_grupo or {
+                h["grupo"] for h in historicos_grafico_grupo if h.get("empresa") in pagantes_marcados_grupo} or None,
             filtro_situacao=filtro_situacao_grupo,
         )
         # DIAGNÓSTICO TEMPORÁRIO — ver _debug_faturamento_real. Remover
